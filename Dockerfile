@@ -20,4 +20,5 @@ COPY . .
 EXPOSE 8080
 
 # Start app with Gunicorn + Uvicorn worker
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:$PORT"]
+CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
+
