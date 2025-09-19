@@ -1,11 +1,3 @@
-from fastapi import FastAPI
-import firebase_admin
-from firebase_admin import credentials, db
-import os, json
-import numpy as np
-import xgboost as xgb
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.neural_network import MLPRegressor
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import firebase_admin
@@ -24,7 +16,6 @@ app = FastAPI()
 # ✅ Firebase setup
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
-
     "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
 })
 
@@ -38,7 +29,7 @@ def fetch_sensor_history(sensor_id: str):
     records = []
     for ts, entry in data.items():
         try:
-            dt = datetime.strptime(ts.split("_")[0], "%Y%m%d")
+            dt = datetime.fromtimestamp(int(ts))  # ✅ Fix timestamp parsing
         except:
             dt = datetime.now()
         records.append({
@@ -145,5 +136,4 @@ def visualize(sensor_id: str,
     buf.seek(0)
     plt.close()
 
-    return StreamingResponse(buf, media_type="image/png
-    "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
+    return StreamingResponse(buf, media_type="image/png")
