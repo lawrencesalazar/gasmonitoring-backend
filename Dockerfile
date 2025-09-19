@@ -7,18 +7,17 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y build-essential
 
-# Copy requirements.txt first (for caching layers)
+# Copy requirements first for caching
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your application
+# Copy the rest of the app
 COPY . .
 
-# Expose the Render port (not strictly required but good practice)
+# Expose port (Render sets PORT env, but we declare for clarity)
 EXPOSE 8080
 
-# Start app with Gunicorn + Uvicorn worker
+# Start the app with Gunicorn + Uvicorn worker
 CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
-
