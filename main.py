@@ -13,7 +13,7 @@ app = FastAPI()
 service_account_info = json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
 cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://gasmonitoring-ec511.firebaseio.com/"
+    "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
 })
 
 @app.get("/")
