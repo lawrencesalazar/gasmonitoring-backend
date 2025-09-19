@@ -1,4 +1,7 @@
 fastapi
 uvicorn
-firebase-admin
 gunicorn
+firebase-admin
+xgboost
+scikit-learn
+pandas
