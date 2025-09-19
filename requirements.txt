@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-gunicorn
 firebase-admin
+gunicorn
 xgboost
 scikit-learn
+matplotlib
 pandas
 numpy
