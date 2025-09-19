@@ -19,8 +19,10 @@ app = FastAPI()
 # ✅ Firebase setup
 service_account_info = json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
 cred = credentials.Certificate(service_account_info)
-firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
+firebase_admin.initialize_app(cred, { 
+databaseURL: "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app",
+
+ 
 })
 
 # ✅ Safe matplotlib import
