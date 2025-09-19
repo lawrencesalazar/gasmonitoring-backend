@@ -4,6 +4,8 @@ from firebase_admin import credentials, db
 import os, json
 import numpy as np
 import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
 
 app = FastAPI()
 
@@ -30,58 +32,91 @@ def add_reading(data: dict):
     return {"status": "success"}
 
 # -------------------------------------------------
-# 🆕 Forecast Endpoint (XGBoost placeholder)
+# Forecast Endpoint (XGBoost)
 # -------------------------------------------------
 @app.get("/forecast/{sensor_id}")
 def forecast(sensor_id: str, steps: int = 7):
-    """
-    Train a dummy XGBoost regressor on historical riskIndex data
-    and predict 'steps' future values.
-    """
-    # Get historical readings
     ref = db.reference(f"history/{sensor_id}")
     data = ref.get()
     if not data:
-        return {"forecast": [], "message": "No data found for this sensor"}
+        return {"forecast": [], "message": "No data found"}
 
-    # Extract riskIndex = weighted average
     records = []
     for rec in data.values():
-        try:
-            methane = rec.get("methane", 0)
-            co2 = rec.get("co2", 0)
-            ammonia = rec.get("ammonia", 0)
-            humidity = rec.get("humidity", 0)
-            temperature = rec.get("temperature", 0)
-            riskIndex = (
-                methane * 0.3 + co2 * 0.25 + ammonia * 0.25 +
-                humidity * 0.1 + temperature * 0.1
-            )
-            records.append(riskIndex)
-        except Exception:
-            continue
+        methane = rec.get("methane", 0)
+        co2 = rec.get("co2", 0)
+        ammonia = rec.get("ammonia", 0)
+        humidity = rec.get("humidity", 0)
+        temperature = rec.get("temperature", 0)
+        riskIndex = (
+            methane * 0.3 + co2 * 0.25 + ammonia * 0.25 +
+            humidity * 0.1 + temperature * 0.1
+        )
+        records.append(riskIndex)
 
     if len(records) < 5:
-        return {"forecast": [], "message": "Not enough data for forecasting"}
+        return {"forecast": [], "message": "Not enough data"}
 
-    # Prepare training data
     y = np.array(records, dtype=float)
     X = np.arange(len(y)).reshape(-1, 1)
 
     dtrain = xgb.DMatrix(X, label=y)
-
-    params = {
-        "objective": "reg:squarederror",
-        "max_depth": 3,
-        "eta": 0.1,
-        "verbosity": 0
-    }
-
+    params = {"objective": "reg:squarederror", "max_depth": 3, "eta": 0.1}
     model = xgb.train(params, dtrain, num_boost_round=50)
 
-    # Forecast next N steps
     future_X = np.arange(len(y), len(y) + steps).reshape(-1, 1)
-    dfuture = xgb.DMatrix(future_X)
-    forecast = model.predict(dfuture).tolist()
+    forecast = model.predict(xgb.DMatrix(future_X)).tolist()
 
     return {"forecast": forecast}
+
+# -------------------------------------------------
+# Compare Models Endpoint (XGBoost, Random Forest, Neural Net)
+# -------------------------------------------------
+@app.get("/compare/{sensor_id}")
+def compare_models(sensor_id: str, steps: int = 7):
+    ref = db.reference(f"history/{sensor_id}")
+    data = ref.get()
+    if not data:
+        return {"xgboost": [], "random_forest": [], "neural_net": [], "message": "No data found"}
+
+    records = []
+    for rec in data.values():
+        methane = rec.get("methane", 0)
+        co2 = rec.get("co2", 0)
+        ammonia = rec.get("ammonia", 0)
+        humidity = rec.get("humidity", 0)
+        temperature = rec.get("temperature", 0)
+        riskIndex = (
+            methane * 0.3 + co2 * 0.25 + ammonia * 0.25 +
+            humidity * 0.1 + temperature * 0.1
+        )
+        records.append(riskIndex)
+
+    if len(records) < 5:
+        return {"xgboost": [], "random_forest": [], "neural_net": [], "message": "Not enough data"}
+
+    y = np.array(records, dtype=float)
+    X = np.arange(len(y)).reshape(-1, 1)
+
+    # ---- XGBoost ----
+    dtrain = xgb.DMatrix(X, label=y)
+    params = {"objective": "reg:squarederror", "max_depth": 3, "eta": 0.1}
+    model_xgb = xgb.train(params, dtrain, num_boost_round=50)
+    future_X = np.arange(len(y), len(y) + steps).reshape(-1, 1)
+    forecast_xgb = model_xgb.predict(xgb.DMatrix(future_X)).tolist()
+
+    # ---- Random Forest ----
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X, y)
+    forecast_rf = rf.predict(future_X).tolist()
+
+    # ---- Neural Network ----
+    nn = MLPRegressor(hidden_layer_sizes=(50, 20), max_iter=1000, random_state=42)
+    nn.fit(X, y)
+    forecast_nn = nn.predict(future_X).tolist()
+
+    return {
+        "xgboost": forecast_xgb,
+        "random_forest": forecast_rf,
+        "neural_net": forecast_nn
+    }
