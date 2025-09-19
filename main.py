@@ -3,14 +3,26 @@ import firebase_admin
 from firebase_admin import credentials, db
 import os
 import json
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Load Firebase service account from environment variable
+# Allow frontend domain to access backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://gasmonitoring-ec511.web.app",  # your React frontend
+        "http://localhost:3000"  # for local React dev
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Firebase Admin setup
 service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
 cred = credentials.Certificate(service_account_info)
 
-# Initialize Firebase
 firebase_admin.initialize_app(cred, {
     "databaseURL": "https://gasmonitoring-ec511.firebaseio.com/"
 })
