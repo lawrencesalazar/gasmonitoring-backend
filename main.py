@@ -1,115 +1,102 @@
-
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, StreamingResponse
-import os, json, io
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, db
+import os
+import logging
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.neural_network import MLPRegressor
-from xgboost import XGBRegressor
+# =========================
+# Safe imports for heavy libs
+# =========================
+try:
+    import pandas as pd
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
+    import matplotlib
+    matplotlib.use("Agg")  # Safe backend for servers
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    logging.warning(f"Optional dependency missing: {e}")
 
-# ✅ Initialize FastAPI
+# =========================
+# FastAPI setup
+# =========================
 app = FastAPI()
 
-# ✅ Firebase setup
-service_account_info = json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
-cred = credentials.Certificate(service_account_info)
-firebase_admin.initialize_app(cred, { 
-databaseURL: "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app",
+# Allow CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # adjust for security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
- 
-})
+# =========================
+# Firebase setup
+# =========================
+if not firebase_admin._apps:
+    
+# service_account_info = json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
+# cred = credentials.Certificate(service_account_info)
+    cred_path =  json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
+    if not os.path.exists(cred_path):
+        raise RuntimeError(f"Firebase credential file not found at {cred_path}")
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": os.getenv(
+            "FIREBASE_DB_URL",
+            "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app/"
+        )
+    })
 
-# ✅ Safe matplotlib import
-try:
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-
-
-# 🔹 Helper: Fetch history
-def fetch_sensor_history(sensor_id: str):
-    ref = db.reference(f"history/{sensor_id}")
-    data = ref.get()
+# =========================
+# Helper: Fetch history by sensorID
+# =========================
+def fetch_sensor_history(sensor_id: str, limit: int = 30):
+    ref = db.reference("history")
+    query = ref.order_by_child("sensorID").equal_to(sensor_id).limit_to_last(limit)
+    data = query.get()
     if not data:
         return []
-    records = []
-    for _, entry in data.items():
-        try:
-            dt = datetime.strptime(entry.get("timestamp"), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            dt = datetime.now()
-        records.append({
-            "timestamp": dt,
-            "methane": entry.get("methane", 0),
-            "co2": entry.get("co2", 0),
-            "ammonia": entry.get("ammonia", 0),
-            "humidity": entry.get("humidity", 0),
-            "temperature": entry.get("temperature", 0),
-        })
-    return sorted(records, key=lambda x: x["timestamp"])
+    return list(data.values())
 
+# =========================
+# Routes
+# =========================
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Gas Monitoring API running"}
 
-# 🔹 Forecast with XGBoost
 @app.get("/forecast/{sensor_id}")
-def forecast(sensor_id: str, steps: int = 7):
-    records = fetch_sensor_history(sensor_id)
-    if not records:
-        return JSONResponse({"error": "No data found"}, status_code=404)
+def forecast(sensor_id: str):
+    history = fetch_sensor_history(sensor_id)
+    if not history:
+        raise HTTPException(status_code=404, detail="No history found for sensor")
 
-    df = pd.DataFrame(records)
-    values = df["methane"].values
-    X = np.arange(len(values)).reshape(-1, 1)
-    y = values
+    df = pd.DataFrame(history)
+    if "timestamp" not in df or "co2" not in df:
+        raise HTTPException(status_code=500, detail="Missing required fields")
 
-    model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
-    model.fit(X, y)
+    # Prepare simple forecast (CO₂ vs time index)
+    df["ts_index"] = range(len(df))
+    X = df[["ts_index"]]
+    y = df["co2"]
+    model = LinearRegression().fit(X, y)
+    future_index = [[len(df) + i] for i in range(5)]
+    forecast_values = model.predict(future_index).tolist()
 
-    future_X = np.arange(len(values), len(values) + steps).reshape(-1, 1)
-    preds = model.predict(future_X)
+    return {"sensorID": sensor_id, "forecast": forecast_values}
 
-    last_date = df["timestamp"].iloc[-1]
-    forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
-    forecast_data = [{"date": d.strftime("%Y-%m-%d"), "forecast": float(v)} for d, v in zip(forecast_dates, preds)]
-
-    return {"sensor_id": sensor_id, "forecast": forecast_data}
-
-
-# 🔹 Compare 3 models
-@app.get("/compare/{sensor_id}")
-def compare(sensor_id: str, steps: int = 7):
-    records = fetch_sensor_history(sensor_id)
-    if not records:
-        return JSONResponse({"error": "No data found"}, status_code=404)
-
-    df = pd.DataFrame(records)
-    values = df["methane"].values
-    X = np.arange(len(values)).reshape(-1, 1)
-    y = values
-
-    models = {
-        "xgboost": XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3),
-        "random_forest": RandomForestRegressor(n_estimators=100),
-        "neural_network": MLPRegressor(hidden_layer_sizes=(50,), max_iter=500),
+@app.get("/compare/{sensor_a}/{sensor_b}")
+def compare(sensor_a: str, sensor_b: str):
+    hist_a = fetch_sensor_history(sensor_a)
+    hist_b = fetch_sensor_history(sensor_b)
+    if not hist_a or not hist_b:
+        raise HTTPException(status_code=404, detail="No data for one or both sensors")
+    return {
+        "sensorA": sensor_a,
+        "recordsA": len(hist_a),
+        "sensorB": sensor_b,
+        "recordsB": len(hist_b),
     }
-
-    results = {}
-    future_X = np.arange(len(values), len(values) + steps).reshape(-1, 1)
-    last_date = df["timestamp"].iloc[-1]
-    forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
-
-    for name, model in models.items():
-        try:
-            model.fit(X, y)
-            preds = model.predict(future_X)
-            results[name] = [{"date": d.strftime("%Y-%m-%d"), "forecast": float(v)} for d, v in zip(forecast_dates, preds)]
-        except Exception as e:
-            results[name] = {"error": str(e)}
-
-    return {"sensor_id": sensor_id, "comparison": results}
