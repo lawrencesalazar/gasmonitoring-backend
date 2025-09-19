@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import os, json, io
@@ -16,7 +17,8 @@ from xgboost import XGBRegressor
 app = FastAPI()
 
 # ✅ Firebase setup
-cred = credentials.Certificate("serviceAccountKey.json")
+service_account_info = json.loads(os.environ['FIREBASE_SERVICE_ACCOUNT'])
+cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred, {
     "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
 })
