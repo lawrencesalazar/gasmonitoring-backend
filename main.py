@@ -1,16 +1,18 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
+import os, json, io
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
 import firebase_admin
 from firebase_admin import credentials, db
-import io
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 
+# ✅ Initialize FastAPI
 app = FastAPI()
 
 # ✅ Firebase setup
@@ -18,6 +20,13 @@ cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
     "databaseURL": "https://gasmonitoring-ec511-default-rtdb.firebaseio.com/"
 })
+
+# ✅ Safe matplotlib import
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 
 # 🔹 Helper: Fetch history
@@ -27,10 +36,10 @@ def fetch_sensor_history(sensor_id: str):
     if not data:
         return []
     records = []
-    for ts, entry in data.items():
+    for _, entry in data.items():
         try:
-            dt = datetime.fromtimestamp(int(ts))  # ✅ Fix timestamp parsing
-        except:
+            dt = datetime.strptime(entry.get("timestamp"), "%Y-%m-%d %H:%M:%S")
+        except Exception:
             dt = datetime.now()
         records.append({
             "timestamp": dt,
@@ -51,7 +60,7 @@ def forecast(sensor_id: str, steps: int = 7):
         return JSONResponse({"error": "No data found"}, status_code=404)
 
     df = pd.DataFrame(records)
-    values = df["methane"].values  # example metric
+    values = df["methane"].values
     X = np.arange(len(values)).reshape(-1, 1)
     y = values
 
@@ -102,10 +111,13 @@ def compare(sensor_id: str, steps: int = 7):
     return {"sensor_id": sensor_id, "comparison": results}
 
 
-# 🔹 Visualization
+# 🔹 Visualization (only if matplotlib available)
 @app.get("/visualize/{sensor_id}")
 def visualize(sensor_id: str,
               metric: str = Query("methane", enum=["methane", "co2", "ammonia", "humidity", "temperature"])):
+    if not MATPLOTLIB_AVAILABLE:
+        return JSONResponse({"error": "matplotlib not installed"}, status_code=500)
+
     records = fetch_sensor_history(sensor_id)
     if not records:
         return JSONResponse({"error": "No data found"}, status_code=404)
@@ -114,7 +126,7 @@ def visualize(sensor_id: str,
     plt.figure(figsize=(8, 4))
     plt.plot(df["timestamp"], df[metric], marker="o", linestyle="-", label=f"Historical {metric}")
 
-    # optional: add forecast preview (7 days)
+    # add forecast preview
     X = np.arange(len(df)).reshape(-1, 1)
     y = df[metric].values
     model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
