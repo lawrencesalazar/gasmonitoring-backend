@@ -174,12 +174,11 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
         "sensor_type": sensor,
         "comparison": results
     }
-
 # ---------------------------------------------------
-# Forecast for a given sensor
+# Predict Forecast for a given sensor
 # ---------------------------------------------------
-@app.get("/forecast/{sensor_id}")
-def forecast(sensor_id: str, sensor: str = "methane", steps: int = 7):
+@app.get("/predict/{sensor_id}")
+def predict(sensor_id: str, sensor: str = "methane", steps: int = 7):
     """
     Forecast values for a given sensor type (e.g., methane, ammonia, co2, humidity, temperature, riskIndex).
     Example: /forecast/321?sensor=riskIndex&steps=7
@@ -218,7 +217,7 @@ def forecast(sensor_id: str, sensor: str = "methane", steps: int = 7):
             for d, v in zip(forecast_dates, future_preds)
         ]
 
-        # ✅ Special handling: also forecast riskIndex if sensor != riskIndex
+        # ✅ Special handling: also predict forecast riskIndex if sensor != riskIndex
         riskIndex_forecast = None
         if sensor != "riskIndex" and "riskIndex" in df.columns:
             risk_values = df["riskIndex"].values
@@ -242,7 +241,6 @@ def forecast(sensor_id: str, sensor: str = "methane", steps: int = 7):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
