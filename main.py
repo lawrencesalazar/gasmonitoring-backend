@@ -184,8 +184,8 @@ def predict(
     steps: int = 7
 ):
     """
-    Forecast values for a given sensor type (e.g., methane, ammonia, co2, humidity, temperature, riskIndex).
-    Example: /predict/321?sensor=riskIndex&steps=7
+    Forecast values for a given sensor type.
+    Also forecasts riskIndex if it exists in history.
     """
     records = fetch_sensor_history(sensor_id)
     if not records:
@@ -193,27 +193,26 @@ def predict(
 
     df = pd.DataFrame(records)
 
-    # ✅ Ensure the sensor column exists
+    # ✅ Ensure requested sensor exists
     if sensor not in df.columns:
         return JSONResponse(
-            {"error": f"Sensor '{sensor}' not found. Available sensors: {list(df.columns)}"},
+            {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
             status_code=400,
         )
 
-    values = df[sensor].values
-    if len(values) < 5:
-        return JSONResponse({"error": "Not enough data for forecasting"}, status_code=400)
+    values = df[sensor].dropna().values
+    if len(values) < 3:
+        return JSONResponse({"error": f"Not enough data for forecasting {sensor}"}, status_code=400)
 
     X = np.arange(len(values)).reshape(-1, 1)
     y = values
 
-    model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
-
     try:
-        # Train model
+        # Train model for selected sensor
+        model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
         model.fit(X, y)
 
-        # Forecast next N steps
+        # Forecast future steps
         future_X = np.arange(len(values), len(values) + steps).reshape(-1, 1)
         preds = model.predict(future_X)
 
@@ -225,16 +224,21 @@ def predict(
             for d, v in zip(forecast_dates, preds)
         ]
 
-        # ✅ Also forecast next-day riskIndex (regardless of sensor type)
+        # ✅ Forecast riskIndex if available
         riskIndex_forecast = None
-        if "riskIndex" in df.columns and len(df["riskIndex"].values) >= 5:
-            X_risk = np.arange(len(df)).reshape(-1, 1)
-            y_risk = df["riskIndex"].values
-            risk_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
-            risk_model.fit(X_risk, y_risk)
-            riskIndex_forecast = float(
-                risk_model.predict(np.array([[len(y_risk)]]))[0]
-            )
+        if "riskIndex" in df.columns:
+            risk_values = df["riskIndex"].dropna().values
+            if len(risk_values) >= 3:
+                try:
+                    X_risk = np.arange(len(risk_values)).reshape(-1, 1)
+                    y_risk = risk_values
+                    risk_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
+                    risk_model.fit(X_risk, y_risk)
+                    riskIndex_forecast = float(
+                        risk_model.predict(np.array([[len(y_risk)]]))[0]
+                    )
+                except Exception as e:
+                    riskIndex_forecast = f"forecast_error: {str(e)}"
 
         return {
             "sensor_id": sensor_id,
@@ -245,6 +249,7 @@ def predict(
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
