@@ -1,8 +1,7 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import os
 import json
-import io
 from datetime import datetime, timedelta
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,12 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import pandas as pd
 
-
-
 # ML Models
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error
 
 # Firebase
 import firebase_admin
@@ -29,23 +27,30 @@ try:
 except ImportError:
     plt = None
 
-
 # ---------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------
 app = FastAPI()
 
-# ✅ Allow requests from your frontend
+# ✅ Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict to your frontend domain instead of "*"
+    allow_origins=["*"],  # Replace "*" with your frontend URL in production
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly include OPTIONS
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-from fastapi.responses import JSONResponse
+# ✅ Global middleware to force CORS headers on all responses
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
+# ✅ Handle preflight OPTIONS requests explicitly
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(rest_of_path: str):
     return JSONResponse(
@@ -58,7 +63,7 @@ async def preflight_handler(rest_of_path: str):
     )
 
 # ---------------------------------------------------
-# ✅ Firebase Setup (from ENV)
+# Firebase Setup
 # ---------------------------------------------------
 service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
 database_url = os.getenv(
@@ -69,7 +74,6 @@ database_url = os.getenv(
 if not firebase_admin._apps:
     cred = credentials.Certificate(service_account_info)
     firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-
 
 # ---------------------------------------------------
 # Helper: Fetch Sensor History
@@ -99,7 +103,6 @@ def fetch_sensor_history(sensor_id: str):
 
     return sorted(records, key=lambda x: x["timestamp"])
 
-
 # ---------------------------------------------------
 # Forecast (XGBoost)
 # ---------------------------------------------------
@@ -128,24 +131,18 @@ def forecast(sensor_id: str, steps: int = 7):
     ]
 
     return {"sensor_id": sensor_id, "forecast": forecast_data}
-from sklearn.metrics import mean_squared_error
 
 # ---------------------------------------------------
 # Compare Models (XGBoost, RF, NN) with MSE
 # ---------------------------------------------------
 @app.get("/compare/{sensor_id}")
 def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
-    """
-    Compare forecasting models for a given sensor_id and sensor type.
-    Example: /compare/321?sensor=ammonia&steps=7
-    """
     records = fetch_sensor_history(sensor_id)
     if not records:
         return JSONResponse({"error": "No data found"}, status_code=404)
 
     df = pd.DataFrame(records)
 
-    # ✅ Ensure the sensor exists in data
     if sensor not in df.columns:
         return JSONResponse(
             {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
@@ -156,7 +153,6 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
     X = np.arange(len(values)).reshape(-1, 1)
     y = values
 
-    # Train/test split (last 20% as test set)
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
@@ -174,14 +170,9 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
 
     for name, model in models.items():
         try:
-            # Train model
             model.fit(X_train, y_train)
-
-            # Predict test set and compute MSE
             test_preds = model.predict(X_test)
             mse = mean_squared_error(y_test, test_preds)
-
-            # Forecast future values
             future_preds = model.predict(future_X)
 
             results[name] = {
@@ -199,37 +190,29 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
         "sensor_type": sensor,
         "comparison": results
     }
+
 # ---------------------------------------------------
 # Predict Forecast for a given sensor
 # ---------------------------------------------------
-from fastapi import Query
-from xgboost import XGBRegressor
-import numpy as np
-import pandas as pd
-from datetime import timedelta
-
 @app.get("/predict/{sensor_id}")
 def predict(
     sensor_id: str,
-    sensor: str = Query("methane", enum=["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]),
+    sensor: str = Query(
+        "methane",
+        enum=["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]
+    ),
     steps: int = 7
 ):
-    """
-    Forecast values for a given sensor type using XGBoost.
-    Adds lag features for better forecasting.
-    Also forecasts riskIndex if available or can be computed.
-    """
     records = fetch_sensor_history(sensor_id)
     if not records:
         return JSONResponse({"error": f"No history data found for sensor {sensor_id}"}, status_code=404)
 
     df = pd.DataFrame(records)
 
-    #  Compute riskIndex if missing
+    # Compute riskIndex if missing
     if "riskIndex" not in df.columns and all(c in df.columns for c in ["methane", "co2", "ammonia"]):
         df["riskIndex"] = 0.4 * df["methane"] + 0.35 * df["co2"] + 0.25 * df["ammonia"]
 
-    #  Ensure requested sensor exists
     if sensor not in df.columns:
         return JSONResponse(
             {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
@@ -269,7 +252,7 @@ def predict(
         for d, v in zip(forecast_dates, preds)
     ]
 
-    #  Forecast riskIndex (next day only)
+    # Forecast riskIndex (next day only)
     riskIndex_forecast = None
     if "riskIndex" in df.columns:
         risk_vals = df["riskIndex"].dropna().values
@@ -290,6 +273,7 @@ def predict(
         "forecasts": forecast_result,
         "riskIndex_next_day": riskIndex_forecast,
     }
+
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
