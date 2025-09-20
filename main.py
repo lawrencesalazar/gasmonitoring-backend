@@ -5,8 +5,12 @@ import json
 import io
 from datetime import datetime, timedelta
 
+from fastapi.middleware.cors import CORSMiddleware
+
 import numpy as np
 import pandas as pd
+
+
 
 # ML Models
 from sklearn.ensemble import RandomForestRegressor
@@ -31,6 +35,27 @@ except ImportError:
 # ---------------------------------------------------
 app = FastAPI()
 
+# ✅ Allow requests from your frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # You can restrict to your frontend domain instead of "*"
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly include OPTIONS
+    allow_headers=["*"],
+)
+
+from fastapi.responses import JSONResponse
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return JSONResponse(
+        content={"message": "CORS preflight ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
 # ---------------------------------------------------
 # ✅ Firebase Setup (from ENV)
@@ -200,11 +225,11 @@ def predict(
 
     df = pd.DataFrame(records)
 
-    # ✅ Compute riskIndex if missing
+    #  Compute riskIndex if missing
     if "riskIndex" not in df.columns and all(c in df.columns for c in ["methane", "co2", "ammonia"]):
         df["riskIndex"] = 0.4 * df["methane"] + 0.35 * df["co2"] + 0.25 * df["ammonia"]
 
-    # ✅ Ensure requested sensor exists
+    #  Ensure requested sensor exists
     if sensor not in df.columns:
         return JSONResponse(
             {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
@@ -244,7 +269,7 @@ def predict(
         for d, v in zip(forecast_dates, preds)
     ]
 
-    # ✅ Forecast riskIndex (next day only)
+    #  Forecast riskIndex (next day only)
     riskIndex_forecast = None
     if "riskIndex" in df.columns:
         risk_vals = df["riskIndex"].dropna().values
