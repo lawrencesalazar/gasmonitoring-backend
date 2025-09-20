@@ -178,59 +178,63 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
 # Predict Forecast for a given sensor
 # ---------------------------------------------------
 @app.get("/predict/{sensor_id}")
-def predict(sensor_id: str, sensor: str = "methane", steps: int = 7):
+def predict(
+    sensor_id: str,
+    sensor: str = Query("methane", enum=["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]),
+    steps: int = 7
+):
     """
     Forecast values for a given sensor type (e.g., methane, ammonia, co2, humidity, temperature, riskIndex).
-    Example: /forecast/321?sensor=riskIndex&steps=7
+    Example: /predict/321?sensor=riskIndex&steps=7
     """
     records = fetch_sensor_history(sensor_id)
     if not records:
-        return JSONResponse({"error": "No data found"}, status_code=404)
+        return JSONResponse({"error": f"No history data found for sensor {sensor_id}"}, status_code=404)
 
     df = pd.DataFrame(records)
 
-    # ✅ Ensure the sensor exists
+    # ✅ Ensure the sensor column exists
     if sensor not in df.columns:
         return JSONResponse(
-            {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
+            {"error": f"Sensor '{sensor}' not found. Available sensors: {list(df.columns)}"},
             status_code=400,
         )
 
     values = df[sensor].values
+    if len(values) < 5:
+        return JSONResponse({"error": "Not enough data for forecasting"}, status_code=400)
+
     X = np.arange(len(values)).reshape(-1, 1)
     y = values
 
     model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
 
     try:
+        # Train model
         model.fit(X, y)
 
-        # Forecast future steps
+        # Forecast next N steps
         future_X = np.arange(len(values), len(values) + steps).reshape(-1, 1)
-        future_preds = model.predict(future_X)
+        preds = model.predict(future_X)
 
         last_date = pd.to_datetime(df["timestamp"].iloc[-1])
         forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
 
         forecast_result = [
             {"date": d.strftime("%Y-%m-%d"), "forecast": float(v)}
-            for d, v in zip(forecast_dates, future_preds)
+            for d, v in zip(forecast_dates, preds)
         ]
 
-        # ✅ Special handling: also predict forecast riskIndex if sensor != riskIndex
+        # ✅ Also forecast next-day riskIndex (regardless of sensor type)
         riskIndex_forecast = None
-        if sensor != "riskIndex" and "riskIndex" in df.columns:
-            risk_values = df["riskIndex"].values
-            X_risk = np.arange(len(risk_values)).reshape(-1, 1)
-            y_risk = risk_values
-
+        if "riskIndex" in df.columns and len(df["riskIndex"].values) >= 5:
+            X_risk = np.arange(len(df)).reshape(-1, 1)
+            y_risk = df["riskIndex"].values
             risk_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
             risk_model.fit(X_risk, y_risk)
-
-            risk_preds = risk_model.predict(
-                np.arange(len(risk_values), len(risk_values) + 1).reshape(-1, 1)
+            riskIndex_forecast = float(
+                risk_model.predict(np.array([[len(y_risk)]]))[0]
             )
-            riskIndex_forecast = float(risk_preds[0])
 
         return {
             "sensor_id": sensor_id,
