@@ -177,6 +177,12 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
 # ---------------------------------------------------
 # Predict Forecast for a given sensor
 # ---------------------------------------------------
+from fastapi import Query
+from xgboost import XGBRegressor
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+
 @app.get("/predict/{sensor_id}")
 def predict(
     sensor_id: str,
@@ -184,14 +190,19 @@ def predict(
     steps: int = 7
 ):
     """
-    Forecast values for a given sensor type.
-    Also forecasts riskIndex if it exists in history.
+    Forecast values for a given sensor type using XGBoost.
+    Adds lag features for better forecasting.
+    Also forecasts riskIndex if available or can be computed.
     """
     records = fetch_sensor_history(sensor_id)
     if not records:
         return JSONResponse({"error": f"No history data found for sensor {sensor_id}"}, status_code=404)
 
     df = pd.DataFrame(records)
+
+    # ✅ Compute riskIndex if missing
+    if "riskIndex" not in df.columns and all(c in df.columns for c in ["methane", "co2", "ammonia"]):
+        df["riskIndex"] = 0.4 * df["methane"] + 0.35 * df["co2"] + 0.25 * df["ammonia"]
 
     # ✅ Ensure requested sensor exists
     if sensor not in df.columns:
@@ -201,55 +212,59 @@ def predict(
         )
 
     values = df[sensor].dropna().values
-    if len(values) < 3:
+    if len(values) < 10:
         return JSONResponse({"error": f"Not enough data for forecasting {sensor}"}, status_code=400)
 
-    X = np.arange(len(values)).reshape(-1, 1)
-    y = values
+    # Build lag features
+    lags = 3
+    X, y = [], []
+    for i in range(lags, len(values)):
+        X.append(values[i-lags:i])
+        y.append(values[i])
+    X, y = np.array(X), np.array(y)
 
-    try:
-        # Train model for selected sensor
-        model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
-        model.fit(X, y)
+    # Train XGBoost
+    model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=3)
+    model.fit(X, y)
 
-        # Forecast future steps
-        future_X = np.arange(len(values), len(values) + steps).reshape(-1, 1)
-        preds = model.predict(future_X)
+    # Forecast future values iteratively
+    last_known = values[-lags:].tolist()
+    preds = []
+    for _ in range(steps):
+        next_val = model.predict(np.array(last_known[-lags:]).reshape(1, -1))[0]
+        preds.append(next_val)
+        last_known.append(next_val)
 
-        last_date = pd.to_datetime(df["timestamp"].iloc[-1])
-        forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
+    # Build forecast dates
+    last_date = pd.to_datetime(df["timestamp"].iloc[-1])
+    forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
 
-        forecast_result = [
-            {"date": d.strftime("%Y-%m-%d"), "forecast": float(v)}
-            for d, v in zip(forecast_dates, preds)
-        ]
+    forecast_result = [
+        {"date": d.strftime("%Y-%m-%d"), "forecast": float(v)}
+        for d, v in zip(forecast_dates, preds)
+    ]
 
-        # ✅ Forecast riskIndex if available
-        riskIndex_forecast = None
-        if "riskIndex" in df.columns:
-            risk_values = df["riskIndex"].dropna().values
-            if len(risk_values) >= 3:
-                try:
-                    X_risk = np.arange(len(risk_values)).reshape(-1, 1)
-                    y_risk = risk_values
-                    risk_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3)
-                    risk_model.fit(X_risk, y_risk)
-                    riskIndex_forecast = float(
-                        risk_model.predict(np.array([[len(y_risk)]]))[0]
-                    )
-                except Exception as e:
-                    riskIndex_forecast = f"forecast_error: {str(e)}"
+    # ✅ Forecast riskIndex (next day only)
+    riskIndex_forecast = None
+    if "riskIndex" in df.columns:
+        risk_vals = df["riskIndex"].dropna().values
+        if len(risk_vals) >= lags:
+            X_risk, y_risk = [], []
+            for i in range(lags, len(risk_vals)):
+                X_risk.append(risk_vals[i-lags:i])
+                y_risk.append(risk_vals[i])
+            X_risk, y_risk = np.array(X_risk), np.array(y_risk)
 
-        return {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "forecasts": forecast_result,
-            "riskIndex_next_day": riskIndex_forecast,
-        }
+            risk_model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=3)
+            risk_model.fit(X_risk, y_risk)
+            riskIndex_forecast = float(risk_model.predict(np.array(risk_vals[-lags:]).reshape(1, -1))[0])
 
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+    return {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "forecasts": forecast_result,
+        "riskIndex_next_day": riskIndex_forecast,
+    }
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
