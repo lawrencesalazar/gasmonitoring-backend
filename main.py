@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-import os, json, io
+import os
+import json
+import io
 from datetime import datetime, timedelta
 
 import numpy as np
