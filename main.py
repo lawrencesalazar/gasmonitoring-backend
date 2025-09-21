@@ -35,7 +35,7 @@ app = FastAPI()
 # ✅ Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace "*" with your frontend URL in production
+    allow_origins=["https://gasmonitoring-ec511.web.app", "http://localhost:3000"],  # Replace "*" with your frontend URL in production
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -103,6 +103,21 @@ def fetch_sensor_history(sensor_id: str):
 
     return sorted(records, key=lambda x: x["timestamp"])
 
+# ---------------------------------------------------
+# Display Dataframe 
+# ---------------------------------------------------
+@app.get("/dataframe/{sensor_id}")
+def  dataframe(sensor_id: str, steps: int = 7):     
+    # Filter records for this sensor_id
+    filtered = [r for r in records if r["sensor_id"] == sensor_id]
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(filtered)
+    print(df)  # <-- prints in backend logs (server console)
+    
+    # Convert DataFrame to JSON so frontend can use it
+    return JSONResponse(content=df.to_dict(orient="records"))
+    
 # ---------------------------------------------------
 # Forecast (XGBoost)
 # ---------------------------------------------------
