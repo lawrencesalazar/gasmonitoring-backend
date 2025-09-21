@@ -35,7 +35,7 @@ app = FastAPI()
 # ✅ Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gasmonitoring-ec511.web.app", "http://localhost:3000"],  # Replace "*" with your frontend URL in production
+    allow_origins=["*"] #["https://gasmonitoring-ec511.web.app", "http://localhost:3000"],  # Replace "*" with your frontend URL in production
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
