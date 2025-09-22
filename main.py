@@ -134,12 +134,7 @@ def preprocess_sensor_data(records, resample_freq: str = "D"):
 
     # Fill missing values (forward-fill, then back-fill as fallback)
     df = df.ffill().bfill()
-
-    # Optionally: normalize (example: min-max scaling 0-1)
-    # from sklearn.preprocessing import MinMaxScaler
-    # scaler = MinMaxScaler()
-    # df[df.columns] = scaler.fit_transform(df[df.columns])
-
+ 
     # Example feature engineering: rolling average
     df["methane_rolling"] = df["methane"].rolling(window=3, min_periods=1).mean()
 
@@ -171,7 +166,7 @@ def forecast(sensor_id: str, steps: int = 7):
     if not records:
         return JSONResponse({"error": "No data found"}, status_code=404)
 
-    df = pd.DataFrame(records)
+    df = preprocess_sensor_data(records, resample_freq="D") 
     values = df["methane"].values
     X = np.arange(len(values)).reshape(-1, 1)
     y = values
@@ -200,7 +195,7 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
     if not records:
         return JSONResponse({"error": "No data found"}, status_code=404)
 
-    df = pd.DataFrame(records)
+    df = preprocess_sensor_data(records, resample_freq="D") 
 
     if sensor not in df.columns:
         return JSONResponse(
@@ -266,7 +261,7 @@ def predict(
     if not records:
         return JSONResponse({"error": f"No history data found for sensor {sensor_id}"}, status_code=404)
 
-    df = pd.DataFrame(records)
+    df = preprocess_sensor_data(records, resample_freq="D") 
 
     # Compute riskIndex if missing
     if "riskIndex" not in df.columns and all(c in df.columns for c in ["methane", "co2", "ammonia"]):
@@ -332,6 +327,30 @@ def predict(
         "forecasts": forecast_result,
         "riskIndex_next_day": riskIndex_forecast,
     }
+#---------------------------
+# Predict Methane
+# -----------------------------
+@app.get("/methane-forecast/{sensor_id}")
+def methane_forecast(sensor_id: str, steps: int = 7):
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_sensor_data(records)
+
+    model = train_xgboost(df, target_col="methane")
+
+    # Prepare last known data as input for forecasting
+    last_data = make_features(df).iloc[-1:].drop(columns=["methane", "timestamp"])
+
+    preds = []
+    for _ in range(steps):
+        y_pred = model.predict(last_data)[0]
+        preds.append(float(y_pred))
+
+        # Roll forward (simulate future lags)
+        new_row = last_data.copy()
+        new_row.iloc[0, 0] = y_pred  # inject prediction
+        last_data = new_row
+
+    return {"sensor_id": sensor_id, "forecasts": preds}
 
 # ---------------------------------------------------
 # Health Check
