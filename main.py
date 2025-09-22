@@ -15,6 +15,7 @@ from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error
 
+
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, db
@@ -32,7 +33,7 @@ except ImportError:
 # ---------------------------------------------------
 app = FastAPI()
 
-# ✅ Standard CORSMiddleware
+# Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], #["https://gasmonitoring-ec511.web.app", "http://localhost:3000"],  # Replace "*" with your frontend URL in production
@@ -41,7 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Global middleware to force CORS headers on all responses
+#  Global middleware to force CORS headers on all responses
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
@@ -50,7 +51,7 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# ✅ Handle preflight OPTIONS requests explicitly
+# Handle preflight OPTIONS requests explicitly
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(rest_of_path: str):
     return JSONResponse(
@@ -330,6 +331,34 @@ def predict(
 #---------------------------
 # Predict Methane
 # -----------------------------
+def make_features(df, target_col="methane", lags=7):
+    # Add lag features (last N readings)
+    for i in range(1, lags+1):
+        df[f"{target_col}_lag{i}"] = df[target_col].shift(i)
+    df = df.dropna()
+    return df
+
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+def train_xgboost(df, target_col="methane"):
+    df = make_features(df, target_col)
+    
+    X = df.drop(columns=[target_col, "timestamp"])
+    y = df[target_col]
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    
+    model = xgb.XGBRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8
+    )
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    
+    return model
+
 @app.get("/methane-forecast/{sensor_id}")
 def methane_forecast(sensor_id: str, steps: int = 7):
     records = fetch_sensor_history(sensor_id)
