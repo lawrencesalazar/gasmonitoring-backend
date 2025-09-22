@@ -107,16 +107,21 @@ def fetch_sensor_history(sensor_id: str):
 # Display Dataframe 
 # ---------------------------------------------------
 @app.get("/dataframe/{sensor_id}")
-def  dataframe(sensor_id: str, steps: int = 7):     
+def dataframe(sensor_id: str, steps: int = 7):
     records = fetch_sensor_history(sensor_id)
-    
+
+    if not records:
+        return JSONResponse({"error": f"No history found for {sensor_id}"}, status_code=404)
+
     # Convert to DataFrame
     df = pd.DataFrame(records)
-    # print(df)  # <-- prints in backend logs (server console)
-    
-    # Convert DataFrame to JSON so frontend can use it
+    print(df)
+    # ✅ Convert timestamps to string (for JSON)
+    if "timestamp" in df.columns:
+        df["timestamp"] = df["timestamp"].astype(str)
+
+    # ✅ Return JSON-safe response
     return JSONResponse(content=df.to_dict(orient="records"))
-    
 # ---------------------------------------------------
 # Forecast (XGBoost)
 # ---------------------------------------------------
