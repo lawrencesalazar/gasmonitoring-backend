@@ -104,25 +104,61 @@ def fetch_sensor_history(sensor_id: str):
     return sorted(records, key=lambda x: x["timestamp"])
 
 # ---------------------------------------------------
-# Display Dataframe 
+# PreProcess DataFrame
 # ---------------------------------------------------
+def preprocess_sensor_data(records, resample_freq: str = "D"):
+    """
+    Preprocess sensor records:
+      - Convert timestamps
+      - Handle missing values
+      - Resample (default: daily)
+      - Scale numeric values if needed
+    """
+
+    df = pd.DataFrame(records)
+
+    if df.empty:
+        return df
+
+    # Ensure timestamp is datetime
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    if "timestamp" in pd.columns:
+        df["timestamp"] = df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, str) else x)
+
+    # Set timestamp as index
+    df = df.set_index("timestamp").sort_index()
+
+    # Resample (e.g. daily averages)
+    df = df.resample(resample_freq).mean()
+
+    # Fill missing values (forward-fill, then back-fill as fallback)
+    df = df.ffill().bfill()
+
+    # Optionally: normalize (example: min-max scaling 0-1)
+    # from sklearn.preprocessing import MinMaxScaler
+    # scaler = MinMaxScaler()
+    # df[df.columns] = scaler.fit_transform(df[df.columns])
+
+    # Example feature engineering: rolling average
+    df["methane_rolling"] = df["methane"].rolling(window=3, min_periods=1).mean()
+
+    return df.reset_index()
+
 # ---------------------------------------------------
 # Display Dataframe 
 # ---------------------------------------------------
 @app.get("/dataframe/{sensor_id}")
 def dataframe(sensor_id: str, steps: int = 7):
     records = fetch_sensor_history(sensor_id)
-
+    
     if not records:
         return JSONResponse({"error": f"No history found for {sensor_id}"}, status_code=404)
-
+  
     # Convert to DataFrame
-    df = pd.DataFrame(records)
-    print(df )
-    # Ensure timestamps are converted to string
-    if "timestamp" in df.columns:
-        df["timestamp"] = df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, str) else x)
-
+    df = preprocess_sensor_data(records, resample_freq="D")  
+    # print(df)
+     
     # Convert DataFrame to JSON-safe dict
     return JSONResponse(content=df.to_dict(orient="records"))
 
