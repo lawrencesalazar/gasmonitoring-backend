@@ -1,15 +1,27 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-import firebase_admin
-from firebase_admin import credentials, db
-import pandas as pd
-import xgboost as xgb
-import numpy as np
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+import os
+import json
 from datetime import datetime, timedelta
 
-# ----------------------
-# FastAPI app setup
-# ----------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+import numpy as np
+import pandas as pd
+
+# ML Models
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error
+
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, db
+
+# ---------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------
 app = FastAPI()
 
 # Standard CORSMiddleware
@@ -40,7 +52,6 @@ async def preflight_handler(rest_of_path: str):
             "Access-Control-Allow-Headers": "*",
         },
     )
-
 
 # ---------------------------------------------------
 # Firebase Setup
@@ -175,3 +186,8 @@ def dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type"
         "sensor_type": sensor,
         "data": df.to_dict(orient="records")
     }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
