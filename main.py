@@ -183,6 +183,9 @@ def dataframe(sensor_id: str, steps: int = 7):
     df = preprocess_sensor_data(records, resample_freq="D")  
     # print(df)
      
+    # Convert timestamps to string for JSON serialization
+    df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    
     # Convert DataFrame to JSON-safe dict
     return JSONResponse(content=df.to_dict(orient="records"))
 
