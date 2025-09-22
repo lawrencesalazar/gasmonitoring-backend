@@ -108,11 +108,10 @@ def fetch_sensor_history(sensor_id: str):
 # ---------------------------------------------------
 @app.get("/dataframe/{sensor_id}")
 def  dataframe(sensor_id: str, steps: int = 7):     
-    # Filter records for this sensor_id
-    filtered = [r for r in records if r["sensor_id"] == sensor_id]
+    records = fetch_sensor_history(sensor_id)
     
     # Convert to DataFrame
-    df = pd.DataFrame(filtered)
+    df = pd.DataFrame(records)
     print(df)  # <-- prints in backend logs (server console)
     
     # Convert DataFrame to JSON so frontend can use it
