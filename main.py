@@ -104,6 +104,34 @@ def fetch_sensor_history(sensor_id: str):
 
     return sorted(records, key=lambda x: x["timestamp"])
 
+def make_features(df: pd.DataFrame, target_col: str, lags: int = 7):
+    """Generate lag features for time-series forecasting"""
+    for i in range(1, lags+1):
+        df[f"{target_col}_lag{i}"] = df[target_col].shift(i)
+    df = df.dropna()
+    return df
+
+def train_xgboost(df: pd.DataFrame, target_col: str, lags: int = 7):
+    """Train XGBoost on historical sensor data"""
+    df = make_features(df, target_col, lags)
+
+    X = df.drop(columns=[target_col, "timestamp"], errors="ignore")
+    y = df[target_col]
+
+    if len(X) < 10:  # not enough data
+        return None, None
+
+    model = xgb.XGBRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror"
+    )
+    model.fit(X, y, verbose=False)
+    return model, df
+
 # ---------------------------------------------------
 # PreProcess DataFrame
 # ---------------------------------------------------
@@ -124,8 +152,8 @@ def preprocess_sensor_data(records, resample_freq: str = "D"):
     # Ensure timestamp is datetime
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    if "timestamp" in pd.columns:
-        df["timestamp"] = df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, str) else x)
+    # if "timestamp" in df.columns:
+        # df["timestamp"] = df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, str) else x)
 
     # Set timestamp as index
     df = df.set_index("timestamp").sort_index()
@@ -252,81 +280,44 @@ def compare(sensor_id: str, sensor: str = "methane", steps: int = 7):
 @app.get("/predict/{sensor_id}")
 def predict(
     sensor_id: str,
-    sensor: str = Query(
-        "methane",
-        enum=["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]
-    ),
+    sensor: str = Query(..., description="Sensor type: methane, co2, ammonia, temperature, humidity"),
     steps: int = 7
 ):
-    records = fetch_sensor_history(sensor_id)
-    if not records:
-        return JSONResponse({"error": f"No history data found for sensor {sensor_id}"}, status_code=404)
+    # Fetch history from Firebase
+    df = fetch_sensor_history(sensor_id, sensor)
+    if df.empty:
+        return {"error": f"No data found for sensor {sensor_id} ({sensor})"}
 
-    df = preprocess_sensor_data(records, resample_freq="D") 
+    model, processed_df = train_xgboost(df.copy(), sensor)
+    if model is None:
+        return {"error": "Not enough data to train XGBoost"}
 
-    # Compute riskIndex if missing
-    if "riskIndex" not in df.columns and all(c in df.columns for c in ["methane", "co2", "ammonia"]):
-        df["riskIndex"] = 0.4 * df["methane"] + 0.35 * df["co2"] + 0.25 * df["ammonia"]
+    # Prepare last known data for forecasting
+    features_df = make_features(df.copy(), sensor)
+    last_row = features_df.iloc[-1:].drop(columns=[sensor, "timestamp"], errors="ignore")
 
-    if sensor not in df.columns:
-        return JSONResponse(
-            {"error": f"Sensor '{sensor}' not found. Available: {list(df.columns)}"},
-            status_code=400,
-        )
-
-    values = df[sensor].dropna().values
-    if len(values) < 10:
-        return JSONResponse({"error": f"Not enough data for forecasting {sensor}"}, status_code=400)
-
-    # Build lag features
-    lags = 3
-    X, y = [], []
-    for i in range(lags, len(values)):
-        X.append(values[i-lags:i])
-        y.append(values[i])
-    X, y = np.array(X), np.array(y)
-
-    # Train XGBoost
-    model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=3)
-    model.fit(X, y)
-
-    # Forecast future values iteratively
-    last_known = values[-lags:].tolist()
-    preds = []
+    preds: List[float] = []
     for _ in range(steps):
-        next_val = model.predict(np.array(last_known[-lags:]).reshape(1, -1))[0]
-        preds.append(next_val)
-        last_known.append(next_val)
+        y_pred = model.predict(last_row)[0]
+        preds.append(float(y_pred))
 
-    # Build forecast dates
-    last_date = pd.to_datetime(df["timestamp"].iloc[-1])
-    forecast_dates = [last_date + timedelta(days=i + 1) for i in range(steps)]
+        # Roll forward: simulate feeding prediction as new lag
+        new_row = last_row.copy()
+        for i in range(2, len(new_row.columns) + 1):
+            if f"{sensor}_lag{i}" in new_row.columns:
+                new_row[f"{sensor}_lag{i}"] = new_row[f"{sensor}_lag{i-1}"]
+        new_row[f"{sensor}_lag1"] = y_pred
+        last_row = new_row
 
     forecast_result = [
-        {"date": d.strftime("%Y-%m-%d"), "forecast": float(v)}
-        for d, v in zip(forecast_dates, preds)
+        {"date": str(pd.Timestamp.now().normalize() + pd.Timedelta(days=i+1)), "forecast": preds[i]}
+        for i in range(steps)
     ]
-
-    # Forecast riskIndex (next day only)
-    riskIndex_forecast = None
-    if "riskIndex" in df.columns:
-        risk_vals = df["riskIndex"].dropna().values
-        if len(risk_vals) >= lags:
-            X_risk, y_risk = [], []
-            for i in range(lags, len(risk_vals)):
-                X_risk.append(risk_vals[i-lags:i])
-                y_risk.append(risk_vals[i])
-            X_risk, y_risk = np.array(X_risk), np.array(y_risk)
-
-            risk_model = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=3)
-            risk_model.fit(X_risk, y_risk)
-            riskIndex_forecast = float(risk_model.predict(np.array(risk_vals[-lags:]).reshape(1, -1))[0])
 
     return {
         "sensor_id": sensor_id,
         "sensor_type": sensor,
-        "forecasts": forecast_result,
-        "riskIndex_next_day": riskIndex_forecast,
+        "forecasts": forecast_result
     }
 #---------------------------
 # Predict Methane
