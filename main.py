@@ -41,13 +41,19 @@ async def preflight_handler(rest_of_path: str):
         },
     )
 
-# ----------------------
-# Firebase setup
-# ----------------------
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {
-    "databaseURL":     "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
-})
+
+# ---------------------------------------------------
+# Firebase Setup
+# ---------------------------------------------------
+service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
+database_url = os.getenv(
+    "FIREBASE_DB_URL",
+    "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
+)
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate(service_account_info)
+    firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
 # ----------------------
 # Helper function
