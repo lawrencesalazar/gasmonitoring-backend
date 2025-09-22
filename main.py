@@ -106,6 +106,9 @@ def fetch_sensor_history(sensor_id: str):
 # ---------------------------------------------------
 # Display Dataframe 
 # ---------------------------------------------------
+# ---------------------------------------------------
+# Display Dataframe 
+# ---------------------------------------------------
 @app.get("/dataframe/{sensor_id}")
 def dataframe(sensor_id: str, steps: int = 7):
     records = fetch_sensor_history(sensor_id)
@@ -115,13 +118,14 @@ def dataframe(sensor_id: str, steps: int = 7):
 
     # Convert to DataFrame
     df = pd.DataFrame(records)
-    print(df)
-    # ✅ Convert timestamps to string (for JSON)
+    print(df )
+    # Ensure timestamps are converted to string
     if "timestamp" in df.columns:
-        df["timestamp"] = df["timestamp"].astype(str)
+        df["timestamp"] = df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if not isinstance(x, str) else x)
 
-    # ✅ Return JSON-safe response
+    # Convert DataFrame to JSON-safe dict
     return JSONResponse(content=df.to_dict(orient="records"))
+
 # ---------------------------------------------------
 # Forecast (XGBoost)
 # ---------------------------------------------------
