@@ -112,7 +112,7 @@ def  dataframe(sensor_id: str, steps: int = 7):
     
     # Convert to DataFrame
     df = pd.DataFrame(records)
-    print(df)  # <-- prints in backend logs (server console)
+    # print(df)  # <-- prints in backend logs (server console)
     
     # Convert DataFrame to JSON so frontend can use it
     return JSONResponse(content=df.to_dict(orient="records"))
