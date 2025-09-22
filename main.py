@@ -24,7 +24,6 @@ from firebase_admin import credentials, db
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -113,51 +112,13 @@ def predict(sensor_id: str, sensor: str = Query(..., description="Sensor type"),
     try:
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
-        if df.empty or len(df) < 10:
-            return {"sensor_id": sensor_id, "sensor_type": sensor, "forecasts": []}
-
-        df = make_lag_features(df)
-        X = df[["lag1", "lag2", "lag3"]].values
-        y = df["value"].values.reshape(-1, 1)
-
-        scaler = MinMaxScaler()
-        y_scaled = scaler.fit_transform(y).ravel()
-
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=200)
-        model.fit(X, y_scaled)
-
-        last_lags = df[["lag1", "lag2", "lag3"]].iloc[-1].values.tolist()
-        last_date = df["timestamp"].iloc[-1]
-
-        forecasts = []
-        for _ in range(steps):
-            lag_scaled = scaler.transform(np.array(last_lags).reshape(-1, 1)).ravel()
-            pred_scaled = model.predict(lag_scaled.reshape(1, -1))[0]
-            pred = float(scaler.inverse_transform([[pred_scaled]])[0][0])
-            next_date = last_date + timedelta(days=1)
-            forecasts.append({"date": next_date.strftime("%Y-%m-%d"), "forecast": pred})
-            last_lags = [pred] + last_lags[:2]
-            last_date = next_date
-
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "forecasts": forecasts}
-    except Exception as e:
-        logging.error(f"Prediction failed: {e}", exc_info=True)
-        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
-
-
-@app.get("/compare/{sensor_id}")
-def compare(sensor_id: str, sensor: str = Query(..., description="Sensor type"), steps: int = 7):
-    try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
         if df.empty or len(df) < 20:
-            return {"error": "Not enough data for comparison"}
+            return {"sensor_id": sensor_id, "sensor_type": sensor, "forecasts": []}
 
         df = make_lag_features(df)
         X = df[["lag1", "lag2", "lag3"]].values
         y = df["value"].values
 
-        # Normalize
         scaler = MinMaxScaler()
         y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
 
@@ -172,48 +133,47 @@ def compare(sensor_id: str, sensor: str = Query(..., description="Sensor type"),
             "neural_network": MLPRegressor(hidden_layer_sizes=(50,), max_iter=500),
         }
 
-        results = {}
-        last_lags = df[["lag1", "lag2", "lag3"]].iloc[-1].values.tolist()
-        last_date = df["timestamp"].iloc[-1]
+        best_model = None
+        best_name = None
+        best_mse = float("inf")
 
+        # Train + evaluate all models
         for name, model in models.items():
             try:
                 model.fit(X_train, y_train)
                 test_preds = model.predict(X_test)
-                mse = float(mean_squared_error(y_test, test_preds))
-
-                # Forecast steps
-                preds = []
-                tmp_lags = last_lags.copy()
-                tmp_date = last_date
-                for _ in range(steps):
-                    lag_scaled = scaler.transform(np.array(tmp_lags).reshape(-1, 1)).ravel()
-                    pred_scaled = model.predict(lag_scaled.reshape(1, -1))[0]
-                    pred = float(scaler.inverse_transform([[pred_scaled]])[0][0])
-                    tmp_date = tmp_date + timedelta(days=1)
-                    preds.append({"date": tmp_date.strftime("%Y-%m-%d"), "forecast": pred})
-                    tmp_lags = [pred] + tmp_lags[:2]
-
-                results[name] = {"mse": mse, "forecasts": preds}
+                mse = mean_squared_error(y_test, test_preds)
+                if mse < best_mse:
+                    best_mse = mse
+                    best_model = model
+                    best_name = name
             except Exception as e:
-                results[name] = {"error": str(e)}
+                logging.error(f"Model {name} failed: {e}")
 
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "comparison": results}
+        if best_model is None:
+            return {"error": "No model trained successfully"}
+
+        # Forecast future steps
+        last_lags = df[["lag1", "lag2", "lag3"]].iloc[-1].values.tolist()
+        last_date = df["timestamp"].iloc[-1]
+        forecasts = []
+
+        for _ in range(steps):
+            lag_scaled = scaler.transform(np.array(last_lags).reshape(-1, 1)).ravel()
+            pred_scaled = best_model.predict(lag_scaled.reshape(1, -1))[0]
+            pred = float(scaler.inverse_transform([[pred_scaled]])[0][0])
+            next_date = last_date + timedelta(days=1)
+            forecasts.append({"date": next_date.strftime("%Y-%m-%d"), "forecast": pred})
+            last_lags = [pred] + last_lags[:2]
+            last_date = next_date
+
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "selected_model": best_name,
+            "mse": best_mse,
+            "forecasts": forecasts
+        }
     except Exception as e:
-        logging.error(f"Comparison failed: {e}", exc_info=True)
+        logging.error(f"Prediction failed: {e}", exc_info=True)
         return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
-
-
-@app.get("/dataframe/{sensor_id}")
-def dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type")):
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    if df.empty:
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "data": []}
-    df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    return {"sensor_id": sensor_id, "sensor_type": sensor, "data": df.to_dict(orient="records")}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
