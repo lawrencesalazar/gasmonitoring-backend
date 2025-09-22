@@ -12,6 +12,7 @@ import pandas as pd
 # ML Models
 from xgboost import XGBRegressor
 
+import xgboost as xgb
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, db
