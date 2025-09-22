@@ -12,21 +12,41 @@ from datetime import datetime, timedelta
 # ----------------------
 app = FastAPI()
 
-# Enable CORS
+# Standard CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all for dev, restrict later if needed
+    allow_origins=["*"],  # Replace "*" with frontend URL in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Global middleware to force CORS headers
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return JSONResponse(
+        content={"message": "CORS preflight ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
 # ----------------------
 # Firebase setup
 # ----------------------
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://YOUR_FIREBASE_DB_URL"
+    "databaseURL":     "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
 })
 
 # ----------------------
