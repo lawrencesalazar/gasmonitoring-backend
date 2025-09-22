@@ -1,19 +1,16 @@
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 import os
 import json
 from datetime import datetime, timedelta
-
-from fastapi.middleware.cors import CORSMiddleware
 
 import numpy as np
 import pandas as pd
 
 # ML Models
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
-from sklearn.metrics import mean_squared_error
 
 # Firebase
 import firebase_admin
@@ -42,6 +39,7 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
+# Preflight handler
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(rest_of_path: str):
     return JSONResponse(
@@ -66,9 +64,9 @@ if not firebase_admin._apps:
     cred = credentials.Certificate(service_account_info)
     firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
-# ----------------------
-# Helper function
-# ----------------------
+# ---------------------------------------------------
+# Helper functions
+# ---------------------------------------------------
 def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase and return as list of dicts"""
     ref = db.reference(f"history/{sensor_id}")
@@ -78,12 +76,12 @@ def fetch_sensor_history(sensor_id: str):
         return []
 
     records = []
-    for key, value in snapshot.items():
-        row = value.copy()
-        # Convert timestamp safely
-        if "timestamp" in row:
+    for _, entry in snapshot.items():
+        row = entry.copy()
+        ts = row.get("timestamp") or row.get("time")
+        if ts:
             try:
-                row["timestamp"] = pd.to_datetime(row["timestamp"])
+                row["timestamp"] = pd.to_datetime(ts)
             except Exception:
                 row["timestamp"] = None
         records.append(row)
@@ -98,16 +96,14 @@ def preprocess_dataframe(records, sensor: str):
     df = pd.DataFrame(records)
 
     if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df = df.sort_values("timestamp")
 
-    # Keep only timestamp + sensor column
     if sensor not in df.columns:
         return pd.DataFrame()
 
     df = df[["timestamp", sensor]].dropna()
     df = df.rename(columns={sensor: "value"})
-
     return df
 
 
@@ -125,7 +121,7 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
     X = df[["lag1", "lag2", "lag3"]]
     y = df["value"]
 
-    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+    model = XGBRegressor(objective="reg:squarederror", n_estimators=100)
     model.fit(X, y)
 
     # Prepare last known lags
@@ -134,7 +130,7 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
     predictions = []
     last_date = df["timestamp"].iloc[-1]
 
-    for i in range(steps):
+    for _ in range(steps):
         pred = model.predict(last_lags.reshape(1, -1))[0]
         next_date = last_date + timedelta(days=1)
 
@@ -150,12 +146,15 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
 
     return predictions
 
-
-# ----------------------
+# ---------------------------------------------------
 # Endpoints
-# ----------------------
+# ---------------------------------------------------
 @app.get("/predict/{sensor_id}")
-def predict(sensor_id: str, sensor: str = Query(..., description="Sensor type (humidity, temperature, methane, co2, ammonia)"), steps: int = 7):
+def predict(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type (humidity, temperature, methane, co2, ammonia)"),
+    steps: int = 7
+):
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
 
@@ -171,14 +170,17 @@ def predict(sensor_id: str, sensor: str = Query(..., description="Sensor type (h
 
 
 @app.get("/dataframe/{sensor_id}")
-def dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type")):
+def dataframe(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type (humidity, temperature, methane, co2, ammonia)")
+):
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
 
     if df.empty:
         return {"sensor_id": sensor_id, "sensor_type": sensor, "data": []}
 
-    # Convert Timestamp to ISO strings
+    # Convert timestamps to strings
     df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
     return {
