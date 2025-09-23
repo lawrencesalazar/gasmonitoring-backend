@@ -16,6 +16,8 @@ import matplotlib
 matplotlib.use("Agg")  # For headless servers (Render)
 import matplotlib.pyplot as plt
 
+import seaborn as sns
+
 from sklearn.preprocessing import MinMaxScaler
 import xgboost as xgb
 
