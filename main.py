@@ -184,52 +184,66 @@ def predict(sensor_id: str, sensor: str = Query(..., description="Sensor type"),
     except Exception as e:
         logging.error(f"Prediction failed: {e}", exc_info=True)
         return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
+        
 @app.get("/explain/{sensor_id}")
 def explain(sensor_id: str, sensor: str = Query(..., description="Sensor type")):
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    if df.empty or len(df) < 20:
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "explanations": []}
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        if df.empty or len(df) < 20:
+            return {
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "explanations": [],
+                "note": "Not enough data for SHAP"
+            }
 
-    df = make_lag_features(df)
-    X = df[["lag1", "lag2", "lag3"]].values
-    y = df["value"].values
+        df = make_lag_features(df)
+        X = df[["lag1", "lag2", "lag3"]].values
+        y = df["value"].values
 
-    scaler = MinMaxScaler()
-    y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
+        scaler = MinMaxScaler()
+        y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
 
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y_scaled[:split_idx], y_scaled[split_idx:]
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y_scaled[:split_idx], y_scaled[split_idx:]
 
-    best_model, best_name, best_mse = select_best_model(X_train, y_train, X_test, y_test)
-    if not best_model:
-        return {"error": "No model trained successfully"}
+        best_model, best_name, best_mse = select_best_model(X_train, y_train, X_test, y_test)
+        if not best_model:
+            return {"error": "No model trained successfully"}
 
-    if best_name in ["xgboost", "random_forest"]:
-        explainer = shap.TreeExplainer(best_model)
-    else:
-        explainer = shap.KernelExplainer(best_model.predict, X_train[:50])
+        # --- SHAP explainability ---
+        if best_name in ["xgboost", "random_forest"]:
+            explainer = shap.TreeExplainer(best_model)
+            shap_values = explainer.shap_values(X_test[:20])
+        else:
+            explainer = shap.KernelExplainer(best_model.predict, X_train[:10])
+            shap_values = explainer.shap_values(X_test[:5])  # limit samples
 
-    shap_values = explainer.shap_values(X_test[:20])
-    feature_names = ["lag1", "lag2", "lag3"]
+        shap_values = np.array(shap_values)
+        if shap_values.ndim > 2:  # KernelExplainer case
+            shap_values = shap_values.mean(axis=0)
 
-    # SHAP plot to base64
-    plt.figure()
-    shap.summary_plot(shap_values, X_test[:20], feature_names=feature_names, show=False)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    shap_img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        feature_names = ["lag1", "lag2", "lag3"]
 
-    return {
-        "sensor_id": sensor_id,
-        "sensor_type": sensor,
-        "selected_model": best_name,
-        "mse": best_mse,
-        "shap_values": np.array(shap_values).tolist(),
-        "shap_summary_plot": f"data:image/png;base64,{shap_img_b64}",
-    }    
+        # --- Generate SHAP summary plot ---
+        plt.figure()
+        shap.summary_plot(shap_values, X_test[:len(shap_values)], feature_names=feature_names, show=False)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close()
+        shap_img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "selected_model": best_name,
+            "mse": best_mse,
+            "shap_summary_plot": f"data:image/png;base64,{shap_img_b64}"
+        }
+    except Exception as e:
+        return {"error": f"SHAP explanation failed: {str(e)}"}
 
 @app.get("/health")
 def health():
