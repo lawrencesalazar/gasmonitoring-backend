@@ -189,31 +189,53 @@ def dataframe(sensor_id: str, sensor: str = Query(...)):
         "data": df.to_dict(orient="records")
     }
 
-
 @app.get("/explain/{sensor_id}")
-def explain(sensor_id: str, sensor: str = Query(...)):
-    """Return SHAP summary plot + stats"""
+def explain(
+    sensor_id: str,
+    sensor: str = Query(...),
+    format: str = Query("json", description="Output format: json or png")
+):
+    """
+    SHAP explanation endpoint.
+    - format=json (default) -> returns stats, prediction, and SHAP plot in base64
+    - format=png -> returns SHAP summary plot as StreamingResponse (image/png)
+    """
+    # 1. Fetch data
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
 
     if df.empty or len(df) < 50:
-        return {"note": "Not enough data for SHAP"}
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "note": "Not enough data for SHAP"
+        }
 
+    # 2. Extract hour feature
     df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+
+    # Features: hour + sensor value
     X = df[["hour", "value"]]
     y = df["value"]
 
+    # 3. Train/test split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
+    # 4. Train XGBoost model
     model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
     model.fit(X_train, y_train)
 
+    # 5. One prediction (using last record)
+    last_row = X.iloc[[-1]]
+    prediction = float(model.predict(last_row)[0])
+
+    # 6. SHAP values
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_test)
 
-    # Compute SHAP stats
+    # 7. Compute SHAP stats
     shap_stats = {}
     for i, feature in enumerate(X.columns):
         vals = X_test.iloc[:, i].values
@@ -224,24 +246,34 @@ def explain(sensor_id: str, sensor: str = Query(...)):
             "correlation": float(np.corrcoef(vals, shap_vals)[0, 1]),
         }
 
-    # SHAP summary plot
+    # 8. Create SHAP summary plot
     buf = io.BytesIO()
     plt.figure(figsize=(8, 6))
-    shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
-    plt.title(f"SHAP Summary for {sensor}")
+    shap.summary_plot(
+        shap_values,
+        X_test,
+        feature_names=["hour", f"{sensor}_value"],
+        show=False
+    )
+    plt.title(f"SHAP Summary for {sensor}", fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.savefig(buf, format="png", bbox_inches="tight")
     plt.close()
     buf.seek(0)
 
+    # 9. Conditional return
+    if format == "png":
+        return StreamingResponse(buf, media_type="image/png")
+
+    # Default: JSON with base64-encoded plot
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return {
         "sensor_id": sensor_id,
         "sensor_type": sensor,
+        "prediction": prediction,
         "shap_stats": shap_stats,
-        "plot": f"data:image/png;base64,{img_b64}"
+        "shap_plot": f"data:image/png;base64,{img_b64}"
     }
-
 
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("summary")):
