@@ -186,45 +186,77 @@ def dataframe(sensor_id: str, sensor: str = Query(...)):
         "data": df.to_dict(orient="records")
     }
 
-
 @app.get("/explain/{sensor_id}")
 def explain(sensor_id: str, sensor: str = Query(...)):
-    """Return SHAP explanation plot as PNG"""
+    """
+    Return SHAP explanation plot (summary) as PNG + print stats.
+    Features: hour + sensor value
+    """
+    # 1. Fetch data
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
-    if df.empty or len(df) < 20:
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "note": "Not enough data for SHAP"}
 
-    df = make_lag_features(df)
-    X = df[["lag1", "lag2", "lag3"]].values
-    y = df["value"].values
+    if df.empty or len(df) < 50:
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "note": "Not enough data for SHAP"
+        }
 
-    scaler = MinMaxScaler()
-    y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
+    # 2. Extract hour feature
+    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
 
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train = y_scaled[:split_idx]
+    # Features: hour + sensor value
+    X = df[["hour", "value"]]
+    y = df["value"]
 
+    # 3. Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # 4. Train XGBoost model
     model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
     model.fit(X_train, y_train)
 
+    # 5. SHAP values
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test[:20])
-    shap_values = np.array(shap_values)
+    shap_values = explainer.shap_values(X_test)
 
-    feature_names = ["lag1", "lag2", "lag3"]
+    # 6. Compute SHAP stats for each feature
+    shap_stats = {}
+    for i, feature in enumerate(X.columns):
+        vals = X_test.iloc[:, i].values
+        shap_vals = shap_values[:, i]
+        shap_stats[feature] = {
+            "mean_abs_shap": float(np.abs(shap_vals).mean()),
+            "impact_range": [float(shap_vals.min()), float(shap_vals.max())],
+            "correlation": float(np.corrcoef(vals, shap_vals)[0, 1]),
+        }
 
-    plt.figure()
-    shap.summary_plot(shap_values, X_test[:len(shap_values)], feature_names=feature_names, show=False)
+    # 7. Plot SHAP summary
     buf = io.BytesIO()
+    plt.figure(figsize=(8, 6))
+    shap.summary_plot(
+        shap_values,
+        X_test,
+        feature_names=["hour", f"{sensor}_value"],
+        show=False
+    )
+    plt.title(f"SHAP Summary for {sensor}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
     plt.savefig(buf, format="png", bbox_inches="tight")
     plt.close()
+
     buf.seek(0)
 
-    return StreamingResponse(buf, media_type="image/png")
-
-from fastapi.responses import StreamingResponse
+    # 8. Return both stats + image
+    return {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "shap_stats": shap_stats,
+        "plot": StreamingResponse(buf, media_type="image/png")
+    }
 
 @app.get("/plot/{sensor_id}")
 def plot(
@@ -233,173 +265,178 @@ def plot(
     chart: str = Query("summary", description="Chart type: summary or scatter")
 ):
     """
-    SHAP explanation endpoint.
+    SHAP explanation endpoint (hour + sensor value).
     chart = "summary" -> SHAP summary plot
-    chart = "scatter" -> SHAP scatter plot (sensor_lag1 vs SHAP values)
+    chart = "scatter" -> SHAP scatter plot (hour vs SHAP values)
     """
+    # 1. Fetch data
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
 
-    if df.empty or len(df) < 20:
+    if df.empty or len(df) < 50:
         return JSONResponse(
             {"error": "Not enough data for SHAP analysis"},
             status_code=400
         )
 
-    # Create lag features
-    df = make_lag_features(df)
-    X = df[["lag1", "lag2", "lag3"]].values
-    y = df["value"].values
+    # 2. Extract hour from timestamp
+    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
 
-    # Normalize target
-    scaler = MinMaxScaler()
-    y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
+    # Features: hour + sensor value
+    X = df[["hour", "value"]]
+    y = df["value"]
 
-    # Train/test split
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train = y_scaled[:split_idx]
+    # 3. Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
-    # Train XGBoost model
+    # 4. Train XGBoost
     model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
     model.fit(X_train, y_train)
 
-    # SHAP values
+    # 5. SHAP values
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test[:50])
+    shap_values = explainer.shap_values(X_test)
 
-    # Feature names (use sensor name instead of generic)
-    feature_names = [f"{sensor}_lag1", f"{sensor}_lag2", f"{sensor}_lag3"]
+    # Feature names (use actual features, not lags)
+    feature_names = ["hour", f"{sensor}_value"]
 
-    # Choose chart type
+    # 6. Choose chart type
     buf = io.BytesIO()
     if chart == "scatter":
-        plt.figure()
-        plt.scatter(X_test[:50, 0], shap_values[:50, 0], alpha=0.6)
-        plt.xlabel(f"{sensor}_lag1 values")
-        plt.ylabel("SHAP value")
-        plt.title(f"SHAP Scatter for {sensor}_lag1")
+        # Scatter plot: SHAP value vs hour
+        plt.figure(figsize=(8, 6))
+        hour_idx = list(X.columns).index("hour")
+        plt.scatter(
+            X_test["hour"].values,
+            shap_values[:, hour_idx],
+            alpha=0.6,
+            c=X_test["hour"].values,
+            cmap="viridis",
+            edgecolors="k",
+            linewidth=0.3
+        )
+        plt.xlabel("Hour of Day", fontsize=12, fontweight="bold")
+        plt.ylabel("SHAP value for Hour", fontsize=12, fontweight="bold")
+        plt.title(f"SHAP Scatter for Hour ({sensor})", fontsize=14, fontweight="bold")
+        plt.colorbar(label="Hour")
+        plt.axhline(y=0, color="black", linestyle="--", alpha=0.6)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.savefig(buf, format="png", bbox_inches="tight")
         plt.close()
     else:
-        plt.figure()
-        shap.summary_plot(shap_values, X_test[:50], feature_names=feature_names, show=False)
+        # SHAP summary plot
+        plt.figure(figsize=(8, 6))
+        shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
+        plt.title(f"SHAP Summary Plot for {sensor}", fontsize=14, fontweight="bold")
+        plt.tight_layout()
         plt.savefig(buf, format="png", bbox_inches="tight")
         plt.close()
 
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
-from fastapi.responses import StreamingResponse
-import seaborn as sns
-import matplotlib.pyplot as plt
 
-plt.style.use('default')
-sns.set_palette("husl")
-
-@app.get("/shap/{sensor_id}")
-def shap_analysis(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type"),
-    chart: str = Query("summary", description="Chart type: summary, dependence, scatter, bar")
-):
-    """SHAP analysis endpoint for selected sensor."""
+ 
+@app.get("/shap_hour/{sensor_id}")
+def shap_hour(sensor_id: str, sensor: str = Query(..., description="Sensor type")):
+    # 1. Fetch sensor history
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
+    if df.empty or len(df) < 50:
+        return {"error": "Not enough data for SHAP hour analysis"}
 
-    if df.empty or len(df) < 20:
-        return JSONResponse({"error": "Not enough data for SHAP analysis"}, status_code=400)
+    # 2. Extract hour feature from timestamp
+    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
 
-    # Lag features
-    df = make_lag_features(df)
-    X = df[["lag1", "lag2", "lag3"]]
+    # Use hour + sensor value as features
+    X = df[["hour", "value"]]
     y = df["value"]
 
-    # Train/test split
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    # 3. Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
-    # Train XGBoost
-    model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42)
+    # 4. Train XGBoost
+    model = xgb.XGBRegressor(
+        n_estimators=100,
+        max_depth=6,
+        learning_rate=0.1,
+        random_state=42
+    )
     model.fit(X_train, y_train)
 
-    # Predictions
-    y_pred = model.predict(X_test)
-
-    # SHAP values
+    # 5. SHAP analysis
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_test)
 
-    # Pick one feature for dependence/scatter (lag1 as proxy for sensor values)
-    feature_idx = 0
-    feature_name = f"{sensor}_lag1"
-    feature_values = X_test.iloc[:, feature_idx].values
-    shap_for_feature = shap_values[:, feature_idx]
+    # Focus on "hour"
+    hour_idx = list(X.columns).index("hour")
+    hour_values = X_test["hour"].values
+    hour_shap = shap_values[:, hour_idx]
 
-    # --- SHAP CHART SELECTION ---
+    # === SHAP stats ===
+    mean_abs_shap = float(np.abs(hour_shap).mean())
+    shap_min, shap_max = float(hour_shap.min()), float(hour_shap.max())
+    correlation = float(np.corrcoef(hour_values, hour_shap)[0, 1])
+
+    hour_stats = (
+        pd.DataFrame({"hour": hour_values, "shap_value": hour_shap})
+        .groupby("hour")["shap_value"]
+        .agg(["mean", "std", "count"])
+        .round(3)
+        .reset_index()
+        .to_dict(orient="records")
+    )
+
+    stats = {
+        "mean_abs_shap": mean_abs_shap,
+        "impact_range": [shap_min, shap_max],
+        "correlation": correlation,
+        "hourly_stats": hour_stats,
+    }
+
+    # 6. Create scatter plot
+    plt.figure(figsize=(10, 6))
+    plt.scatter(
+        hour_values,
+        hour_shap,
+        alpha=0.6,
+        s=30,
+        color='#1f77b4',
+        edgecolors='black',
+        linewidth=0.3
+    )
+    plt.ylim(-7.5, 10.0)
+    plt.yticks([-7.5, -5.0, -2.5, 0.0, 2.5, 5.0, 7.5, 10.0])
+    plt.xlim(0, 23)
+    plt.xticks(range(0, 24, 3))
+    plt.ylabel('SHAP value for hour', fontsize=12, fontweight='bold')
+    plt.xlabel('Hour of Day', fontsize=12, fontweight='bold')
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=0.8)
+    plt.grid(True, axis='y', alpha=0.3, linestyle='--')
+    plt.grid(False, axis='x')
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    # 7. Save plot to buffer
     buf = io.BytesIO()
-
-    if chart == "dependence":
-        plt.figure(figsize=(10, 6))
-        shap.dependence_plot(feature_idx, shap_values, X_test, show=False)
-        plt.title(f"SHAP Dependence Plot - {feature_name}", fontsize=14, fontweight="bold")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-
-    elif chart == "scatter":
-        plt.figure(figsize=(10, 6))
-        plt.scatter(feature_values, shap_for_feature, alpha=0.6, c=feature_values, cmap="viridis")
-        plt.colorbar(label=f"{feature_name} value")
-        plt.xlabel(feature_name, fontsize=12)
-        plt.ylabel("SHAP Value", fontsize=12)
-        plt.title(f"SHAP Scatter Plot - {feature_name}", fontsize=14, fontweight="bold")
-
-        # Trend line
-        z = np.polyfit(feature_values, shap_for_feature, 1)
-        p = np.poly1d(z)
-        plt.plot(feature_values, p(feature_values), "r--", linewidth=2, alpha=0.8)
-
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-
-    elif chart == "bar":
-        plt.figure(figsize=(8, 6))
-        feature_importance = np.abs(shap_values).mean(0)
-        feature_names = X.columns
-
-        idx = np.argsort(feature_importance)[::-1]
-        sorted_features = [feature_names[i] for i in idx]
-        sorted_importance = feature_importance[idx]
-
-        plt.barh(sorted_features, sorted_importance)
-        plt.xlabel("Mean |SHAP Value|")
-        plt.title("Feature Importance (SHAP)", fontsize=14, fontweight="bold")
-        plt.gca().invert_yaxis()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-
-    else:  # summary
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
-        plt.title("SHAP Summary Plot - Feature Importance", fontsize=14, fontweight="bold")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-
+    plt.savefig(buf, format="png", bbox_inches="tight")
     plt.close()
     buf.seek(0)
 
-    # --- JSON Stats (like your example) ---
-    stats = {
-        "mean_abs_shap": float(np.abs(shap_for_feature).mean()),
-        "impact_range": [float(shap_for_feature.min()), float(shap_for_feature.max())],
-        "correlation": float(np.corrcoef(feature_values, shap_for_feature)[0, 1]),
-        "mse": float(mean_squared_error(y_test, y_pred)),
-        "r2": float(r2_score(y_test, y_pred))
-    }
+    # 8. Encode image in base64 for JSON
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    return StreamingResponse(buf, media_type="image/png", headers={
-        "X-SHAP-Stats": json.dumps(stats)  # lightweight stats in headers
-    })
+    return {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "stats": stats,
+        "shap_plot": f"data:image/png;base64,{img_b64}"
+    }
 
 @app.get("/health")
 def health():
