@@ -1,21 +1,21 @@
+import io
+import base64
+import numpy as np
+import shap
+import matplotlib
+matplotlib.use("Agg")   # must be at the top, before pyplot
+import matplotlib.pyplot as plt 
+
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import json
 import logging
-from datetime import timedelta
- 
-import io
-import base64
- 
-import numpy as np
+from datetime import timedelta 
+
 import pandas as pd
 import xgboost as xgb
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_squared_error
