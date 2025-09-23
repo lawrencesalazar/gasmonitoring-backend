@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
 import xgboost as xgb
 
 # Firebase
