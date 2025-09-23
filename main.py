@@ -289,6 +289,117 @@ def plot(
 
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
+from fastapi.responses import StreamingResponse
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.style.use('default')
+sns.set_palette("husl")
+
+@app.get("/shap/{sensor_id}")
+def shap_analysis(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    chart: str = Query("summary", description="Chart type: summary, dependence, scatter, bar")
+):
+    """SHAP analysis endpoint for selected sensor."""
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+
+    if df.empty or len(df) < 20:
+        return JSONResponse({"error": "Not enough data for SHAP analysis"}, status_code=400)
+
+    # Lag features
+    df = make_lag_features(df)
+    X = df[["lag1", "lag2", "lag3"]]
+    y = df["value"]
+
+    # Train/test split
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    # Train XGBoost
+    model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42)
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+
+    # SHAP values
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test)
+
+    # Pick one feature for dependence/scatter (lag1 as proxy for sensor values)
+    feature_idx = 0
+    feature_name = f"{sensor}_lag1"
+    feature_values = X_test.iloc[:, feature_idx].values
+    shap_for_feature = shap_values[:, feature_idx]
+
+    # --- SHAP CHART SELECTION ---
+    buf = io.BytesIO()
+
+    if chart == "dependence":
+        plt.figure(figsize=(10, 6))
+        shap.dependence_plot(feature_idx, shap_values, X_test, show=False)
+        plt.title(f"SHAP Dependence Plot - {feature_name}", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+
+    elif chart == "scatter":
+        plt.figure(figsize=(10, 6))
+        plt.scatter(feature_values, shap_for_feature, alpha=0.6, c=feature_values, cmap="viridis")
+        plt.colorbar(label=f"{feature_name} value")
+        plt.xlabel(feature_name, fontsize=12)
+        plt.ylabel("SHAP Value", fontsize=12)
+        plt.title(f"SHAP Scatter Plot - {feature_name}", fontsize=14, fontweight="bold")
+
+        # Trend line
+        z = np.polyfit(feature_values, shap_for_feature, 1)
+        p = np.poly1d(z)
+        plt.plot(feature_values, p(feature_values), "r--", linewidth=2, alpha=0.8)
+
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+
+    elif chart == "bar":
+        plt.figure(figsize=(8, 6))
+        feature_importance = np.abs(shap_values).mean(0)
+        feature_names = X.columns
+
+        idx = np.argsort(feature_importance)[::-1]
+        sorted_features = [feature_names[i] for i in idx]
+        sorted_importance = feature_importance[idx]
+
+        plt.barh(sorted_features, sorted_importance)
+        plt.xlabel("Mean |SHAP Value|")
+        plt.title("Feature Importance (SHAP)", fontsize=14, fontweight="bold")
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+
+    else:  # summary
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
+        plt.title("SHAP Summary Plot - Feature Importance", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+
+    plt.close()
+    buf.seek(0)
+
+    # --- JSON Stats (like your example) ---
+    stats = {
+        "mean_abs_shap": float(np.abs(shap_for_feature).mean()),
+        "impact_range": [float(shap_for_feature.min()), float(shap_for_feature.max())],
+        "correlation": float(np.corrcoef(feature_values, shap_for_feature)[0, 1]),
+        "mse": float(mean_squared_error(y_test, y_pred)),
+        "r2": float(r2_score(y_test, y_pred))
+    }
+
+    return StreamingResponse(buf, media_type="image/png", headers={
+        "X-SHAP-Stats": json.dumps(stats)  # lightweight stats in headers
+    })
 
 @app.get("/health")
 def health():
