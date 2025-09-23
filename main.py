@@ -222,6 +222,71 @@ def explain(sensor_id: str, sensor: str = Query(...)):
 
     return StreamingResponse(buf, media_type="image/png")
 
+from fastapi.responses import StreamingResponse
+
+@app.get("/plot/{sensor_id}")
+def plot(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    chart: str = Query("summary", description="Chart type: summary or scatter")
+):
+    """
+    SHAP explanation endpoint.
+    chart = "summary" -> SHAP summary plot
+    chart = "scatter" -> SHAP scatter plot (sensor_lag1 vs SHAP values)
+    """
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+
+    if df.empty or len(df) < 20:
+        return JSONResponse(
+            {"error": "Not enough data for SHAP analysis"},
+            status_code=400
+        )
+
+    # Create lag features
+    df = make_lag_features(df)
+    X = df[["lag1", "lag2", "lag3"]].values
+    y = df["value"].values
+
+    # Normalize target
+    scaler = MinMaxScaler()
+    y_scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
+
+    # Train/test split
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train = y_scaled[:split_idx]
+
+    # Train XGBoost model
+    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+    model.fit(X_train, y_train)
+
+    # SHAP values
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_test[:50])
+
+    # Feature names (use sensor name instead of generic)
+    feature_names = [f"{sensor}_lag1", f"{sensor}_lag2", f"{sensor}_lag3"]
+
+    # Choose chart type
+    buf = io.BytesIO()
+    if chart == "scatter":
+        plt.figure()
+        plt.scatter(X_test[:50, 0], shap_values[:50, 0], alpha=0.6)
+        plt.xlabel(f"{sensor}_lag1 values")
+        plt.ylabel("SHAP value")
+        plt.title(f"SHAP Scatter for {sensor}_lag1")
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close()
+    else:
+        plt.figure()
+        shap.summary_plot(shap_values, X_test[:50], feature_names=feature_names, show=False)
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close()
+
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
 
 @app.get("/health")
 def health():
