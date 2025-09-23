@@ -8,12 +8,13 @@ from datetime import timedelta
  
 import io
 import base64
-
-import matplotlib.pyplot as plt
+ 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-import shap
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
@@ -228,8 +229,7 @@ def explain(sensor_id: str, sensor: str = Query(..., description="Sensor type"))
         "mse": best_mse,
         "shap_values": np.array(shap_values).tolist(),
         "shap_summary_plot": f"data:image/png;base64,{shap_img_b64}",
-    }
-    
+    }    
 
 @app.get("/health")
 def health():
