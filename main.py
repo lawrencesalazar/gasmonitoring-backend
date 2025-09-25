@@ -20,6 +20,19 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
+# ML & preprocessing
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR 
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    explained_variance_score
+)
 import xgboost as xgb
 
 # Firebase
@@ -598,3 +611,115 @@ async def xgboost_compute(sensor_id: str, sensor: str):
         },
         "history_points": len(df)
     }
+    from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    explained_variance_score
+)
+
+def compute_metrics(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100 if np.all(y_true != 0) else None
+    r2 = r2_score(y_true, y_pred)
+    evs = explained_variance_score(y_true, y_pred)
+
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "r2_score": r2,
+        "explained_variance": evs,
+        "y_true_sample": y_true[:10].tolist(),   # include sample actual values
+        "y_pred_sample": y_pred[:10].tolist()    # include sample predictions
+    }
+
+@app.get("/algorithm/{sensor_id}")
+def xgboost_compute(sensor_id: str, sensor: str):
+    try:
+        # Fetch history data
+        ref = db.reference(f"history/{sensor_id}")
+        history = ref.get()
+
+        if not history:
+            raise HTTPException(status_code=404, detail="No history found for this sensor")
+
+        # Flatten history JSON
+        rows = []
+        for _, record in history.items():
+            if sensor in record:
+                rows.append({
+                    "timestamp": record.get("timestamp"),
+                    "value": float(record.get(sensor))
+                })
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for sensor type: {sensor}")
+
+        # Sort and preprocess
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Feature engineering: lags
+        df["lag1"] = df["value"].shift(1)
+        df["lag2"] = df["value"].shift(2)
+        df = df.dropna()
+
+        X = df[["lag1", "lag2"]]
+        y = df["value"]
+
+        # Train/test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, shuffle=False
+        )
+
+        # Scaling
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        if len(X_test) == 0:
+            raise HTTPException(status_code=400, detail="Not enough data for testing")
+
+        results = {}
+
+        # Linear Regression
+        lr = LinearRegression()
+        lr.fit(X_train, y_train)
+        results["LinearRegression"] = compute_metrics(y_test, lr.predict(X_test))
+
+        # Random Forest
+        rf = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf.fit(X_train, y_train)
+        results["RandomForest"] = compute_metrics(y_test, rf.predict(X_test))
+
+        # Decision Tree
+        dt = DecisionTreeRegressor(random_state=42)
+        dt.fit(X_train, y_train)
+        results["DecisionTree"] = compute_metrics(y_test, dt.predict(X_test))
+
+        # Support Vector Regression
+        svr = SVR(kernel="rbf")
+        svr.fit(X_train_scaled, y_train)
+        results["SVR"] = compute_metrics(y_test, svr.predict(X_test_scaled))
+
+        # XGBoost
+        xgb_model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+        xgb_model.fit(X_train, y_train)
+        results["XGBoost"] = compute_metrics(y_test, xgb_model.predict(X_test))
+
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "sample_size": len(df),
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            "algorithms": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
