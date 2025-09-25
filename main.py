@@ -179,87 +179,6 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
 # Endpoints
 # ----------------------
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-    <head>
-        <title>Gas Monitoring API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; }
-            h1 { color: #2c3e50; }
-            h2 { margin-top: 1.5em; color: #34495e; }
-            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
-            ul { margin-left: 1.2em; }
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Gas Monitoring API</h1>
-        <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
-
-        <h2>📖 API Documentation</h2>
-        <ul>
-            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
-            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
-        </ul>
-
-        <h2>📘 How to Use</h2>
-        <p>Below is a quick reference on how to use the API with your React.js dashboard.</p>
-
-        <h3>1. Forecast Endpoint</h3>
-        <p>Get predictions for a specific sensor.</p>
-        <pre><code>GET /predict/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON):</b></p>
-        <pre><code>{
-  "sensor_id": "123",
-  "sensor_type": "temperature",
-  "forecasts": [
-    {"date": "2025-09-20", "forecast": 25.7},
-    {"date": "2025-09-21", "forecast": 26.1}
-  ]
-}</code></pre>
-
-        <h3>2. SHAP Explanation Endpoint</h3>
-        <p>Visualize feature importance with SHAP.</p>
-        <pre><code>GET /explain/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response:</b> PNG image (SHAP summary plot).</p>
-
-        <h3>3. SHAP Hour Analysis</h3>
-        <p>Analyze SHAP values by hour.</p>
-        <pre><code>GET /shap_hour/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON + Base64 Image):</b></p>
-        <pre><code>{
-  "stats": {
-    "mean_abs_shap": 2.34,
-    "shap_range": [-5.1, 6.7],
-    "correlation": 0.452,
-    "mse": 0.12
-  },
-  "plot_base64": "iVBORw0KGgoAAAANSUhEUg..."
-}</code></pre>
-
-        <h2>💻 Example React.js Integration</h2>
-        <pre><code>{`useEffect(() => {
-  fetch(\`https://gasmonitoring-backend.onrender.com/predict/\${sensorID}?sensor=\${sensor}\`)
-    .then(res => res.json())
-    .then(data => setForecast(data.forecasts || []));
-}, [sensorID, sensor]);`}</code></pre>
-
-        <p>See the <b>SensorAnalytics</b> React component for a full example.</p>
-
-        <hr />
-        <p style="font-size: 0.9em; color: #666;">
-            Powered by FastAPI & XGBoost | Gas Monitoring Project
-        </p>
-    </body>
-    </html>
-    """
 @app.get("/predict/{sensor_id}")
 def predict(sensor_id: str, sensor: str = Query(...), steps: int = 7):
     records = fetch_sensor_history(sensor_id)
@@ -723,3 +642,86 @@ def xgboost_compute(sensor_id: str, sensor:  str = Query(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+        
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>Gas Monitoring API</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; }
+            h1 { color: #2c3e50; }
+            h2 { margin-top: 1.5em; color: #34495e; }
+            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
+            ul { margin-left: 1.2em; }
+        </style>
+    </head>
+    <body>
+        <h1>🚀 Gas Monitoring API</h1>
+        <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
+
+        <h2>📖 API Documentation</h2>
+        <ul>
+            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
+            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
+        </ul>
+
+        <h2>📘 How to Use</h2>
+        <p>Below is a quick reference on how to use the API with your React.js dashboard.</p>
+
+        <h3>1. Forecast Endpoint</h3>
+        <p>Get predictions for a specific sensor.</p>
+        <pre><code>GET /predict/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response (JSON):</b></p>
+        <pre><code>{
+  "sensor_id": "123",
+  "sensor_type": "temperature",
+  "forecasts": [
+    {"date": "2025-09-20", "forecast": 25.7},
+    {"date": "2025-09-21", "forecast": 26.1}
+  ]
+}</code></pre>
+
+        <h3>2. SHAP Explanation Endpoint</h3>
+        <p>Visualize feature importance with SHAP.</p>
+        <pre><code>GET /explain/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response:</b> PNG image (SHAP summary plot).</p>
+
+        <h3>3. SHAP Hour Analysis</h3>
+        <p>Analyze SHAP values by hour.</p>
+        <pre><code>GET /shap_hour/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response (JSON + Base64 Image):</b></p>
+        <pre><code>{
+  "stats": {
+    "mean_abs_shap": 2.34,
+    "shap_range": [-5.1, 6.7],
+    "correlation": 0.452,
+    "mse": 0.12
+  },
+  "plot_base64": "iVBORw0KGgoAAAANSUhEUg..."
+}</code></pre>
+
+        <h2>💻 Example React.js Integration</h2>
+        <pre><code>{`useEffect(() => {
+  fetch(\`https://gasmonitoring-backend.onrender.com/predict/\${sensorID}?sensor=\${sensor}\`)
+    .then(res => res.json())
+    .then(data => setForecast(data.forecasts || []));
+}, [sensorID, sensor]);`}</code></pre>
+
+        <p>See the <b>SensorAnalytics</b> React component for a full example.</p>
+
+        <hr />
+        <p style="font-size: 0.9em; color: #666;">
+            Powered by FastAPI & XGBoost | Gas Monitoring Project
+        </p>
+    </body>
+    </html>
+    """
