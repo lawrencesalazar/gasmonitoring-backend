@@ -1,8 +1,6 @@
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-
 
 import os
 import json
@@ -25,7 +23,6 @@ import xgboost as xgb
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, db
-import gc
 
 # ---------------------------------------------------
 # FastAPI App
@@ -191,7 +188,6 @@ def dataframe(sensor_id: str, sensor: str = Query(...)):
         "sensor_type": sensor,
         "data": df.to_dict(orient="records")
     }
-import gc
 
 @app.get("/explain/{sensor_id}")
 def explain(
@@ -199,26 +195,47 @@ def explain(
     sensor: str = Query(...),
     format: str = Query("json", description="Output format: json or png")
 ):
+    """
+    SHAP explanation endpoint.
+    - format=json (default) -> returns stats, prediction, and SHAP plot in base64
+    - format=png -> returns SHAP summary plot as StreamingResponse (image/png)
+    """
+    # 1. Fetch data
     records = fetch_sensor_history(sensor_id)
     df = preprocess_dataframe(records, sensor)
 
     if df.empty or len(df) < 50:
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "note": "Not enough data for SHAP"}
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "note": "Not enough data for SHAP"
+        }
 
+    # 2. Extract hour feature
     df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+
+    # Features: hour + sensor value
     X = df[["hour", "value"]]
     y = df["value"]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # 3. Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # 4. Train XGBoost model
     model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
     model.fit(X_train, y_train)
 
+    # 5. One prediction (using last record)
     last_row = X.iloc[[-1]]
     prediction = float(model.predict(last_row)[0])
 
+    # 6. SHAP values
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_test)
 
+    # 7. Compute SHAP stats
     shap_stats = {}
     for i, feature in enumerate(X.columns):
         vals = X_test.iloc[:, i].values
@@ -229,33 +246,34 @@ def explain(
             "correlation": float(np.corrcoef(vals, shap_vals)[0, 1]),
         }
 
+    # 8. Create SHAP summary plot
     buf = io.BytesIO()
     plt.figure(figsize=(8, 6))
-    shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
-    plt.title(f"SHAP Summary for {sensor}")
+    shap.summary_plot(
+        shap_values,
+        X_test,
+        feature_names=["hour", f"{sensor}_value"],
+        show=False
+    )
+    plt.title(f"SHAP Summary for {sensor}", fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close("all")  # 🔑 close ALL figures
+    plt.close()
     buf.seek(0)
 
+    # 9. Conditional return
     if format == "png":
-        response = StreamingResponse(buf, media_type="image/png")
-    else:
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        response = {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "prediction": prediction,
-            "shap_stats": shap_stats,
-            "shap_plot": f"data:image/png;base64,{img_b64}"
-        }
+        return StreamingResponse(buf, media_type="image/png")
 
-    # 🔑 Cleanup to prevent memory leaks
-    del model, explainer, shap_values, X, y, X_train, X_test, y_train, y_test
-    gc.collect()
-
-    return response
-
+    # Default: JSON with base64-encoded plot
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "prediction": prediction,
+        "shap_stats": shap_stats,
+        "shap_plot": f"data:image/png;base64,{img_b64}"
+    }
 
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("summary")):
@@ -358,81 +376,3 @@ def shap_hour(sensor_id: str, sensor: str = Query(...)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-    <head>
-        <title>Gas Monitoring API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; }
-            h1 { color: #2c3e50; }
-            h2 { margin-top: 1.5em; color: #34495e; }
-            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
-            ul { margin-left: 1.2em; }
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Gas Monitoring API</h1>
-        <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
-
-        <h2>📖 API Documentation</h2>
-        <ul>
-            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
-            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
-        </ul>
-
-        <h2>📘 How to Use</h2>
-        <p>Below is a quick reference on how to use the API with your React.js dashboard.</p>
-
-        <h3>1. Forecast Endpoint</h3>
-        <p>Get predictions for a specific sensor.</p>
-        <pre><code>GET /predict/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON):</b></p>
-        <pre><code>{
-  "sensor_id": "123",
-  "sensor_type": "temperature",
-  "forecasts": [
-    {"date": "2025-09-20", "forecast": 25.7},
-    {"date": "2025-09-21", "forecast": 26.1}
-  ]
-}</code></pre>
-
-        <h3>2. SHAP Explanation Endpoint</h3>
-        <p>Visualize feature importance with SHAP.</p>
-        <pre><code>GET /explain/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response:</b> PNG image (SHAP summary plot).</p>
-
-        <h3>3. SHAP Hour Analysis</h3>
-        <p>Analyze SHAP values by hour.</p>
-        <pre><code>GET /shap_hour/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON + Base64 Image):</b></p>
-        <pre><code>{
-  "stats": {
-    "mean_abs_shap": 2.34,
-    "shap_range": [-5.1, 6.7],
-    "correlation": 0.452,
-    "mse": 0.12
-  },
-  "plot_base64": "iVBORw0KGgoAAAANSUhEUg..."
-}</code></pre>
-
-        <h2>💻 Example React.js Integration</h2>
-        <pre><code>{`useEffect(() => {
-  fetch(\`https://gasmonitoring-backend.onrender.com/predict/\${sensorID}?sensor=\${sensor}\`)
-    .then(res => res.json())
-    .then(data => setForecast(data.forecasts || []));
-}, [sensorID, sensor]);`}</code></pre>
-
-        <p>See the <b>SensorAnalytics</b> React component for a full example.</p>
-
-        <hr />
-        <p style="font-size: 0.9em; color: #666;">
-            Powered by FastAPI & XGBoost | Gas Monitoring Project
-        </p>
-    </body>
-    </html>
-    """

@@ -1,27 +1,23 @@
-# Use official Python 3.11 
-FROM docker.io/library/python:3.11
+# Use official lightweight Python image
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system-level deps (needed for matplotlib, pandas, shap, xgboost, etc.)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libatlas-base-dev \
-    gfortran \
-    libfreetype6-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# Install system dependencies
+RUN apt-get update && apt-get install -y build-essential
 
-# Copy and install dependencies
+# Copy requirements first for caching
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
+# Copy the rest of the app
 COPY . .
 
-# Expose Render’s default port
-EXPOSE 10000
+# Expose port (Render sets PORT env, but we declare for clarity)
+EXPOSE 8080
 
-# Run with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Start the app with Gunicorn + Uvicorn worker
+CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
