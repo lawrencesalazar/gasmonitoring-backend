@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi import HTTPException
 
 
 import os
@@ -20,20 +21,16 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
-# ML & preprocessing
-from sklearn.model_selection import train_test_split
+# ML & preprocessingfrom fastapi import HTTPException
+import math
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.svm import SVR 
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    explained_variance_score
-)
+from sklearn.svm import SVR
 import xgboost as xgb
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
+ 
 
 # Firebase
 import firebase_admin
@@ -557,7 +554,7 @@ def compute_metrics(y_true, y_pred):
     }
 
 @app.get("/algorithm/{sensor_id}")
-def xgboost_compute(sensor_id: str, sensor:  str = Query(...)):
+def alogrithm(sensor_id: str, sensor:  str = Query(...)):
     try:
         # Fetch history data
         ref = db.reference(f"history/{sensor_id}")
