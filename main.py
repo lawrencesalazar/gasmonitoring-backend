@@ -519,3 +519,83 @@ def recommendation(sensor_id: str, sensor: str = Query(...)):
         "forecast": forecast_val,
         "recommendation": recommendation
     }
+# Utility: fetch last N days of history for a sensor
+def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
+    ref = db.reference(f"history")
+    snapshot = ref.get()
+    if not snapshot:
+        return []
+
+    now = datetime.now()
+    start_date = (now - timedelta(days=days)).strftime("%Y%m%d")
+
+    data_points = []
+    for ts, record in snapshot.items():
+        date_key = ts.split("_")[0]  # format: yyyyMMdd_HHmmss
+        if date_key >= start_date:
+            if record.get("sensor_id") == sensor_id and record.get("sensor_type") == sensor_type:
+                data_points.append({
+                    "timestamp": ts,
+                    "value": record.get("value")
+                })
+    data_points.sort(key=lambda x: x["timestamp"])
+    return data_points
+
+
+# NEW ENDPOINT: Compute XGBoost metrics
+@app.get("/xgboost_compute/{sensor_id}")
+async def xgboost_compute(sensor_id: str, sensor: str):
+    history = fetch_history(sensor_id, sensor, days=3)
+    if not history or len(history) < 5:
+        return {"error": "Not enough data to compute XGBoost analysis."}
+
+    # Prepare dataset
+    df = pd.DataFrame(history)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna()
+
+    if len(df) < 5:
+        return {"error": "Insufficient clean data for training."}
+
+    # Create features: lag values
+    df["lag1"] = df["value"].shift(1)
+    df["lag2"] = df["value"].shift(2)
+    df["lag3"] = df["value"].shift(3)
+    df = df.dropna()
+
+    X = df[["lag1", "lag2", "lag3"]]
+    y = df["value"]
+
+    # Train-test split: last 1 as test
+    X_train, X_test = X.iloc[:-1], X.iloc[-1:]
+    y_train, y_test = y.iloc[:-1], y.iloc[-1:]
+
+    # XGBoost model
+    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50)
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_train = model.predict(X_train)
+
+    # Metrics
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = math.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_train, y_pred_train)
+
+    # Return analysis
+    return {
+        "status": "ok",
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "latest_actual": float(y_test.iloc[0]),
+        "predicted_next": float(y_pred[0]),
+        "metrics": {
+            "MSE": mse,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2
+        },
+        "history_points": len(df)
+    }
