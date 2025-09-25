@@ -1,18 +1,22 @@
-# Use Debian slim base (always available on Render)
+# Start from Debian
 FROM debian:bookworm-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install Python, pip, and build tools
+# Install Python 3.11 + pip + build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv build-essential \
+    python3.11 python3.11-venv python3.11-dev python3-pip build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Make "python" command point to python3
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# Make python3.11 the default "python"
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-# Copy requirements first (for caching)
+# Verify version
+RUN python --version && pip --version
+
+# Copy requirements first for caching
 COPY requirements.txt .
 
 # Install dependencies
@@ -21,7 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the app
 COPY . .
 
-# Expose Render’s default port
+# Expose Render port
 EXPOSE 8080
 
 # Run with Gunicorn + Uvicorn worker
