@@ -31,11 +31,15 @@ import gc
 # FastAPI App
 # ---------------------------------------------------
 app = FastAPI()
+# Allow your frontend domains
+origins = [
+    "http://localhost:3000",    # Vite dev
+    "https://gasmonitoring-ec511.web.app",  # Render frontend
+]
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: replace "*" with frontend URL in production
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

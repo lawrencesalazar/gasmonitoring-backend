@@ -1,5 +1,6 @@
 # Start from Debian
-FROM debian:bookworm-slim
+FROM python:3.11-slim
+
 
 # Set working directory
 WORKDIR /app
