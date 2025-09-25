@@ -165,6 +165,88 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
 # ----------------------
 # Endpoints
 # ----------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>Gas Monitoring API</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; }
+            h1 { color: #2c3e50; }
+            h2 { margin-top: 1.5em; color: #34495e; }
+            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
+            ul { margin-left: 1.2em; }
+        </style>
+    </head>
+    <body>
+        <h1>🚀 Gas Monitoring API</h1>
+        <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
+
+        <h2>📖 API Documentation</h2>
+        <ul>
+            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
+            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
+        </ul>
+
+        <h2>📘 How to Use</h2>
+        <p>Below is a quick reference on how to use the API with your React.js dashboard.</p>
+
+        <h3>1. Forecast Endpoint</h3>
+        <p>Get predictions for a specific sensor.</p>
+        <pre><code>GET /predict/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response (JSON):</b></p>
+        <pre><code>{
+  "sensor_id": "123",
+  "sensor_type": "temperature",
+  "forecasts": [
+    {"date": "2025-09-20", "forecast": 25.7},
+    {"date": "2025-09-21", "forecast": 26.1}
+  ]
+}</code></pre>
+
+        <h3>2. SHAP Explanation Endpoint</h3>
+        <p>Visualize feature importance with SHAP.</p>
+        <pre><code>GET /explain/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response:</b> PNG image (SHAP summary plot).</p>
+
+        <h3>3. SHAP Hour Analysis</h3>
+        <p>Analyze SHAP values by hour.</p>
+        <pre><code>GET /shap_hour/{sensor_id}?sensor=temperature</code></pre>
+        <p><b>Response (JSON + Base64 Image):</b></p>
+        <pre><code>{
+  "stats": {
+    "mean_abs_shap": 2.34,
+    "shap_range": [-5.1, 6.7],
+    "correlation": 0.452,
+    "mse": 0.12
+  },
+  "plot_base64": "iVBORw0KGgoAAAANSUhEUg..."
+}</code></pre>
+
+        <h2>💻 Example React.js Integration</h2>
+        <pre><code>{`useEffect(() => {
+  fetch(\`https://gasmonitoring-backend.onrender.com/predict/\${sensorID}?sensor=\${sensor}\`)
+    .then(res => res.json())
+    .then(data => setForecast(data.forecasts || []));
+}, [sensorID, sensor]);`}</code></pre>
+
+        <p>See the <b>SensorAnalytics</b> React component for a full example.</p>
+
+        <hr />
+        <p style="font-size: 0.9em; color: #666;">
+            Powered by FastAPI & XGBoost | Gas Monitoring Project
+        </p>
+    </body>
+    </html>
+    """
 @app.get("/predict/{sensor_id}")
 def predict(sensor_id: str, sensor: str = Query(...), steps: int = 7):
     records = fetch_sensor_history(sensor_id)
@@ -341,7 +423,7 @@ def shap_hour(sensor_id: str, sensor: str = Query(...)):
     plt.figure(figsize=(10, 6))
     plt.scatter(hour_values, hour_shap, alpha=0.6, s=30, edgecolors="k")
     plt.xlabel("Hour of Day")
-    plt.ylabel("SHAP value (Hour)")
+    plt.ylabel("{sensor} value (Hour)")
     plt.axhline(y=0, color="black", linestyle="--")
     plt.tight_layout()
 
@@ -359,84 +441,81 @@ def shap_hour(sensor_id: str, sensor: str = Query(...)):
     }
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-    <head>
-        <title>Gas Monitoring API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; }
-            h1 { color: #2c3e50; }
-            h2 { margin-top: 1.5em; color: #34495e; }
-            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
-            ul { margin-left: 1.2em; }
-        </style>
-    </head>
-    <body>
-        <h1>🚀 Gas Monitoring API</h1>
-        <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
-
-        <h2>📖 API Documentation</h2>
-        <ul>
-            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
-            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
-        </ul>
-
-        <h2>📘 How to Use</h2>
-        <p>Below is a quick reference on how to use the API with your React.js dashboard.</p>
-
-        <h3>1. Forecast Endpoint</h3>
-        <p>Get predictions for a specific sensor.</p>
-        <pre><code>GET /predict/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON):</b></p>
-        <pre><code>{
-  "sensor_id": "123",
-  "sensor_type": "temperature",
-  "forecasts": [
-    {"date": "2025-09-20", "forecast": 25.7},
-    {"date": "2025-09-21", "forecast": 26.1}
-  ]
-}</code></pre>
-
-        <h3>2. SHAP Explanation Endpoint</h3>
-        <p>Visualize feature importance with SHAP.</p>
-        <pre><code>GET /explain/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response:</b> PNG image (SHAP summary plot).</p>
-
-        <h3>3. SHAP Hour Analysis</h3>
-        <p>Analyze SHAP values by hour.</p>
-        <pre><code>GET /shap_hour/{sensor_id}?sensor=temperature</code></pre>
-        <p><b>Response (JSON + Base64 Image):</b></p>
-        <pre><code>{
-  "stats": {
-    "mean_abs_shap": 2.34,
-    "shap_range": [-5.1, 6.7],
-    "correlation": 0.452,
-    "mse": 0.12
-  },
-  "plot_base64": "iVBORw0KGgoAAAANSUhEUg..."
-}</code></pre>
-
-        <h2>💻 Example React.js Integration</h2>
-        <pre><code>{`useEffect(() => {
-  fetch(\`https://gasmonitoring-backend.onrender.com/predict/\${sensorID}?sensor=\${sensor}\`)
-    .then(res => res.json())
-    .then(data => setForecast(data.forecasts || []));
-}, [sensorID, sensor]);`}</code></pre>
-
-        <p>See the <b>SensorAnalytics</b> React component for a full example.</p>
-
-        <hr />
-        <p style="font-size: 0.9em; color: #666;">
-            Powered by FastAPI & XGBoost | Gas Monitoring Project
-        </p>
-    </body>
-    </html>
+@app.get("/recommendation/{sensor_id}")
+def recommendation(sensor_id: str, sensor: str = Query(...)):
     """
+    Generate 1-day ahead forecast + OSH recommendation
+    using the last 3 days of data for the selected sensor.
+    """
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+
+    if df.empty:
+        return {"sensor_id": sensor_id, "sensor_type": sensor, "recommendation": "No data available"}
+
+    # Filter last 3 days of history
+    cutoff = df["timestamp"].max() - pd.Timedelta(days=3)
+    df_recent = df[df["timestamp"] >= cutoff]
+
+    if len(df_recent) < 5:
+        return {"sensor_id": sensor_id, "sensor_type": sensor, "recommendation": "Not enough recent data"}
+
+    # Train XGBoost using lag features
+    df_recent = make_lag_features(df_recent)
+    if df_recent.empty:
+        return {"sensor_id": sensor_id, "sensor_type": sensor, "recommendation": "Insufficient lag data"}
+
+    X = df_recent[["lag1", "lag2", "lag3"]].values
+    y = df_recent["value"].values
+
+    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+    model.fit(X, y)
+
+    # Predict 1 day ahead
+    last_lags = X[-1].copy()
+    last_date = df_recent["timestamp"].iloc[-1]
+    pred = model.predict(last_lags.reshape(1, -1))[0]
+    next_date = last_date + timedelta(days=1)
+
+    # OSH Recommendation logic
+    forecast_val = float(pred)
+    recommendation = "No recommendation"
+
+    if sensor.lower() == "co2":
+        if forecast_val > 1000:
+            recommendation = "⚠️ High CO₂: Improve ventilation and reduce occupancy."
+        else:
+            recommendation = "✅ CO₂ levels are safe."
+    elif sensor.lower() == "methane":
+        if forecast_val > 1000:
+            recommendation = "⚠️ Methane leak risk: Check for gas leaks, ensure proper ventilation."
+        else:
+            recommendation = "✅ Methane levels are safe."
+    elif sensor.lower() == "ammonia":
+        if forecast_val > 50:
+            recommendation = "⚠️ Ammonia hazard: Use protective equipment and ventilate area."
+        else:
+            recommendation = "✅ Ammonia levels are safe."
+    elif sensor.lower() == "temperature":
+        if forecast_val > 35:
+            recommendation = "⚠️ High temperature: Risk of heat stress, ensure hydration and cooling."
+        elif forecast_val < 10:
+            recommendation = "⚠️ Low temperature: Risk of cold stress, ensure heating and PPE."
+        else:
+            recommendation = "✅ Temperature within safe range."
+    elif sensor.lower() == "humidity":
+        if forecast_val > 70:
+            recommendation = "⚠️ High humidity: Risk of mold growth, improve dehumidification."
+        elif forecast_val < 30:
+            recommendation = "⚠️ Low humidity: Risk of dehydration and discomfort."
+        else:
+            recommendation = "✅ Humidity within safe range."
+
+    return {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "date": next_date.strftime("%Y-%m-%d"),
+        "forecast": forecast_val,
+        "recommendation": recommendation
+    }
