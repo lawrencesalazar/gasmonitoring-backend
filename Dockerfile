@@ -1,11 +1,11 @@
-# Use official lightweight Python image
-FROM python:3.11-slim
+# Use official lightweight Python image from GitHub Container Registry (Docker Hub mirror)
+FROM ghcr.io/astral-sh/python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y build-essential
+RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for caching
 COPY requirements.txt .
