@@ -1,5 +1,5 @@
-# Use official Python 3.11 base image (Debian Bookworm is more stable than slim)
-FROM python:3.11-bookworm
+# Use official Python 3.11 
+FROM docker.io/library/python:3.11
 
 # Set working directory
 WORKDIR /app
