@@ -1,13 +1,18 @@
-# Use official lightweight Python image from GitHub Container Registry (Docker Hub mirror)
-FROM ghcr.io/astral-sh/python:3.11-slim
+# Use Debian slim base (always available on Render)
+FROM debian:bookworm-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
+# Install Python, pip, and build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
+# Make "python" command point to python3
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+# Copy requirements first (for caching)
 COPY requirements.txt .
 
 # Install dependencies
@@ -16,8 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the app
 COPY . .
 
-# Expose port (Render sets PORT env, but we declare for clarity)
+# Expose Render’s default port
 EXPOSE 8080
 
-# Start the app with Gunicorn + Uvicorn worker
+# Run with Gunicorn + Uvicorn worker
 CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
