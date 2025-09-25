@@ -440,8 +440,6 @@ def shap_hour(sensor_id: str, sensor: str = Query(...)):
         "shap_plot": f"data:image/png;base64,{img_b64}"
     }
 
-
-
 @app.get("/recommendation/{sensor_id}")
 def recommendation(sensor_id: str, sensor: str = Query(...)):
     """
@@ -519,6 +517,7 @@ def recommendation(sensor_id: str, sensor: str = Query(...)):
         "forecast": forecast_val,
         "recommendation": recommendation
     }
+    
 # Utility: fetch last N days of history for a sensor
 def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
     ref = db.reference(f"history")
@@ -542,7 +541,7 @@ def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
     return data_points
 
 
-# NEW ENDPOINT: Compute XGBoost metrics
+# ENDPOINT: Compute XGBoost metrics
 @app.get("/xgboost_compute/{sensor_id}")
 async def xgboost_compute(sensor_id: str, sensor: str):
     history = fetch_history(sensor_id, sensor, days=3)
