@@ -4,9 +4,8 @@ uvicorn
 firebase-admin
 gunicorn
 xgboost
-scikit-learn 
+scikit-learn
 pandas
 numpy
 shap
 seaborn
-gc

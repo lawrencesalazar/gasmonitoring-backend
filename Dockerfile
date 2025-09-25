@@ -1,23 +1,27 @@
-# Use official lightweight Python image
-FROM python:3.11-slim
+# Use official Python 3.11 base image (Debian Bookworm is more stable than slim)
+FROM python:3.11-bookworm
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y build-essential
+# Install system-level deps (needed for matplotlib, pandas, shap, xgboost, etc.)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libatlas-base-dev \
+    gfortran \
+    libfreetype6-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
+# Copy and install dependencies
 COPY requirements.txt .
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
+# Copy project files
 COPY . .
 
-# Expose port (Render sets PORT env, but we declare for clarity)
-EXPOSE 8080
+# Expose Render’s default port
+EXPOSE 10000
 
-# Start the app with Gunicorn + Uvicorn worker
-CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
+# Run with uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
