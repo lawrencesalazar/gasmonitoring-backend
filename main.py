@@ -113,18 +113,36 @@ def fetch_sensor_history(sensor_id: str):
         return []
 
     records = []
-    for _, value in snapshot.items():
-        row = value.copy()
-        # Normalize timestamp
-        if "timestamp" in row:
-            try:
-                row["timestamp"] = pd.to_datetime(row["timestamp"])
-            except Exception:
-                row["timestamp"] = None
-        records.append(row)
-
+    for key, value in snapshot.items():
+        if isinstance(value, dict):  # Ensure it's a record dict
+            row = value.copy()
+            # Add the Firebase key as an ID if not present
+            if 'id' not in row:
+                row['id'] = key
+                
+            if "timestamp" in row:
+                try:
+                    # Handle different timestamp formats
+                    if isinstance(row["timestamp"], (int, float)):
+                        # Assume Unix timestamp
+                        row["timestamp"] = pd.to_datetime(row["timestamp"], unit='s')
+                    else:
+                        # Try string parsing
+                        row["timestamp"] = pd.to_datetime(row["timestamp"])
+                except Exception as e:
+                    print(f"DEBUG: Error parsing timestamp {row['timestamp']}: {e}")
+                    # Try to extract timestamp from key if it's in format yyyyMMdd_HHmmss
+                    try:
+                        if '_' in key and len(key) == 15:  # yyyyMMdd_HHmmss format
+                            row["timestamp"] = pd.to_datetime(key, format='%Y%m%d_%H%M%S')
+                        else:
+                            row["timestamp"] = None
+                    except:
+                        row["timestamp"] = None
+            records.append(row)
+    
+    print(f"DEBUG: Fetched {len(records)} records for sensor {sensor_id}")
     return records
-
 
 def preprocess_dataframe(records, sensor: str):
     """Preprocess raw Firebase records into a clean DataFrame for ML"""
