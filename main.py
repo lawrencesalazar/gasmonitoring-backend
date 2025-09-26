@@ -271,54 +271,84 @@ def explain(
 
     return response
 
-
 @app.get("/plot/{sensor_id}")
-def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("summary")):
-    """SHAP summary or scatter plot"""
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
+def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
+    """SHAP scatter or summary plot with 3-day consolidated hourly history"""
+    try:
+        # ✅ Fetch last 3 days history
+        history = fetch_history(sensor_id, sensor, days=3)
+        if not history or len(history) < 20:
+            return JSONResponse({"error": "Not enough data"}, status_code=400)
 
-    if df.empty or len(df) < 50:
-        return JSONResponse({"error": "Not enough data"}, status_code=400)
+        # ✅ Convert to DataFrame
+        df = pd.DataFrame(history)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y%m%d_%H%M%S")
+        df["date"] = df["timestamp"].dt.date
+        df["hour"] = df["timestamp"].dt.hour
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna()
 
-    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    X = df[["hour", "value"]]
-    y = df["value"]
+        # ✅ Aggregate by date+hour (mean values)
+        agg = (
+            df.groupby(["date", "hour"])["value"]
+            .mean()
+            .reset_index()
+            .sort_values(["date", "hour"])
+        )
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+        if agg.empty or len(agg) < 10:
+            return JSONResponse({"error": "Not enough consolidated data"}, status_code=400)
 
-    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
-    model.fit(X_train, y_train)
+        # ✅ Train simple XGBoost on hour → value
+        X = agg[["hour"]]
+        y = agg["value"]
 
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+        model.fit(X, y)
 
-    buf = io.BytesIO()
-    if chart == "scatter":
-        plt.figure(figsize=(8, 6))
-        plt.scatter(X_test["hour"], shap_values[:, 0], alpha=0.6, c=X_test["hour"], cmap="viridis")
-        plt.xlabel("Hour of Day")
-        plt.ylabel("SHAP value (Hour)")
-        plt.title(f"SHAP Scatter for {sensor}")
-        plt.colorbar(label="Hour")
-        plt.axhline(y=0, color="black", linestyle="--")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        plt.close()
-    else:
-        plt.figure(figsize=(8, 6))
-        shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
-        plt.title(f"SHAP Summary Plot for {sensor}")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        plt.close()
+        # ✅ SHAP explain
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
 
-    buf.seek(0)
-    headers = {"Access-Control-Allow-Origin": "*"}  # fix CORS
-    return StreamingResponse(buf, media_type="image/png")
+        buf = io.BytesIO()
+        if chart == "scatter":
+            plt.figure(figsize=(9, 6))
+            # scatter SHAP value vs. hour
+            scatter = plt.scatter(
+                shap_values[:, 0],
+                agg["hour"],
+                c=pd.factorize(agg["date"])[0],  # color by date
+                cmap="tab10",
+                alpha=0.7
+            )
+            plt.xlabel("SHAP Value (Impact)")
+            plt.ylabel("Hour of Day")
+            plt.title(f"SHAP Scatter (3-day hourly) - {sensor}")
+            cbar = plt.colorbar(scatter, ticks=range(len(agg["date"].unique())))
+            cbar.ax.set_yticklabels([str(d) for d in agg["date"].unique()])
+            plt.axvline(x=0, color="black", linestyle="--")
+            plt.tight_layout()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            plt.close()
+        else:
+            plt.figure(figsize=(9, 6))
+            shap.summary_plot(
+                shap_values,
+                X,
+                feature_names=["hour"],
+                show=False
+            )
+            plt.title(f"SHAP Summary (3-day hourly) - {sensor}")
+            plt.tight_layout()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            plt.close()
 
+        buf.seek(0)
+        headers = {"Access-Control-Allow-Origin": "*"}
+        return StreamingResponse(buf, media_type="image/png", headers=headers)
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(sensor_id: str, sensor: str = Query(...)):
