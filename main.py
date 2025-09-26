@@ -40,8 +40,6 @@ app.add_middleware(
     allow_origins=[
         "*",  # or replace with your React/Vite domains
         "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
         "https://gasmonitoring-ec511.web.app",
     ],
     allow_credentials=True,
@@ -647,6 +645,43 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+
+# Explain endpoint
+@app.get("/explain/{sensor_id}")
+def explain(sensor_id: str, sensor: str = Query(...)):
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+    if df.empty or len(df) < 10:
+        return JSONResponse({"error": "Not enough data"})
+    cutoff = datetime.now() - timedelta(days=7)
+    df_recent = df[df["timestamp"] >= cutoff]
+    if df_recent.empty:
+        return JSONResponse({"error": "No recent data"})
+    df_recent["hour"] = df_recent["timestamp"].dt.hour
+    agg = df_recent.groupby("hour")["value"].mean().reset_index()
+    X = agg[["hour"]]
+    y = agg["value"]
+    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+    model.fit(X, y)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    return JSONResponse({
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "shap_values": shap_values.tolist(),
+        "features": X.to_dict(orient="records")
+    })
+
+# SHAP Hour endpoint
+@app.get("/shap_hour/{sensor_id}")
+def shap_hour(sensor_id: str, sensor: str = Query(...)):
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+    if df.empty:
+        return JSONResponse({"error": "No data"})
+    df["hour"] = df["timestamp"].dt.hour
+    agg = df.groupby("hour")["value"].mean().reset_index()
+    return JSONResponse(agg.to_dict(orient="records"))
 
 # Run the application
 if __name__ == "__main__":
