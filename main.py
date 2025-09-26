@@ -105,8 +105,7 @@ def error_image(message: str):
             "Access-Control-Allow-Headers": "*",
         },
     )
-
-def fetch_sensor_history(sensor_id: str):
+    def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase and return as list of dicts"""
     ref = db.reference(f"history/{sensor_id}")
     snapshot = ref.get()
@@ -116,13 +115,16 @@ def fetch_sensor_history(sensor_id: str):
     records = []
     for _, value in snapshot.items():
         row = value.copy()
+        # Normalize timestamp
         if "timestamp" in row:
             try:
                 row["timestamp"] = pd.to_datetime(row["timestamp"])
             except Exception:
                 row["timestamp"] = None
         records.append(row)
+
     return records
+
 
 def preprocess_dataframe(records, sensor: str):
     """Preprocess raw Firebase records into a clean DataFrame for ML"""
@@ -130,16 +132,21 @@ def preprocess_dataframe(records, sensor: str):
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
+
+    # Ensure timestamp
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
         df = df.sort_values("timestamp")
 
-    if sensor not in df.columns:
-        return pd.DataFrame()
+    # Keep only the requested sensor column
+    if sensor in df.columns:
+        df = df[["timestamp", sensor]].dropna()
+        df = df.rename(columns={sensor: "value"})
+        return df
 
-    df = df[["timestamp", sensor]].dropna()
-    df = df.rename(columns={sensor: "value"})
-    return df
+    return pd.DataFrame()
+
 
 def make_lag_features(df: pd.DataFrame):
     """Add lag features for time-series forecasting"""
