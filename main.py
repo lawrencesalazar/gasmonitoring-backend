@@ -188,59 +188,75 @@ def compute_classification_metrics(y_true, y_pred, classes):
         "confusion_matrix": conf_matrix.tolist(),
         "classes": classes
     }
-def create_classification_labels(df, sensor_type):
-    """Create classification labels based on sensor thresholds"""
-    if df.empty:
+    def create_classification_labels(df, sensor_type):
+    """Create classification labels based on sensor thresholds with better class distribution"""
+    if df.empty or len(df) < 5:  # Need at least 5 samples for meaningful classification
         return pd.DataFrame()
     
     df_class = df.copy()
     
     # Define thresholds for different sensor types
     thresholds = {
-        'co2': {'low': 400, 'medium': 800, 'high': 1000},
-        'methane': {'low': 200, 'medium': 500, 'high': 1000},
-        'ammonia': {'low': 10, 'medium': 25, 'high': 50},
-        'temperature': {'low': 15, 'medium_low': 20, 'medium_high': 30, 'high': 35},
-        'humidity': {'low': 30, 'medium_low': 40, 'medium_high': 60, 'high': 70}
+        'co2': {'very_low': 400, 'low': 600, 'medium': 800, 'high': 1000},
+        'methane': {'very_low': 100, 'low': 300, 'medium': 500, 'high': 1000},
+        'ammonia': {'very_low': 5, 'low': 15, 'medium': 25, 'high': 50},
+        'temperature': {'very_low': 10, 'low': 18, 'normal_low': 22, 'normal_high': 28, 'high': 32, 'very_high': 35},
+        'humidity': {'very_low': 20, 'low': 35, 'normal_low': 45, 'normal_high': 55, 'high': 65, 'very_high': 75}
     }
     
     sensor_type_lower = sensor_type.lower()
     
-    if sensor_type_lower in thresholds:
-        thresholds_config = thresholds[sensor_type_lower]
+    # Use quantile-based approach to ensure we have multiple classes
+    if len(df_class) >= 10:
+        # For larger datasets, use quantiles to ensure balanced classes
+        q1 = df_class['value'].quantile(0.25)
+        q2 = df_class['value'].quantile(0.5)  # median
+        q3 = df_class['value'].quantile(0.75)
         
-        if sensor_type_lower in ['co2', 'methane', 'ammonia']:
-            # For gas sensors: low, medium, high
-            conditions = [
-                df_class['value'] <= thresholds_config['low'],
-                (df_class['value'] > thresholds_config['low']) & (df_class['value'] <= thresholds_config['medium']),
-                (df_class['value'] > thresholds_config['medium']) & (df_class['value'] <= thresholds_config['high']),
-                df_class['value'] > thresholds_config['high']
-            ]
-            choices = ['very_low', 'low', 'medium', 'high']
-            
-        else:  # temperature and humidity
-            # For environmental sensors: very_low, low, normal, high, very_high
-            conditions = [
-                df_class['value'] < thresholds_config['low'],
-                (df_class['value'] >= thresholds_config['low']) & (df_class['value'] < thresholds_config.get('medium_low', 25)),
-                (df_class['value'] >= thresholds_config.get('medium_low', 25)) & (df_class['value'] <= thresholds_config.get('medium_high', 30)),
-                (df_class['value'] > thresholds_config.get('medium_high', 30)) & (df_class['value'] <= thresholds_config['high']),
-                df_class['value'] > thresholds_config['high']
-            ]
-            choices = ['very_low', 'low', 'normal', 'high', 'very_high']
-        
-        df_class['class'] = np.select(conditions, choices, default='unknown')
+        conditions = [
+            df_class['value'] < q1,
+            (df_class['value'] >= q1) & (df_class['value'] < q2),
+            (df_class['value'] >= q2) & (df_class['value'] < q3),
+            df_class['value'] >= q3
+        ]
+        choices = ['low', 'medium_low', 'medium_high', 'high']
         
     else:
-        # Default binary classification based on median
+        # For smaller datasets, use simpler binary classification
         median_val = df_class['value'].median()
-        df_class['class'] = np.where(df_class['value'] > median_val, 'above_median', 'below_median')
+        conditions = [
+            df_class['value'] <= median_val,
+            df_class['value'] > median_val
+        ]
+        choices = ['below_median', 'above_median']
+    
+    df_class['class'] = np.select(conditions, choices, default='unknown')
     
     # Remove any rows with 'unknown' class
     df_class = df_class[df_class['class'] != 'unknown']
     
+    # Check if we have at least 2 classes with multiple samples
+    class_counts = df_class['class'].value_counts()
+    valid_classes = class_counts[class_counts >= 1].index.tolist()  # At least 1 sample per class
+    
+    if len(valid_classes) < 2:
+        # If we don't have enough classes, force binary classification
+        median_val = df_class['value'].median()
+        df_class['class'] = np.where(df_class['value'] > median_val, 'high', 'low')
+        
+        # Check again
+        class_counts = df_class['class'].value_counts()
+        valid_classes = class_counts[class_counts >= 1].index.tolist()
+        
+        if len(valid_classes) < 2:
+            # If still not enough classes, return empty DataFrame
+            return pd.DataFrame()
+    
+    # Only keep valid classes
+    df_class = df_class[df_class['class'].isin(valid_classes)]
+    
     return df_class
+    
 def error_image(msg: str):
     """Generate error image with message"""
     buf = io.BytesIO()
@@ -822,13 +838,12 @@ HYPERPARAM_GRIDS = {
     }
 }
 
-# NEW PERFORMANCE ENDPOINT
-@app.get("/performance/{sensor_id}")
+# NEW PERFORMANCE ENDPOINT@app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
     test_size: float = Query(0.2, description="Test set size ratio"),
-    cv_folds: int = Query(5, description="Cross-validation folds")
+    cv_folds: int = Query(3, description="Cross-validation folds")  # Reduced from 5 to 3
 ):
     """Get performance metrics for different classifiers with hyperparameter tuning"""
     try:
@@ -836,17 +851,50 @@ def performance_metrics(
         df = preprocess_dataframe(records, sensor)
         
         if df.empty or len(df) < 10:
-            return {"error": "Not enough data for performance analysis", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": f"Not enough data for performance analysis. Need at least 10 samples, got {len(df)}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
         
         # Create classification dataset
         df_class = create_classification_labels(df, sensor)
         if df_class.empty:
-            return {"error": "Failed to create classification labels", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": "Failed to create classification labels - insufficient class diversity", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
+        
+        # Check class distribution
+        class_distribution = df_class['class'].value_counts()
+        if len(class_distribution) < 2:
+            return {
+                "error": f"Need at least 2 classes for classification. Found only: {class_distribution.to_dict()}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
+        
+        # Ensure each class has at least 2 samples
+        min_samples_per_class = 2
+        valid_classes = class_distribution[class_distribution >= min_samples_per_class].index
+        if len(valid_classes) < 2:
+            return {
+                "error": f"Need at least 2 classes with minimum {min_samples_per_class} samples each. Current distribution: {class_distribution.to_dict()}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
+        
+        df_class = df_class[df_class['class'].isin(valid_classes)]
         
         # Create features (using lag features for time series)
         df_lags = make_lag_features(df_class, lags=2)
-        if df_lags.empty:
-            return {"error": "Insufficient data after feature engineering", "sensor_id": sensor_id, "sensor_type": sensor}
+        if df_lags.empty or len(df_lags) < 5:
+            return {
+                "error": "Insufficient data after feature engineering", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
         
         # Prepare features and target
         feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
@@ -859,12 +907,29 @@ def performance_metrics(
         classes = le.classes_.tolist()
         
         if len(classes) < 2:
-            return {"error": "Need at least 2 classes for classification", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": f"Need at least 2 classes for classification. Found: {classes}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
         
-        # Split data
+        # Adjust test_size and cv_folds based on data size
+        n_samples = len(X)
+        actual_test_size = min(test_size, 0.3)  # Cap at 30%
+        actual_cv_folds = min(cv_folds, max(2, n_samples // 3))  # Adaptive CV folds
+        
+        # Split data with stratification
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=test_size, random_state=42, stratify=y_encoded
+            X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
         )
+        
+        # Check if we have enough training data
+        if len(X_train) < 5:
+            return {
+                "error": f"Insufficient training data: {len(X_train)} samples. Need at least 5.", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor
+            }
         
         # Scale features
         scaler = StandardScaler()
@@ -873,12 +938,36 @@ def performance_metrics(
         
         results = {}
         
-        # 1. XGBoost Classifier with Hyperparameter Tuning
+        # Simplified hyperparameter grids for small datasets
+        simple_hyperparam_grids = {
+            'xgboost': {
+                'n_estimators': [30, 50],
+                'max_depth': [3, 5],
+                'learning_rate': [0.1, 0.2]
+            },
+            'random_forest': {
+                'n_estimators': [30, 50],
+                'max_depth': [3, 5]
+            },
+            'svc': {
+                'C': [0.1, 1],
+                'kernel': ['linear', 'rbf']
+            },
+            'knn': {
+                'n_neighbors': [3, 5]
+            },
+            'logistic_regression': {
+                'C': [0.1, 1],
+                'max_iter': [100, 200]
+            }
+        }
+        
+        # 1. XGBoost Classifier with simplified tuning
         try:
             xgb_clf = xgb.XGBClassifier(random_state=42, eval_metric='logloss')
             grid_search_xgb = GridSearchCV(
-                xgb_clf, HYPERPARAM_GRIDS['xgboost'], 
-                cv=min(cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=-1
+                xgb_clf, simple_hyperparam_grids['xgboost'], 
+                cv=min(actual_cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=1
             )
             grid_search_xgb.fit(X_train_scaled, y_train)
             best_xgb = grid_search_xgb.best_estimator_
@@ -893,14 +982,14 @@ def performance_metrics(
             logger.error(f"XGBoost tuning failed: {e}")
             results['XGBoost'] = {'error': str(e)}
         
-        # 2. Random Forest Classifier with Hyperparameter Tuning
+        # 2. Random Forest Classifier with simplified tuning
         try:
             rf_clf = RandomForestClassifier(random_state=42)
             grid_search_rf = GridSearchCV(
-                rf_clf, HYPERPARAM_GRIDS['random_forest'],
-                cv=min(cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=-1
+                rf_clf, simple_hyperparam_grids['random_forest'],
+                cv=min(actual_cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=1
             )
-            grid_search_rf.fit(X_train, y_train)  # RF doesn't always need scaling
+            grid_search_rf.fit(X_train, y_train)
             best_rf = grid_search_rf.best_estimator_
             y_pred_rf = best_rf.predict(X_test)
             
@@ -913,52 +1002,12 @@ def performance_metrics(
             logger.error(f"Random Forest tuning failed: {e}")
             results['RandomForest'] = {'error': str(e)}
         
-        # 3. SVC with Hyperparameter Tuning
-        try:
-            svc_clf = SVC(random_state=42, probability=True)
-            grid_search_svc = GridSearchCV(
-                svc_clf, HYPERPARAM_GRIDS['svc'],
-                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
-            )
-            grid_search_svc.fit(X_train_scaled, y_train)
-            best_svc = grid_search_svc.best_estimator_
-            y_pred_svc = best_svc.predict(X_test_scaled)
-            
-            results['SVC'] = {
-                'best_params': grid_search_svc.best_params_,
-                'metrics': compute_classification_metrics(y_test, y_pred_svc, classes),
-                'cv_score': float(grid_search_svc.best_score_)
-            }
-        except Exception as e:
-            logger.error(f"SVC tuning failed: {e}")
-            results['SVC'] = {'error': str(e)}
-        
-        # 4. K-Nearest Neighbors with Hyperparameter Tuning
-        try:
-            knn_clf = KNeighborsClassifier()
-            grid_search_knn = GridSearchCV(
-                knn_clf, HYPERPARAM_GRIDS['knn'],
-                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
-            )
-            grid_search_knn.fit(X_train_scaled, y_train)
-            best_knn = grid_search_knn.best_estimator_
-            y_pred_knn = best_knn.predict(X_test_scaled)
-            
-            results['KNN'] = {
-                'best_params': grid_search_knn.best_params_,
-                'metrics': compute_classification_metrics(y_test, y_pred_knn, classes),
-                'cv_score': float(grid_search_knn.best_score_)
-            }
-        except Exception as e:
-            logger.error(f"KNN tuning failed: {e}")
-            results['KNN'] = {'error': str(e)}
-        
-        # 5. Logistic Regression with Hyperparameter Tuning
+        # 3. Logistic Regression (most stable for small datasets)
         try:
             lr_clf = LogisticRegression(random_state=42, max_iter=1000)
             grid_search_lr = GridSearchCV(
-                lr_clf, HYPERPARAM_GRIDS['logistic_regression'],
-                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
+                lr_clf, simple_hyperparam_grids['logistic_regression'],
+                cv=min(actual_cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=1
             )
             grid_search_lr.fit(X_train_scaled, y_train)
             best_lr = grid_search_lr.best_estimator_
@@ -978,8 +1027,10 @@ def performance_metrics(
         if successful_models:
             best_algorithm = max(successful_models.keys(), 
                                key=lambda x: successful_models[x]['metrics']['f1_score'])
+            best_score = successful_models[best_algorithm]['metrics']['f1_score']
         else:
             best_algorithm = "No successful models"
+            best_score = 0
         
         return {
             "sensor_id": sensor_id,
@@ -990,18 +1041,26 @@ def performance_metrics(
                 "test_samples": len(X_test),
                 "feature_count": len(feature_cols),
                 "classes": classes,
-                "class_distribution": dict(df_lags['class'].value_counts())
+                "class_distribution": dict(df_lags['class'].value_counts()),
+                "original_data_points": len(df)
             },
             "algorithms": results,
             "best_algorithm": best_algorithm,
-            "test_size": test_size,
-            "cv_folds": cv_folds
+            "best_score": best_score,
+            "test_size_used": actual_test_size,
+            "cv_folds_used": actual_cv_folds,
+            "status": "success"
         }
         
     except Exception as e:
         logger.error(f"Performance metrics error: {e}")
-        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
-
+        return {
+            "error": str(e), 
+            "sensor_id": sensor_id, 
+            "sensor_type": sensor,
+            "status": "error"
+        }
+        
 @app.get("/confusion_matrix/{sensor_id}")
 def confusion_matrix_chart(
     sensor_id: str,
