@@ -34,23 +34,20 @@ app = FastAPI(
     version="1.0.0",
     description="API for gas sensor monitoring, forecasting, and SHAP explanations"
 )
-
-# CORS Middleware - MOVE THIS AFTER app initialization
-origins = [
-    "http://localhost:3000",
-    "https://gasmonitoring-ec511.web.app",
-    "http://localhost:3001",
-    "*"
-]
-
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "*",  # or replace with your React/Vite domains
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://gasmonitoring-ec511.web.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ---------------------------------------------------
 # Firebase Setup
 # ---------------------------------------------------
@@ -85,16 +82,7 @@ try:
         logger.info("Firebase initialized successfully")
 except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
-
-# Global CORS headers middleware
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
+ 
 # Utility functions
 def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase"""
