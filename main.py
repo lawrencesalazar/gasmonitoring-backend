@@ -45,6 +45,7 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",    # Vite dev
     "https://gasmonitoring-ec511.web.app",  # Render frontend
+    "*"
 ]
 
 app.add_middleware(
@@ -275,12 +276,12 @@ def explain(
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
     """SHAP scatter or summary plot with 3-day consolidated hourly history"""
     try:
-        # ✅ Fetch last 3 days history
+        #  Fetch last 3 days history
         history = fetch_history(sensor_id, sensor, days=3)
         if not history or len(history) < 20:
             return JSONResponse({"error": "Not enough data"}, status_code=400)
 
-        # ✅ Convert to DataFrame
+        # Convert to DataFrame
         df = pd.DataFrame(history)
         df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y%m%d_%H%M%S")
         df["date"] = df["timestamp"].dt.date
@@ -288,7 +289,7 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df = df.dropna()
 
-        # ✅ Aggregate by date+hour (mean values)
+        #  Aggregate by date+hour (mean values)
         agg = (
             df.groupby(["date", "hour"])["value"]
             .mean()
@@ -299,14 +300,14 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
         if agg.empty or len(agg) < 10:
             return JSONResponse({"error": "Not enough consolidated data"}, status_code=400)
 
-        # ✅ Train simple XGBoost on hour → value
+        # Train simple XGBoost on hour → value
         X = agg[["hour"]]
         y = agg["value"]
 
         model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
         model.fit(X, y)
 
-        # ✅ SHAP explain
+        # SHAP explain
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X)
 
@@ -343,9 +344,8 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
             plt.savefig(buf, format="png", bbox_inches="tight")
             plt.close()
 
-        buf.seek(0)
-        headers = {"Access-Control-Allow-Origin": "*"}
-        return StreamingResponse(buf, media_type="image/png", headers=headers)
+        buf.seek(0) 
+        return StreamingResponse(buf, media_type="image/png")
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
