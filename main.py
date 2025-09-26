@@ -37,11 +37,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # or replace with your React/Vite domains
-        "http://localhost:3000",
-        "https://gasmonitoring-ec511.web.app",
-    ],
+    allow_origins=[  "*"    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -142,6 +138,27 @@ def compute_metrics(y_true, y_pred):
     else:
         r2 = 0
     return {"mse": float(mse), "rmse": float(rmse), "mae": float(mae), "r2_score": float(r2)}
+
+def compute_classification_metrics(y_true, y_pred, classes):
+    """Compute comprehensive classification metrics"""
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    # Per-class metrics
+    class_report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    conf_matrix = confusion_matrix(y_true, y_pred)
+    
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1_score": float(f1),
+        "class_report": class_report,
+        "confusion_matrix": conf_matrix.tolist(),
+        "classes": classes
+    }
 
 def error_image(msg: str):
     """Generate error image with message"""
@@ -682,6 +699,280 @@ def shap_hour(sensor_id: str, sensor: str = Query(...)):
     df["hour"] = df["timestamp"].dt.hour
     agg = df.groupby("hour")["value"].mean().reset_index()
     return JSONResponse(agg.to_dict(orient="records"))
+    
+    # Hyperparameter grids for different classifiers
+HYPERPARAM_GRIDS = {
+    'xgboost': {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.01, 0.1, 0.2],
+        'subsample': [0.8, 0.9, 1.0]
+    },
+    'random_forest': {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [3, 5, 7, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'bootstrap': [True, False]
+    },
+    'svc': {
+        'C': [0.1, 1, 10, 100],
+        'kernel': ['linear', 'rbf', 'poly'],
+        'gamma': ['scale', 'auto', 0.1, 1],
+        'degree': [2, 3, 4]
+    },
+    'knn': {
+        'n_neighbors': [3, 5, 7, 9, 11],
+        'weights': ['uniform', 'distance'],
+        'algorithm': ['auto', 'ball_tree', 'kd_tree'],
+        'leaf_size': [20, 30, 40]
+    },
+    'logistic_regression': {
+        'C': [0.1, 1, 10, 100],
+        'penalty': ['l1', 'l2', 'elasticnet'],
+        'solver': ['liblinear', 'saga'],
+        'max_iter': [100, 200, 500]
+    }
+}
+
+# NEW PERFORMANCE ENDPOINT
+@app.get("/performance/{sensor_id}")
+def performance_metrics(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    test_size: float = Query(0.2, description="Test set size ratio"),
+    cv_folds: int = Query(5, description="Cross-validation folds")
+):
+    """Get performance metrics for different classifiers with hyperparameter tuning"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        
+        if df.empty or len(df) < 10:
+            return {"error": "Not enough data for performance analysis", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Create classification dataset
+        df_class = create_classification_labels(df, sensor)
+        if df_class.empty:
+            return {"error": "Failed to create classification labels", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Create features (using lag features for time series)
+        df_lags = make_lag_features(df_class, lags=2)
+        if df_lags.empty:
+            return {"error": "Insufficient data after feature engineering", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Prepare features and target
+        feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
+        X = df_lags[feature_cols]
+        y = df_lags['class']
+        
+        # Encode labels
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y)
+        classes = le.classes_.tolist()
+        
+        if len(classes) < 2:
+            return {"error": "Need at least 2 classes for classification", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_encoded, test_size=test_size, random_state=42, stratify=y_encoded
+        )
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        results = {}
+        
+        # 1. XGBoost Classifier with Hyperparameter Tuning
+        try:
+            xgb_clf = xgb.XGBClassifier(random_state=42, eval_metric='logloss')
+            grid_search_xgb = GridSearchCV(
+                xgb_clf, HYPERPARAM_GRIDS['xgboost'], 
+                cv=min(cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=-1
+            )
+            grid_search_xgb.fit(X_train_scaled, y_train)
+            best_xgb = grid_search_xgb.best_estimator_
+            y_pred_xgb = best_xgb.predict(X_test_scaled)
+            
+            results['XGBoost'] = {
+                'best_params': grid_search_xgb.best_params_,
+                'metrics': compute_classification_metrics(y_test, y_pred_xgb, classes),
+                'cv_score': float(grid_search_xgb.best_score_)
+            }
+        except Exception as e:
+            logger.error(f"XGBoost tuning failed: {e}")
+            results['XGBoost'] = {'error': str(e)}
+        
+        # 2. Random Forest Classifier with Hyperparameter Tuning
+        try:
+            rf_clf = RandomForestClassifier(random_state=42)
+            grid_search_rf = GridSearchCV(
+                rf_clf, HYPERPARAM_GRIDS['random_forest'],
+                cv=min(cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=-1
+            )
+            grid_search_rf.fit(X_train, y_train)  # RF doesn't always need scaling
+            best_rf = grid_search_rf.best_estimator_
+            y_pred_rf = best_rf.predict(X_test)
+            
+            results['RandomForest'] = {
+                'best_params': grid_search_rf.best_params_,
+                'metrics': compute_classification_metrics(y_test, y_pred_rf, classes),
+                'cv_score': float(grid_search_rf.best_score_)
+            }
+        except Exception as e:
+            logger.error(f"Random Forest tuning failed: {e}")
+            results['RandomForest'] = {'error': str(e)}
+        
+        # 3. SVC with Hyperparameter Tuning
+        try:
+            svc_clf = SVC(random_state=42, probability=True)
+            grid_search_svc = GridSearchCV(
+                svc_clf, HYPERPARAM_GRIDS['svc'],
+                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
+            )
+            grid_search_svc.fit(X_train_scaled, y_train)
+            best_svc = grid_search_svc.best_estimator_
+            y_pred_svc = best_svc.predict(X_test_scaled)
+            
+            results['SVC'] = {
+                'best_params': grid_search_svc.best_params_,
+                'metrics': compute_classification_metrics(y_test, y_pred_svc, classes),
+                'cv_score': float(grid_search_svc.best_score_)
+            }
+        except Exception as e:
+            logger.error(f"SVC tuning failed: {e}")
+            results['SVC'] = {'error': str(e)}
+        
+        # 4. K-Nearest Neighbors with Hyperparameter Tuning
+        try:
+            knn_clf = KNeighborsClassifier()
+            grid_search_knn = GridSearchCV(
+                knn_clf, HYPERPARAM_GRIDS['knn'],
+                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
+            )
+            grid_search_knn.fit(X_train_scaled, y_train)
+            best_knn = grid_search_knn.best_estimator_
+            y_pred_knn = best_knn.predict(X_test_scaled)
+            
+            results['KNN'] = {
+                'best_params': grid_search_knn.best_params_,
+                'metrics': compute_classification_metrics(y_test, y_pred_knn, classes),
+                'cv_score': float(grid_search_knn.best_score_)
+            }
+        except Exception as e:
+            logger.error(f"KNN tuning failed: {e}")
+            results['KNN'] = {'error': str(e)}
+        
+        # 5. Logistic Regression with Hyperparameter Tuning
+        try:
+            lr_clf = LogisticRegression(random_state=42, max_iter=1000)
+            grid_search_lr = GridSearchCV(
+                lr_clf, HYPERPARAM_GRIDS['logistic_regression'],
+                cv=min(cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=-1
+            )
+            grid_search_lr.fit(X_train_scaled, y_train)
+            best_lr = grid_search_lr.best_estimator_
+            y_pred_lr = best_lr.predict(X_test_scaled)
+            
+            results['LogisticRegression'] = {
+                'best_params': grid_search_lr.best_params_,
+                'metrics': compute_classification_metrics(y_test, y_pred_lr, classes),
+                'cv_score': float(grid_search_lr.best_score_)
+            }
+        except Exception as e:
+            logger.error(f"Logistic Regression tuning failed: {e}")
+            results['LogisticRegression'] = {'error': str(e)}
+        
+        # Determine best algorithm
+        successful_models = {k: v for k, v in results.items() if 'metrics' in v}
+        if successful_models:
+            best_algorithm = max(successful_models.keys(), 
+                               key=lambda x: successful_models[x]['metrics']['f1_score'])
+        else:
+            best_algorithm = "No successful models"
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "dataset_info": {
+                "total_samples": len(df_lags),
+                "training_samples": len(X_train),
+                "test_samples": len(X_test),
+                "feature_count": len(feature_cols),
+                "classes": classes,
+                "class_distribution": dict(df_lags['class'].value_counts())
+            },
+            "algorithms": results,
+            "best_algorithm": best_algorithm,
+            "test_size": test_size,
+            "cv_folds": cv_folds
+        }
+        
+    except Exception as e:
+        logger.error(f"Performance metrics error: {e}")
+        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
+
+@app.get("/confusion_matrix/{sensor_id}")
+def confusion_matrix_chart(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    test_size: float = Query(0.2, description="Test size"),
+    cv_folds: int = Query(5, description="CV folds")
+):
+    """
+    Generate confusion matrix chart for best performing algorithm
+    """
+    try:
+        # Reuse performance endpoint logic
+        perf = performance_metrics(sensor_id, sensor, test_size, cv_folds)
+        if "error" in perf:
+            return error_image(perf["error"])
+
+        best_algo = perf.get("best_algorithm")
+        if not best_algo or best_algo == "No successful models":
+            return error_image("No valid model for confusion matrix")
+
+        metrics = perf["algorithms"][best_algo]["metrics"]
+        conf_matrix = np.array(metrics["confusion_matrix"])
+        classes = metrics["classes"]
+
+        # Plot confusion matrix
+        buf = io.BytesIO()
+        plt.figure(figsize=(6, 5))
+        plt.imshow(conf_matrix, interpolation="nearest", cmap=plt.cm.Blues)
+        plt.title(f"Confusion Matrix - {best_algo}")
+        plt.colorbar()
+
+        tick_marks = np.arange(len(classes))
+        plt.xticks(tick_marks, classes, rotation=45)
+        plt.yticks(tick_marks, classes)
+
+        # Normalize
+        cm_normalized = conf_matrix.astype("float") / conf_matrix.sum(axis=1)[:, np.newaxis]
+        thresh = conf_matrix.max() / 2.
+        for i in range(conf_matrix.shape[0]):
+            for j in range(conf_matrix.shape[1]):
+                plt.text(
+                    j, i,
+                    f"{conf_matrix[i, j]} ({cm_normalized[i, j]:.2f})",
+                    horizontalalignment="center",
+                    color="white" if conf_matrix[i, j] > thresh else "black"
+                )
+
+        plt.ylabel("True label")
+        plt.xlabel("Predicted label")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=100)
+        plt.close()
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+
+    except Exception as e:
+        logger.error(f"Confusion matrix error: {e}")
+        return error_image(str(e))
 
 # Run the application
 if __name__ == "__main__":
