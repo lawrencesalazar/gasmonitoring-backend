@@ -1,15 +1,14 @@
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from fastapi import HTTPException
-
 
 import os
 import json
 import io
 import base64
-from datetime import timedelta
+import math
+import gc
+from datetime import timedelta, datetime
 
 import numpy as np
 import pandas as pd
@@ -18,45 +17,41 @@ import matplotlib
 matplotlib.use("Agg")  # Headless servers (Render)
 import matplotlib.pyplot as plt
 
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
 from sklearn.model_selection import train_test_split
-# ML & preprocessingfrom fastapi import HTTPException
-import math
-from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
+
 import xgboost as xgb
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
- 
 
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, db
-import gc
 
 # ---------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------
 app = FastAPI()
-# Allow your frontend domains
+
+# CORS Middleware
 origins = [
-    "http://localhost:3000",    # Vite dev
-    "https://gasmonitoring-ec511.web.app",  # Render frontend
+    "http://localhost:3000",
+    "https://gasmonitoring-ec511.web.app",
     "*"
 ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # You can restrict to your frontend domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# Add global CORS headers
+# Global CORS headers middleware
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
@@ -64,7 +59,6 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
-
 
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(rest_of_path: str):
@@ -76,7 +70,6 @@ async def preflight_handler(rest_of_path: str):
             "Access-Control-Allow-Headers": "*",
         },
     )
-
 
 # ---------------------------------------------------
 # Firebase Setup
@@ -92,7 +85,7 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
 # ---------------------------
-# Utility to generate error images
+# Utility Functions
 # ---------------------------
 def error_image(message: str):
     buf = io.BytesIO()
@@ -112,9 +105,7 @@ def error_image(message: str):
             "Access-Control-Allow-Headers": "*",
         },
     )
-# ----------------------
-# Helper Functions
-# ----------------------
+
 def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase and return as list of dicts"""
     ref = db.reference(f"history/{sensor_id}")
@@ -133,7 +124,6 @@ def fetch_sensor_history(sensor_id: str):
         records.append(row)
     return records
 
-
 def preprocess_dataframe(records, sensor: str):
     """Preprocess raw Firebase records into a clean DataFrame for ML"""
     if not records:
@@ -151,14 +141,12 @@ def preprocess_dataframe(records, sensor: str):
     df = df.rename(columns={sensor: "value"})
     return df
 
-
 def make_lag_features(df: pd.DataFrame):
     """Add lag features for time-series forecasting"""
     df["lag1"] = df["value"].shift(1)
     df["lag2"] = df["value"].shift(2)
     df["lag3"] = df["value"].shift(3)
     return df.dropna()
-
 
 def train_xgboost(df: pd.DataFrame, steps: int = 7):
     """Train XGBoost model and forecast future values"""
@@ -191,11 +179,49 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
 
     return predictions
 
+def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
+    ref = db.reference(f"history")
+    snapshot = ref.get()
+    if not snapshot:
+        return []
 
-# ----------------------
+    now = datetime.now()
+    start_date = (now - timedelta(days=days)).strftime("%Y%m%d")
+
+    data_points = []
+    for ts, record in snapshot.items():
+        date_key = ts.split("_")[0]  # format: yyyyMMdd_HHmmss
+        if date_key >= start_date:
+            if record.get("sensor_id") == sensor_id and record.get("sensor_type") == sensor_type:
+                data_points.append({
+                    "timestamp": ts,
+                    "value": record.get("value")
+                })
+    data_points.sort(key=lambda x: x["timestamp"])
+    return data_points
+
+def compute_metrics(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100 if np.all(y_true != 0) else None
+    r2 = r2_score(y_true, y_pred)
+    evs = explained_variance_score(y_true, y_pred)
+
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "r2_score": r2,
+        "explained_variance": evs,
+        "y_true_sample": y_true[:10].tolist(),
+        "y_pred_sample": y_pred[:10].tolist()
+    }
+
+# ---------------------------
 # Endpoints
-# ----------------------
-
+# ---------------------------
 @app.get("/predict/{sensor_id}")
 def predict(sensor_id: str, sensor: str = Query(...), steps: int = 7):
     records = fetch_sensor_history(sensor_id)
@@ -211,7 +237,6 @@ def predict(sensor_id: str, sensor: str = Query(...), steps: int = 7):
         "forecasts": forecasts
     }
 
-
 @app.get("/dataframe/{sensor_id}")
 def dataframe(sensor_id: str, sensor: str = Query(...)):
     records = fetch_sensor_history(sensor_id)
@@ -226,41 +251,7 @@ def dataframe(sensor_id: str, sensor: str = Query(...)):
         "sensor_type": sensor,
         "data": df.to_dict(orient="records")
     }
-import gc
-from fastapi import Query
-from fastapi.responses import StreamingResponse
-import io
-import matplotlib.pyplot as plt
-import shap
-import numpy as np
-import pandas as pd
-import xgboost as xgb
 
-# ---------------------------
-# Utility to generate error images
-# ---------------------------
-def error_image(message: str):
-    buf = io.BytesIO()
-    plt.figure(figsize=(6, 3))
-    plt.text(0.5, 0.5, f"⚠️ {message}", ha="center", va="center", fontsize=12, color="red")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="image/png",
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
-
-# ---------------------------
-# EXPLAIN endpoint (SHAP summary)
-# ---------------------------
 @app.get("/explain/{sensor_id}")
 def explain(sensor_id: str, sensor: str = Query(...)):
     try:
@@ -302,10 +293,6 @@ def explain(sensor_id: str, sensor: str = Query(...)):
     except Exception as e:
         return error_image(str(e))
 
-
-# ---------------------------
-# PLOT endpoint (scatter or summary)
-# ---------------------------
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
     try:
@@ -379,9 +366,7 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
 
     except Exception as e:
         return error_image(str(e))
-  # ---------------------------
-# SHAP_HOUR endpoint (SHAP per hour chart)
-# ---------------------------
+
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(sensor_id: str, sensor: str = Query(...)):
     try:
@@ -510,31 +495,7 @@ def recommendation(sensor_id: str, sensor: str = Query(...)):
         "forecast": forecast_val,
         "recommendation": recommendation
     }
-    
-# Utility: fetch last N days of history for a sensor
-def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
-    ref = db.reference(f"history")
-    snapshot = ref.get()
-    if not snapshot:
-        return []
 
-    now = datetime.now()
-    start_date = (now - timedelta(days=days)).strftime("%Y%m%d")
-
-    data_points = []
-    for ts, record in snapshot.items():
-        date_key = ts.split("_")[0]  # format: yyyyMMdd_HHmmss
-        if date_key >= start_date:
-            if record.get("sensor_id") == sensor_id and record.get("sensor_type") == sensor_type:
-                data_points.append({
-                    "timestamp": ts,
-                    "value": record.get("value")
-                })
-    data_points.sort(key=lambda x: x["timestamp"])
-    return data_points
-
-
-# ENDPOINT: Compute XGBoost metrics
 @app.get("/xgboost_compute/{sensor_id}")
 async def xgboost_compute(sensor_id: str, sensor: str):
     history = fetch_history(sensor_id, sensor, days=3)
@@ -591,34 +552,9 @@ async def xgboost_compute(sensor_id: str, sensor: str):
         },
         "history_points": len(df)
     }
-    from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    explained_variance_score
-)
-
-def compute_metrics(y_true, y_pred):
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100 if np.all(y_true != 0) else None
-    r2 = r2_score(y_true, y_pred)
-    evs = explained_variance_score(y_true, y_pred)
-
-    return {
-        "mse": mse,
-        "rmse": rmse,
-        "mae": mae,
-        "mape": mape,
-        "r2_score": r2,
-        "explained_variance": evs,
-        "y_true_sample": y_true[:10].tolist(),   # include sample actual values
-        "y_pred_sample": y_pred[:10].tolist()    # include sample predictions
-    }
 
 @app.get("/algorithm/{sensor_id}")
-def alogrithm(sensor_id: str, sensor:  str = Query(...)):
+def algorithm(sensor_id: str, sensor: str = Query(...)):
     try:
         # Fetch history data
         ref = db.reference(f"history/{sensor_id}")
@@ -703,12 +639,10 @@ def alogrithm(sensor_id: str, sensor:  str = Query(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
-        
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.get("/", response_class=HTMLResponse)
 def home():
