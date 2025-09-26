@@ -47,10 +47,9 @@ origins = [
     "https://gasmonitoring-ec511.web.app",  # Render frontend
     "*"
 ]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],   # You can restrict to your frontend domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -92,7 +91,27 @@ if not firebase_admin._apps:
     cred = credentials.Certificate(service_account_info)
     firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
-
+# ---------------------------
+# Utility to generate error images
+# ---------------------------
+def error_image(message: str):
+    buf = io.BytesIO()
+    plt.figure(figsize=(6, 3))
+    plt.text(0.5, 0.5, f"⚠️ {message}", ha="center", va="center", fontsize=12, color="red")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.close()
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="image/png",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 # ----------------------
 # Helper Functions
 # ----------------------
@@ -208,80 +227,92 @@ def dataframe(sensor_id: str, sensor: str = Query(...)):
         "data": df.to_dict(orient="records")
     }
 import gc
+from fastapi import Query
+from fastapi.responses import StreamingResponse
+import io
+import matplotlib.pyplot as plt
+import shap
+import numpy as np
+import pandas as pd
+import xgboost as xgb
 
-@app.get("/explain/{sensor_id}")
-def explain(
-    sensor_id: str,
-    sensor: str = Query(...),
-    format: str = Query("json", description="Output format: json or png")
-):
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-
-    if df.empty or len(df) < 50:
-        return {"sensor_id": sensor_id, "sensor_type": sensor, "note": "Not enough data for SHAP"}
-
-    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    X = df[["hour", "value"]]
-    y = df["value"]
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
-    model.fit(X_train, y_train)
-
-    last_row = X.iloc[[-1]]
-    prediction = float(model.predict(last_row)[0])
-
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
-
-    shap_stats = {}
-    for i, feature in enumerate(X.columns):
-        vals = X_test.iloc[:, i].values
-        shap_vals = shap_values[:, i]
-        shap_stats[feature] = {
-            "mean_abs_shap": float(np.abs(shap_vals).mean()),
-            "impact_range": [float(shap_vals.min()), float(shap_vals.max())],
-            "correlation": float(np.corrcoef(vals, shap_vals)[0, 1]),
-        }
-
+# ---------------------------
+# Utility to generate error images
+# ---------------------------
+def error_image(message: str):
     buf = io.BytesIO()
-    plt.figure(figsize=(8, 6))
-    shap.summary_plot(shap_values, X_test, feature_names=X.columns, show=False)
-    plt.title(f"SHAP Summary for {sensor}")
+    plt.figure(figsize=(6, 3))
+    plt.text(0.5, 0.5, f"⚠️ {message}", ha="center", va="center", fontsize=12, color="red")
+    plt.axis("off")
     plt.tight_layout()
     plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close("all")  # 🔑 close ALL figures
+    plt.close()
     buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="image/png",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
-    if format == "png":
-        response = StreamingResponse(buf, media_type="image/png")
-    else:
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        response = {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "prediction": prediction,
-            "shap_stats": shap_stats,
-            "shap_plot": f"data:image/png;base64,{img_b64}"
-        }
+# ---------------------------
+# EXPLAIN endpoint (SHAP summary)
+# ---------------------------
+@app.get("/explain/{sensor_id}")
+def explain(sensor_id: str, sensor: str = Query(...)):
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
 
-    # 🔑 Cleanup to prevent memory leaks
-    del model, explainer, shap_values, X, y, X_train, X_test, y_train, y_test
-    gc.collect()
+        if df.empty or len(df) < 50:
+            return error_image("Not enough data for SHAP")
 
-    return response
+        df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+        X = df[["hour", "value"]]
+        y = df["value"]
 
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+        model.fit(X, y)
+
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+
+        buf = io.BytesIO()
+        plt.figure(figsize=(8, 6))
+        shap.summary_plot(shap_values, X, feature_names=X.columns, show=False)
+        plt.title(f"SHAP Summary for {sensor}")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close("all")
+        buf.seek(0)
+
+        return StreamingResponse(
+            buf,
+            media_type="image/png",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+
+    except Exception as e:
+        return error_image(str(e))
+
+
+# ---------------------------
+# PLOT endpoint (scatter or summary)
+# ---------------------------
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
-    """SHAP scatter or summary plot with 3-day consolidated hourly history"""
     try:
-        #  Fetch last 3 days history
         history = fetch_history(sensor_id, sensor, days=3)
         if not history or len(history) < 20:
-            return JSONResponse({"error": "Not enough data"}, status_code=400)
+            return error_image("Not enough data for plot")
 
-        # Convert to DataFrame
         df = pd.DataFrame(history)
         df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y%m%d_%H%M%S")
         df["date"] = df["timestamp"].dt.date
@@ -289,7 +320,6 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df = df.dropna()
 
-        #  Aggregate by date+hour (mean values)
         agg = (
             df.groupby(["date", "hour"])["value"]
             .mean()
@@ -298,27 +328,24 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
         )
 
         if agg.empty or len(agg) < 10:
-            return JSONResponse({"error": "Not enough consolidated data"}, status_code=400)
+            return error_image("Not enough consolidated data")
 
-        # Train simple XGBoost on hour → value
+        # Train simple model
         X = agg[["hour"]]
         y = agg["value"]
-
         model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
         model.fit(X, y)
 
-        # SHAP explain
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X)
 
         buf = io.BytesIO()
         if chart == "scatter":
             plt.figure(figsize=(9, 6))
-            # scatter SHAP value vs. hour
             scatter = plt.scatter(
                 shap_values[:, 0],
                 agg["hour"],
-                c=pd.factorize(agg["date"])[0],  # color by date
+                c=pd.factorize(agg["date"])[0],
                 cmap="tab10",
                 alpha=0.7
             )
@@ -333,23 +360,26 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
             plt.close()
         else:
             plt.figure(figsize=(9, 6))
-            shap.summary_plot(
-                shap_values,
-                X,
-                feature_names=["hour"],
-                show=False
-            )
+            shap.summary_plot(shap_values, X, feature_names=["hour"], show=False)
             plt.title(f"SHAP Summary (3-day hourly) - {sensor}")
             plt.tight_layout()
             plt.savefig(buf, format="png", bbox_inches="tight")
             plt.close()
 
-        buf.seek(0) 
-        return StreamingResponse(buf, media_type="image/png")
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="image/png",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+        return error_image(str(e))
+        
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(sensor_id: str, sensor: str = Query(...)):
     """Detailed SHAP stats for hour feature"""
