@@ -242,19 +242,19 @@ def home():
         </style>
     </head>
     <body>
-        <h1>🚀 Gas Monitoring API</h1>
+        <h1> Gas Monitoring API</h1>
         <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
 
-        <h2>📖 API Documentation</h2>
+        <h2> API Documentation</h2>
         <ul>
             <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
             <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
         </ul>
 
-        <h2>🔧 Available Endpoints</h2>
+        <h2> Available Endpoints</h2>
         
         <div class="endpoint">
-            <h3>📊 Data Endpoints</h3>
+            <h3> Data Endpoints</h3>
             <ul>
                 <li><code>GET /health</code> - API status check</li>
                 <li><code>GET /dataframe/{sensor_id}?sensor=type</code> - Raw sensor data</li>
@@ -263,7 +263,7 @@ def home():
         </div>
 
         <div class="endpoint">
-            <h3>🤖 AI/ML Endpoints</h3>
+            <h3> AI/ML Endpoints</h3>
             <ul>
                 <li><code>GET /algorithm/{sensor_id}?sensor=type</code> - Multi-algorithm comparison</li>
                 <li><code>GET /xgboost_compute/{sensor_id}?sensor=type</code> - XGBoost analysis</li>
@@ -273,14 +273,14 @@ def home():
         </div>
 
         <div class="endpoint">
-            <h3>📈 Forecasting Endpoints</h3>
+            <h3> Forecasting Endpoints</h3>
             <ul>
                 <li><code>GET /predict/{sensor_id}?sensor=type</code> - Future predictions</li>
                 <li><code>GET /recommendation/{sensor_id}?sensor=type</code> - OSH recommendations</li>
             </ul>
         </div>
 
-        <h2>💻 Example React.js Integration</h2>
+        <h2> Example React.js Integration</h2>
         <pre><code>useEffect(() => {
   fetch(`/api/predict/${sensorID}?sensor=${sensorType}`)
     .then(res => res.json())
