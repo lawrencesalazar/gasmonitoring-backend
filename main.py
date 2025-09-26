@@ -316,6 +316,7 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("summary")
         plt.close()
 
     buf.seek(0)
+    headers = {"Access-Control-Allow-Origin": "*"}  # fix CORS
     return StreamingResponse(buf, media_type="image/png")
 
 
