@@ -327,162 +327,125 @@ def explain(sensor_id: str, sensor: str = Query(...)):
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
     try:
+        print(f"DEBUG: Plot endpoint called with sensor_id: {sensor_id}, sensor: {sensor}")
+        
         # Use the same data fetching method as other endpoints
         records = fetch_sensor_history(sensor_id)
+        print(f"DEBUG: Fetched {len(records)} raw records")
+        
         if not records:
             return error_image("No data found for this sensor")
         
         # Preprocess the data
         df = preprocess_dataframe(records, sensor)
+        print(f"DEBUG: After preprocessing, dataframe shape: {df.shape}")
         
         if df.empty or len(df) < 3:
             return error_image(f"Not enough data for plot. Found {len(df)} records.")
 
-        print(f"DEBUG: Total records found: {len(df)}")
-        print(f"DEBUG: Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        print(f"DEBUG: Data available - First few timestamps: {df['timestamp'].head(3).tolist()}")
+        print(f"DEBUG: Data available - First few values: {df['value'].head(3).tolist()}")
 
-        # Use all available data instead of filtering by 3 days
-        df_recent = df.copy()
-        print(f"DEBUG: Using {len(df_recent)} records for plotting")
+        # Use ALL data without time filtering
+        df_plot = df.copy()
+        print(f"DEBUG: Using {len(df_plot)} records for plotting")
 
-        # Create time-based features
-        df_recent["hour"] = df_recent["timestamp"].dt.hour
-        df_recent["date"] = df_recent["timestamp"].dt.date
-        df_recent["day_of_week"] = df_recent["timestamp"].dt.dayofweek
-
-        print(f"DEBUG: Unique dates: {df_recent['date'].nunique()}")
-        print(f"DEBUG: Unique hours: {df_recent['hour'].nunique()}")
-
-        # Try different aggregation strategies
-        if len(df_recent) >= 10:
-            # If we have enough data, try hourly aggregation
-            agg = (
-                df_recent.groupby(["date", "hour"])["value"]
-                .mean()
-                .reset_index()
-                .sort_values(["date", "hour"])
-            )
-            print(f"DEBUG: Hourly aggregation result: {len(agg)} points")
-        else:
-            # If not enough data for hourly aggregation, use raw data
-            agg = df_recent[["date", "hour", "value"]].copy()
-            agg = agg.sort_values(["date", "hour"])
-            print(f"DEBUG: Using raw data (no aggregation): {len(agg)} points")
-
-        if agg.empty:
-            return error_image("No data available after processing")
-
-        # If we have very few data points, create synthetic features for better SHAP analysis
-        if len(agg) < 5:
-            # Use multiple features for better SHAP analysis
-            X = agg[["hour"]].copy()
-            # Add some derived features
-            X["hour_sin"] = np.sin(2 * np.pi * X["hour"] / 24)
-            X["hour_cos"] = np.cos(2 * np.pi * X["hour"] / 24)
-            X["value_lag"] = agg["value"].shift(1).fillna(agg["value"].mean())
-        else:
-            # Use hour as the main feature
-            X = agg[["hour"]]
-
-        y_agg = agg["value"]
-
-        print(f"DEBUG: Final X shape: {X.shape}, features: {X.columns.tolist()}")
-
-        # Handle cases with very few samples
-        if len(X) < 2:
-            return error_image(f"Need at least 2 data points for SHAP analysis. Found {len(X)}")
-
-        # Train simple model with regularization for small datasets
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror", 
-            n_estimators=min(50, len(X) * 2),  # Adaptive number of estimators
-            max_depth=3,  # Simpler model for small datasets
-            random_state=42
-        )
+        # Create simple features - just use the value and index
+        df_plot = df_plot.reset_index(drop=True)
+        df_plot['index'] = df_plot.index
+        df_plot['hour'] = df_plot['timestamp'].dt.hour
         
+        print(f"DEBUG: Created features - index range: {df_plot['index'].min()} to {df_plot['index'].max()}")
+        print(f"DEBUG: Hour range: {df_plot['hour'].min()} to {df_plot['hour'].max()}")
+
+        # Prepare features for a simple model
+        if len(df_plot) > 10:
+            # If we have enough data, use hour and index as features
+            X = df_plot[['index', 'hour']]
+        else:
+            # For small datasets, just use index
+            X = df_plot[['index']]
+            
+        y = df_plot['value']
+
+        print(f"DEBUG: X shape: {X.shape}, y shape: {y.shape}")
+
+        # Train a very simple model
         try:
-            model.fit(X, y_agg)
+            model = xgb.XGBRegressor(
+                objective="reg:squarederror", 
+                n_estimators=30,
+                max_depth=2,
+                random_state=42
+            )
+            model.fit(X, y)
+            print("DEBUG: Model trained successfully")
         except Exception as e:
             print(f"DEBUG: Model training failed: {e}")
-            # Fallback: use mean value as prediction
-            class SimpleModel:
-                def __init__(self, mean_val):
-                    self.mean_val = mean_val
-                def predict(self, X):
-                    return np.full(X.shape[0], self.mean_val)
-            
-            model = SimpleModel(y_agg.mean())
-            # For SHAP, we need a model with feature_importances_
-            model.feature_importances_ = np.ones(len(X.columns)) / len(X.columns)
+            # Use a simple linear model as fallback
+            from sklearn.linear_model import LinearRegression
+            model = LinearRegression()
+            model.fit(X, y)
+            print("DEBUG: Linear regression fallback used")
 
         # Calculate SHAP values
         try:
-            if hasattr(model, 'feature_importances_'):  # Real model
-                explainer = shap.TreeExplainer(model)
-                shap_values = explainer.shap_values(X)
-            else:  # Simple fallback model
-                # Create dummy SHAP values centered around 0
-                shap_values = np.random.normal(0, 0.1, size=(len(X), len(X.columns)))
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X)
+            print(f"DEBUG: SHAP values calculated, shape: {np.array(shap_values).shape}")
         except Exception as e:
             print(f"DEBUG: SHAP calculation failed: {e}")
-            # Create simple SHAP values based on correlation with hour
-            shap_values = np.zeros((len(X), len(X.columns)))
+            # Create simple SHAP-like values based on correlation
+            shap_values = np.zeros_like(X.values)
             for i, col in enumerate(X.columns):
-                if col == "hour":
-                    # SHAP value proportional to deviation from mean hour
+                if col == 'index':
+                    # SHAP value proportional to index position
+                    shap_values[:, i] = (X[col] - X[col].mean()) * 0.01
+                elif col == 'hour':
+                    # SHAP value based on hour deviation
                     shap_values[:, i] = (X[col] - X[col].mean()) * 0.1
 
         buf = io.BytesIO()
         
         if chart == "scatter":
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(12, 6))
             
-            # Create scatter plot
-            if len(agg) > 1:
-                scatter = plt.scatter(
-                    shap_values[:, 0] if len(shap_values.shape) > 1 else shap_values,
-                    agg["hour"],
-                    c=pd.factorize(agg["date"])[0] if len(agg["date"].unique()) > 1 else 'blue',
-                    cmap="tab10",
-                    alpha=0.7,
-                    s=60
-                )
-                
-                # Add colorbar only if we have multiple dates
-                if len(agg["date"].unique()) > 1:
-                    unique_dates = agg["date"].unique()
-                    cbar = plt.colorbar(scatter, ticks=range(len(unique_dates)))
-                    cbar.ax.set_yticklabels([str(d) for d in sorted(unique_dates)])
-                    cbar.set_label('Date')
-            else:
-                # Single point plot
-                plt.scatter(
-                    shap_values[0] if len(shap_values.shape) > 1 else shap_values,
-                    agg["hour"].iloc[0],
-                    c='blue',
-                    alpha=0.7,
-                    s=100
-                )
-            
-            plt.xlabel("SHAP Value (Impact on Prediction)")
-            plt.ylabel("Hour of Day")
-            plt.title(f"SHAP Scatter Plot - {sensor} ({len(agg)} data points)")
-            plt.axvline(x=0, color="black", linestyle="--", alpha=0.5)
+            # Create a simple time series plot with SHAP overlay
+            plt.subplot(1, 2, 1)
+            plt.plot(df_plot['timestamp'], df_plot['value'], 'b-', alpha=0.7, linewidth=2)
+            plt.scatter(df_plot['timestamp'], df_plot['value'], c=shap_values[:, 0], cmap='viridis', s=50)
+            plt.xlabel('Time')
+            plt.ylabel(f'{sensor} Value')
+            plt.title(f'{sensor} Time Series')
+            plt.xticks(rotation=45)
+            plt.colorbar(label='SHAP Value')
             plt.grid(True, alpha=0.3)
+            
+            plt.subplot(1, 2, 2)
+            plt.scatter(df_plot['hour'], df_plot['value'], c=shap_values[:, 0], cmap='viridis', s=50)
+            plt.xlabel('Hour of Day')
+            plt.ylabel(f'{sensor} Value')
+            plt.title(f'{sensor} by Hour')
+            plt.colorbar(label='SHAP Value')
+            plt.grid(True, alpha=0.3)
+            
+            plt.suptitle(f'Sensor {sensor_id} - {sensor} Analysis ({len(df_plot)} points)')
             plt.tight_layout()
             
         else:  # summary plot
             plt.figure(figsize=(10, 6))
-            if len(X.columns) == 1:
-                # Single feature summary plot
-                plt.scatter(shap_values, X.iloc[:, 0], alpha=0.7)
-                plt.xlabel("SHAP Value")
-                plt.ylabel(X.columns[0])
-                plt.title(f"SHAP Summary - {sensor} ({len(agg)} points)")
-            else:
-                # Multiple features - use proper summary plot
+            
+            if len(X.columns) > 1:
+                # Multiple features
                 shap.summary_plot(shap_values, X, feature_names=X.columns.tolist(), show=False)
-                plt.title(f"SHAP Summary - {sensor} ({len(agg)} points)")
+            else:
+                # Single feature - create custom plot
+                plt.scatter(shap_values, X.iloc[:, 0], alpha=0.7)
+                plt.xlabel('SHAP Value')
+                plt.ylabel(X.columns[0])
+                plt.grid(True, alpha=0.3)
+                
+            plt.title(f'SHAP Summary - {sensor} ({len(df_plot)} points)')
             plt.tight_layout()
 
         plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
