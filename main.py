@@ -28,14 +28,14 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# Initialize FastAPI app FIRST
 app = FastAPI(
     title="Gas Monitoring API", 
     version="1.0.0",
     description="API for gas sensor monitoring, forecasting, and SHAP explanations"
 )
 
-# CORS Middleware
+# CORS Middleware - MOVE THIS AFTER app initialization
 origins = [
     "http://localhost:3000",
     "https://gasmonitoring-ec511.web.app",
@@ -55,7 +55,25 @@ app.add_middleware(
 # Firebase Setup
 # ---------------------------------------------------
 try:
-    service_account_info = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "{}"))
+    # For Render.com deployment, use environment variables
+    firebase_config = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    if firebase_config:
+        service_account_info = json.loads(firebase_config)
+    else:
+        # Fallback for local development
+        service_account_info = {
+            "type": "service_account",
+            "project_id": os.getenv("FIREBASE_PROJECT_ID", "gasmonitoring-ec511"),
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", ""),
+            "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
+            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", ""),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL", "")
+        }
+    
     database_url = os.getenv(
         "FIREBASE_DB_URL",
         "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -86,14 +104,15 @@ def fetch_sensor_history(sensor_id: str):
         if not snapshot:
             return []
         records = []
-        for _, value in snapshot.items():
-            row = value.copy()
-            if "timestamp" in row:
-                try:
-                    row["timestamp"] = pd.to_datetime(row["timestamp"])
-                except Exception:
-                    row["timestamp"] = None
-            records.append(row)
+        for key, value in snapshot.items():
+            if isinstance(value, dict):
+                row = value.copy()
+                if "timestamp" in row:
+                    try:
+                        row["timestamp"] = pd.to_datetime(row["timestamp"])
+                    except Exception:
+                        row["timestamp"] = None
+                records.append(row)
         logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
         return records
     except Exception as e:
@@ -119,20 +138,24 @@ def preprocess_dataframe(records, sensor: str):
 
 def make_lag_features(df, lags=3):
     """Create lag features for time series forecasting"""
+    df_copy = df.copy()
     for i in range(1, lags + 1):
-        df[f"lag{i}"] = df["value"].shift(i)
-    return df.dropna()
+        df_copy[f"lag{i}"] = df_copy["value"].shift(i)
+    return df_copy.dropna()
 
 def compute_metrics(y_true, y_pred):
     """Compute regression metrics"""
+    if len(y_true) == 0:
+        return {"mse": 0, "rmse": 0, "mae": 0, "r2_score": 0}
+    
     mse = np.mean((y_true - y_pred) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_true - y_pred))
-    if len(y_true) > 1:
+    if len(y_true) > 1 and np.var(y_true) > 0:
         r2 = 1 - (np.sum((y_true - y_pred)**2) / np.sum((y_true - np.mean(y_true))**2))
     else:
         r2 = 0
-    return {"mse": mse, "rmse": rmse, "mae": mae, "r2_score": r2}
+    return {"mse": float(mse), "rmse": float(rmse), "mae": float(mae), "r2_score": float(r2)}
 
 def error_image(msg: str):
     """Generate error image with message"""
@@ -258,11 +281,11 @@ def home():
         </div>
 
         <h2>💻 Example React.js Integration</h2>
-        <pre><code>{`useEffect(() => {
-  fetch(\`/api/predict/\${sensorID}?sensor=\${sensorType}\`)
+        <pre><code>useEffect(() => {
+  fetch(`/api/predict/${sensorID}?sensor=${sensorType}`)
     .then(res => res.json())
     .then(data => setForecast(data.forecasts || []));
-}, [sensorID, sensorType]);`}</code></pre>
+}, [sensorID, sensorType]);</code></pre>
 
         <hr />
         <p style="font-size: 0.9em; color: #666;">
@@ -275,14 +298,23 @@ def home():
 @app.get("/health")
 def health():
     """Health check endpoint"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {"status": "ok", "timestamp": datetime.now().isoformat(), "service": "Gas Monitoring API"}
 
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)")):
     """Get raw sensor data as JSON"""
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    return df.to_dict(orient="records")
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "records": df.to_dict(orient="records"),
+            "count": len(df)
+        }
+    except Exception as e:
+        logger.error(f"Dataframe error: {e}")
+        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
@@ -297,48 +329,32 @@ def plot_sensor_data(
             return error_image("No data found for this sensor")
         
         df = preprocess_dataframe(records, sensor)
-        if df.empty or len(df) < 10:
+        if df.empty or len(df) < 5:
             return error_image(f"Not enough data for plot. Found {len(df)} records.")
         
-        # Use recent data (last 3 days)
-        cutoff = datetime.now() - timedelta(days=3)
+        # Use recent data (last 7 days)
+        cutoff = datetime.now() - timedelta(days=7)
         df_recent = df[df["timestamp"] >= cutoff]
         
-        if df_recent.empty or len(df_recent) < 5:
+        if df_recent.empty or len(df_recent) < 3:
             return error_image("Not enough recent data for plotting")
         
-        # Prepare features
-        df_recent["hour"] = df_recent["timestamp"].dt.hour
-        df_recent["date"] = df_recent["timestamp"].dt.date
-        agg = df_recent.groupby(["date", "hour"])["value"].mean().reset_index()
-        
-        if len(agg) < 2:
-            return error_image("Insufficient data for analysis")
-        
-        X = agg[["hour"]]
-        y = agg["value"]
-        
-        # Train simple model for SHAP
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
-        model.fit(X, y)
-        
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
-        
-        # Generate plot
+        # Create simple time series plot
         buf = io.BytesIO()
         plt.figure(figsize=(10, 6))
         
         if chart == "scatter":
-            plt.scatter(agg["hour"], y, c=shap_values, cmap="coolwarm", alpha=0.7)
-            plt.colorbar(label="SHAP Value")
-            plt.xlabel("Hour of Day")
+            plt.scatter(df_recent["timestamp"], df_recent["value"], alpha=0.7)
+            plt.xlabel("Timestamp")
             plt.ylabel("Sensor Value")
-            plt.title(f"SHAP Scatter Plot - {sensor}")
+            plt.title(f"Scatter Plot - {sensor} (Sensor {sensor_id})")
         else:
-            shap.summary_plot(shap_values, X, feature_names=["Hour"], show=False)
-            plt.title(f"SHAP Summary - {sensor}")
+            plt.plot(df_recent["timestamp"], df_recent["value"], marker='o')
+            plt.xlabel("Timestamp")
+            plt.ylabel("Sensor Value")
+            plt.title(f"Time Series - {sensor} (Sensor {sensor_id})")
         
+        plt.xticks(rotation=45)
         plt.tight_layout()
         plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
         plt.close()
@@ -361,24 +377,21 @@ def compare_algorithms(
         df = preprocess_dataframe(records, sensor)
         
         if df.empty or len(df) < 5:
-            raise HTTPException(status_code=404, detail="Not enough data for analysis")
+            return {"error": "Not enough data for analysis", "sensor_id": sensor_id, "sensor_type": sensor}
         
         # Create lag features
-        df = make_lag_features(df, lags=2)
-        if df.empty:
-            raise HTTPException(status_code=404, detail="Insufficient data after feature engineering")
+        df_lags = make_lag_features(df, lags=2)
+        if df_lags.empty:
+            return {"error": "Insufficient data after feature engineering", "sensor_id": sensor_id, "sensor_type": sensor}
         
-        X, y = df[["lag1", "lag2"]], df["value"]
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        X, y = df_lags[["lag1", "lag2"]], df_lags["value"]
         
-        if len(X_test) == 0:
-            X_test = X_train.iloc[-1:].copy()
-            y_test = y_train.iloc[-1:].copy()
-        
-        # Scale data for SVR
-        scaler = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_test_s = scaler.transform(X_test)
+        # Use last 20% for testing, but ensure at least 1 sample
+        test_size = min(0.2, 1.0 / len(X))
+        if len(X) <= 5:
+            X_train, X_test, y_train, y_test = X, X, y, y
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
         
         results = {}
         
@@ -387,27 +400,23 @@ def compare_algorithms(
         results["LinearRegression"] = compute_metrics(y_test, lr.predict(X_test))
         
         # Random Forest
-        rf = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train, y_train)
+        rf = RandomForestRegressor(n_estimators=50, random_state=42).fit(X_train, y_train)
         results["RandomForest"] = compute_metrics(y_test, rf.predict(X_test))
         
         # Decision Tree
         dt = DecisionTreeRegressor(random_state=42).fit(X_train, y_train)
         results["DecisionTree"] = compute_metrics(y_test, dt.predict(X_test))
         
-        # SVR
-        svr = SVR().fit(X_train_s, y_train)
-        results["SVR"] = compute_metrics(y_test, svr.predict(X_test_s))
-        
         # XGBoost
-        xgb_model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        xgb_model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
         xgb_model.fit(X_train, y_train)
         results["XGBoost"] = compute_metrics(y_test, xgb_model.predict(X_test))
         
         # Generate forecast
-        last_row = df.iloc[-1]
+        last_row = df_lags.iloc[-1]
         pred_next = xgb_model.predict([[last_row["lag1"], last_row["lag2"]]])[0]
         forecast_val = float(pred_next)
-        next_date = df["timestamp"].iloc[-1] + timedelta(days=1)
+        next_date = df_lags["timestamp"].iloc[-1] + timedelta(days=1)
         
         # Generate recommendation
         recommendation = generate_recommendation(sensor, forecast_val)
@@ -416,18 +425,18 @@ def compare_algorithms(
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "algorithms": results,
-            "best_algorithm": min(results, key=lambda x: results[x]["rmse"]),
+            "best_algorithm": min(results.keys(), key=lambda x: results[x]["rmse"]),
             "forecast": {
                 "date": next_date.strftime("%Y-%m-%d"),
                 "predicted_value": forecast_val,
                 "recommendation": recommendation
             },
-            "data_points": len(df)
+            "data_points": len(df_lags)
         }
         
     except Exception as e:
         logger.error(f"Algorithm comparison error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
 @app.get("/recommendation/{sensor_id}")
 def get_recommendation(
@@ -447,37 +456,45 @@ def get_recommendation(
                 "status": "error"
             }
 
-        # Use recent data (last 10 days)
-        cutoff = df["timestamp"].max() - timedelta(days=10)
+        # Use recent data (last 30 days)
+        cutoff = datetime.now() - timedelta(days=30)
         df_recent = df[df["timestamp"] >= cutoff]
 
-        if len(df_recent) < 5:
+        if len(df_recent) < 3:
+            # Use current value for recommendation
+            current_value = df["value"].iloc[-1] if not df.empty else 0
+            recommendation = generate_recommendation(sensor, float(current_value))
+            
             return {
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
-                "recommendation": "Not enough recent data for forecasting",
-                "status": "insufficient_data"
+                "current_value": float(current_value),
+                "recommendation": recommendation,
+                "status": "current_value_only"
             }
 
         # Create lag features and train model
-        df_recent = make_lag_features(df_recent, lags=3)
-        if df_recent.empty:
+        df_lags = make_lag_features(df_recent, lags=2)
+        if df_lags.empty:
+            current_value = df_recent["value"].iloc[-1]
+            recommendation = generate_recommendation(sensor, float(current_value))
             return {
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
-                "recommendation": "Insufficient data for forecasting",
-                "status": "insufficient_data"
+                "current_value": float(current_value),
+                "recommendation": recommendation,
+                "status": "current_value_only"
             }
 
-        X = df_recent[["lag1", "lag2", "lag3"]].values
-        y = df_recent["value"].values
+        X = df_lags[["lag1", "lag2"]].values
+        y = df_lags["value"].values
 
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
         model.fit(X, y)
 
         # Generate forecast
         last_lags = X[-1].copy()
-        last_date = df_recent["timestamp"].iloc[-1]
+        last_date = df_lags["timestamp"].iloc[-1]
         pred = model.predict(last_lags.reshape(1, -1))[0]
         next_date = last_date + timedelta(days=1)
         forecast_val = float(pred)
@@ -491,8 +508,8 @@ def get_recommendation(
             "forecast_date": next_date.strftime("%Y-%m-%d"),
             "predicted_value": forecast_val,
             "recommendation": recommendation,
-            "current_value": float(df_recent["value"].iloc[-1]),
-            "data_points": len(df_recent),
+            "current_value": float(df_lags["value"].iloc[-1]),
+            "data_points": len(df_lags),
             "status": "success"
         }
         
@@ -516,30 +533,30 @@ async def xgboost_analysis(
         if not records:
             return {"error": "No data found for sensor", "status": "error"}
             
-        df = pd.DataFrame(records)
-        if sensor not in df.columns:
-            return {"error": f"Sensor type '{sensor}' not found in data", "status": "error"}
-            
-        df["value"] = pd.to_numeric(df[sensor], errors="coerce")
-        df = df.dropna(subset=["value"])
+        df = preprocess_dataframe(records, sensor)
+        if df.empty:
+            return {"error": "No valid data after preprocessing", "status": "error"}
         
-        if len(df) < 5:
+        if len(df) < 3:
             return {"error": "Insufficient clean data for training", "status": "error"}
 
         # Create lag features
-        df = make_lag_features(df, lags=3)
-        if len(df) < 2:
+        df_lags = make_lag_features(df, lags=2)
+        if len(df_lags) < 2:
             return {"error": "Insufficient data after feature engineering", "status": "error"}
 
-        X = df[["lag1", "lag2", "lag3"]]
-        y = df["value"]
+        X = df_lags[["lag1", "lag2"]]
+        y = df_lags["value"]
 
-        # Train-test split
-        X_train, X_test = X.iloc[:-1], X.iloc[-1:]
-        y_train, y_test = y.iloc[:-1], y.iloc[-1:]
+        # Use simple validation approach for small datasets
+        if len(X) <= 3:
+            X_train, X_test, y_train, y_test = X, X.iloc[-1:], y, y.iloc[-1:]
+        else:
+            X_train, X_test = X.iloc[:-1], X.iloc[-1:]
+            y_train, y_test = y.iloc[:-1], y.iloc[-1:]
 
         # XGBoost model
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=30, random_state=42)
         model.fit(X_train, y_train)
 
         # Predictions
@@ -547,10 +564,10 @@ async def xgboost_analysis(
         y_pred_train = model.predict(X_train)
 
         # Metrics
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = math.sqrt(mse)
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_train, y_pred_train)
+        mse = mean_squared_error(y_test, y_pred) if len(y_test) > 0 else 0
+        rmse = math.sqrt(mse) if mse > 0 else 0
+        mae = mean_absolute_error(y_test, y_pred) if len(y_test) > 0 else 0
+        r2 = r2_score(y_train, y_pred_train) if len(y_train) > 1 else 0
 
         # Generate recommendation
         recommendation = generate_recommendation(sensor, float(y_pred[0]))
@@ -559,7 +576,7 @@ async def xgboost_analysis(
             "status": "success",
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "latest_actual": float(y_test.iloc[0]) if len(y_test) > 0 else None,
+            "latest_actual": float(y_test.iloc[0]) if len(y_test) > 0 else float(y_train.iloc[-1]),
             "predicted_next": float(y_pred[0]),
             "recommendation": recommendation,
             "metrics": {
@@ -568,7 +585,7 @@ async def xgboost_analysis(
                 "MAE": round(mae, 4),
                 "R2": round(r2, 4)
             },
-            "history_points": len(df)
+            "history_points": len(df_lags)
         }
         
     except Exception as e:
@@ -579,33 +596,33 @@ async def xgboost_analysis(
 def predict_future(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
-    days: int = Query(7, description="Forecast horizon in days")
+    days: int = Query(3, description="Forecast horizon in days")
 ):
     """Generate multi-day forecasts"""
     try:
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
         
-        if df.empty or len(df) < 10:
-            raise HTTPException(status_code=404, detail="Not enough historical data")
+        if df.empty or len(df) < 3:
+            return {"error": "Not enough historical data", "sensor_id": sensor_id, "sensor_type": sensor}
         
         # Create features and train model
-        df_lags = make_lag_features(df, lags=3)
+        df_lags = make_lag_features(df, lags=2)
         if df_lags.empty:
-            raise HTTPException(status_code=404, detail="Insufficient data for forecasting")
+            return {"error": "Insufficient data for forecasting", "sensor_id": sensor_id, "sensor_type": sensor}
         
-        X = df_lags[["lag1", "lag2", "lag3"]].values
+        X = df_lags[["lag1", "lag2"]].values
         y = df_lags["value"].values
         
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
         model.fit(X, y)
         
         # Generate forecasts
         forecasts = []
         current_features = X[-1].copy()
-        current_date = df["timestamp"].iloc[-1]
+        current_date = df_lags["timestamp"].iloc[-1]
         
-        for i in range(min(days, 30)):  # Limit to 30 days max
+        for i in range(min(days, 7)):  # Limit to 7 days max
             next_pred = model.predict(current_features.reshape(1, -1))[0]
             current_date += timedelta(days=1)
             
@@ -615,141 +632,36 @@ def predict_future(
                 "recommendation": generate_recommendation(sensor, float(next_pred))
             })
             
-            # Update features for next prediction (simple approach)
+            # Update features for next prediction
             current_features = np.roll(current_features, -1)
             current_features[-1] = next_pred
         
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "forecast_horizon_days": days,
+            "forecast_horizon_days": len(forecasts),
             "forecasts": forecasts,
             "last_actual_value": float(y[-1]),
-            "last_actual_date": df["timestamp"].iloc[-1].strftime("%Y-%m-%d")
+            "last_actual_date": df_lags["timestamp"].iloc[-1].strftime("%Y-%m-%d")
         }
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
-@app.get("/explain/{sensor_id}")
-def explain_shap(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type")
-):
-    """Generate SHAP explanation plot"""
-    try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
-        
-        if df.empty or len(df) < 10:
-            return error_image("Not enough data for SHAP analysis")
-        
-        # Prepare features
-        df_lags = make_lag_features(df, lags=3)
-        if df_lags.empty:
-            return error_image("Insufficient data for feature engineering")
-        
-        X = df_lags[["lag1", "lag2", "lag3"]]
-        y = df_lags["value"]
-        
-        # Train model
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
-        model.fit(X, y)
-        
-        # SHAP explanation
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
-        
-        # Create plot
-        buf = io.BytesIO()
-        plt.figure(figsize=(10, 8))
-        shap.summary_plot(shap_values, X, feature_names=["Lag-1", "Lag-2", "Lag-3"], show=False)
-        plt.title(f"SHAP Feature Importance - {sensor}")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close()
-        buf.seek(0)
-        
-        return StreamingResponse(buf, media_type="image/png")
-        
-    except Exception as e:
-        logger.error(f"SHAP explanation error: {e}")
-        return error_image(f"SHAP analysis error: {str(e)}")
-
-@app.get("/shap_hour/{sensor_id}")
-def shap_hour_analysis(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type")
-):
-    """SHAP analysis by hour with detailed statistics"""
-    try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
-        
-        if df.empty or len(df) < 10:
-            return {"error": "Not enough data for analysis", "status": "error"}
-        
-        # Extract hour and prepare features
-        df["hour"] = df["timestamp"].dt.hour
-        df_lags = make_lag_features(df, lags=2)
-        
-        if df_lags.empty:
-            return {"error": "Insufficient data after feature engineering", "status": "error"}
-        
-        X = df_lags[["lag1", "lag2", "hour"]]
-        y = df_lags["value"]
-        
-        # Train model
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
-        model.fit(X, y)
-        
-        # SHAP analysis
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
-        
-        # Hourly analysis
-        hourly_shap = pd.DataFrame({
-            'hour': X['hour'],
-            'shap': shap_values[:, 2]  # SHAP values for hour feature
-        })
-        
-        stats = hourly_shap.groupby('hour')['shap'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Create plot
-        buf = io.BytesIO()
-        plt.figure(figsize=(10, 6))
-        plt.bar(stats['hour'], stats['mean'], yerr=stats['std'], capsize=5)
-        plt.xlabel('Hour of Day')
-        plt.ylabel('Mean SHAP Value')
-        plt.title(f'SHAP Values by Hour - {sensor}')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150)
-        plt.close()
-        
-        buf.seek(0)
-        plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        
-        return {
-            "status": "success",
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "stats": {
-                "mean_abs_shap": float(np.mean(np.abs(shap_values))),
-                "shap_range": [float(np.min(shap_values)), float(np.max(shap_values))],
-                "hourly_correlation": float(X['hour'].corr(y)),
-                "data_points": len(X)
-            },
-            "hourly_analysis": stats.to_dict('records'),
-            "plot_base64": plot_base64
-        }
-        
-    except Exception as e:
-        logger.error(f"SHAP hour analysis error: {e}")
-        return {"error": str(e), "status": "error"}
+# Simple test endpoint for basic functionality
+@app.get("/test/{sensor_id}")
+def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
+    """Test endpoint to verify basic functionality"""
+    return {
+        "message": "API is working",
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "timestamp": datetime.now().isoformat()
+    }
 
 # Run the application
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
