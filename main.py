@@ -23,7 +23,13 @@ import matplotlib.pyplot as plt
 import io
 import base64
 import logging
-
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,8 +82,30 @@ try:
         logger.info("Firebase initialized successfully")
 except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
- 
+
+# Add explicit CORS headers to key endpoints as backup
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+# Add OPTIONS handler for preflight requests
+@app.options("/{path:path}")
+async def preflight_handler():
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+    
 # Utility functions
+    # Utility functions
 def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase"""
     try:
@@ -139,6 +167,7 @@ def compute_metrics(y_true, y_pred):
         r2 = 0
     return {"mse": float(mse), "rmse": float(rmse), "mae": float(mae), "r2_score": float(r2)}
 
+
 def compute_classification_metrics(y_true, y_pred, classes):
     """Compute comprehensive classification metrics"""
     accuracy = accuracy_score(y_true, y_pred)
@@ -159,7 +188,59 @@ def compute_classification_metrics(y_true, y_pred, classes):
         "confusion_matrix": conf_matrix.tolist(),
         "classes": classes
     }
-
+def create_classification_labels(df, sensor_type):
+    """Create classification labels based on sensor thresholds"""
+    if df.empty:
+        return pd.DataFrame()
+    
+    df_class = df.copy()
+    
+    # Define thresholds for different sensor types
+    thresholds = {
+        'co2': {'low': 400, 'medium': 800, 'high': 1000},
+        'methane': {'low': 200, 'medium': 500, 'high': 1000},
+        'ammonia': {'low': 10, 'medium': 25, 'high': 50},
+        'temperature': {'low': 15, 'medium_low': 20, 'medium_high': 30, 'high': 35},
+        'humidity': {'low': 30, 'medium_low': 40, 'medium_high': 60, 'high': 70}
+    }
+    
+    sensor_type_lower = sensor_type.lower()
+    
+    if sensor_type_lower in thresholds:
+        thresholds_config = thresholds[sensor_type_lower]
+        
+        if sensor_type_lower in ['co2', 'methane', 'ammonia']:
+            # For gas sensors: low, medium, high
+            conditions = [
+                df_class['value'] <= thresholds_config['low'],
+                (df_class['value'] > thresholds_config['low']) & (df_class['value'] <= thresholds_config['medium']),
+                (df_class['value'] > thresholds_config['medium']) & (df_class['value'] <= thresholds_config['high']),
+                df_class['value'] > thresholds_config['high']
+            ]
+            choices = ['very_low', 'low', 'medium', 'high']
+            
+        else:  # temperature and humidity
+            # For environmental sensors: very_low, low, normal, high, very_high
+            conditions = [
+                df_class['value'] < thresholds_config['low'],
+                (df_class['value'] >= thresholds_config['low']) & (df_class['value'] < thresholds_config.get('medium_low', 25)),
+                (df_class['value'] >= thresholds_config.get('medium_low', 25)) & (df_class['value'] <= thresholds_config.get('medium_high', 30)),
+                (df_class['value'] > thresholds_config.get('medium_high', 30)) & (df_class['value'] <= thresholds_config['high']),
+                df_class['value'] > thresholds_config['high']
+            ]
+            choices = ['very_low', 'low', 'normal', 'high', 'very_high']
+        
+        df_class['class'] = np.select(conditions, choices, default='unknown')
+        
+    else:
+        # Default binary classification based on median
+        median_val = df_class['value'].median()
+        df_class['class'] = np.where(df_class['value'] > median_val, 'above_median', 'below_median')
+    
+    # Remove any rows with 'unknown' class
+    df_class = df_class[df_class['class'] != 'unknown']
+    
+    return df_class
 def error_image(msg: str):
     """Generate error image with message"""
     buf = io.BytesIO()
@@ -226,12 +307,12 @@ def generate_recommendation(sensor_type: str, value: float):
     
     else:
         return "ℹ️ No specific recommendations available for this sensor type."
-
+        
 # Endpoints
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-    <html>
+     <html>
     <head>
         <title>Gas Monitoring API</title>
         <style>
@@ -245,19 +326,20 @@ def home():
         </style>
     </head>
     <body>
-        <h1> Gas Monitoring API</h1>
+        <h1>Gas Monitoring API</h1>
         <p>Welcome to the Gas Monitoring Backend. This service provides endpoints for forecasting, SHAP explanations, and analytics for your sensors.</p>
+        <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
 
-        <h2> API Documentation</h2>
+        <h2>API Documentation</h2>
         <ul>
             <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
             <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
         </ul>
 
-        <h2> Available Endpoints</h2>
+        <h2>Available Endpoints</h2>
         
         <div class="endpoint">
-            <h3> Data Endpoints</h3>
+            <h3>Data Endpoints</h3>
             <ul>
                 <li><code>GET /health</code> - API status check</li>
                 <li><code>GET /dataframe/{sensor_id}?sensor=type</code> - Raw sensor data</li>
@@ -266,7 +348,7 @@ def home():
         </div>
 
         <div class="endpoint">
-            <h3> AI/ML Endpoints</h3>
+            <h3>AI/ML Endpoints</h3>
             <ul>
                 <li><code>GET /algorithm/{sensor_id}?sensor=type</code> - Multi-algorithm comparison</li>
                 <li><code>GET /xgboost_compute/{sensor_id}?sensor=type</code> - XGBoost analysis</li>
@@ -276,19 +358,18 @@ def home():
         </div>
 
         <div class="endpoint">
-            <h3> Forecasting Endpoints</h3>
+            <h3>Forecasting Endpoints</h3>
             <ul>
                 <li><code>GET /predict/{sensor_id}?sensor=type</code> - Future predictions</li>
                 <li><code>GET /recommendation/{sensor_id}?sensor=type</code> - OSH recommendations</li>
             </ul>
         </div>
 
-        <h2> Example React.js Integration</h2>
-        <pre><code>useEffect(() => {
-  fetch(`/api/predict/${sensorID}?sensor=${sensorType}`)
-    .then(res => res.json())
-    .then(data => setForecast(data.forecasts || []));
-}, [sensorID, sensorType]);</code></pre>
+        <h2>CORS Test</h2>
+        <pre><code>// Test from your frontend:
+fetch('https://gasmonitoring-backend-1.onrender.com/health')
+  .then(response => response.json())
+  .then(data => console.log(data));</code></pre>
 
         <hr />
         <p style="font-size: 0.9em; color: #666;">
@@ -300,8 +381,14 @@ def home():
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat(), "service": "Gas Monitoring API"}
+    """Health check endpoint"""    
+    return {
+        "status": "ok", 
+        "timestamp": datetime.now().isoformat(), 
+        "service": "Gas Monitoring API",
+        "cors_enabled": True,
+        "allowed_origins": "all (*)"
+    }
 
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)")):
