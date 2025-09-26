@@ -105,7 +105,7 @@ def error_image(message: str):
             "Access-Control-Allow-Headers": "*",
         },
     )
-    def fetch_sensor_history(sensor_id: str):
+def fetch_sensor_history(sensor_id: str):
     """Fetch sensor history from Firebase and return as list of dicts"""
     ref = db.reference(f"history/{sensor_id}")
     snapshot = ref.get()
