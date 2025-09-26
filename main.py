@@ -180,23 +180,30 @@ def train_xgboost(df: pd.DataFrame, steps: int = 7):
     return predictions
 
 def fetch_history(sensor_id: str, sensor_type: str, days: int = 3):
-    ref = db.reference(f"history")
+    """Fetch history data for a specific sensor - FIXED VERSION"""
+    ref = db.reference(f"history/{sensor_id}")
     snapshot = ref.get()
     if not snapshot:
         return []
 
-    now = datetime.now()
-    start_date = (now - timedelta(days=days)).strftime("%Y%m%d")
-
+    # Calculate cutoff date
+    cutoff_date = datetime.now() - timedelta(days=days)
+    
     data_points = []
-    for ts, record in snapshot.items():
-        date_key = ts.split("_")[0]  # format: yyyyMMdd_HHmmss
-        if date_key >= start_date:
-            if record.get("sensor_id") == sensor_id and record.get("sensor_type") == sensor_type:
-                data_points.append({
-                    "timestamp": ts,
-                    "value": record.get("value")
-                })
+    for record_id, record in snapshot.items():
+        if "timestamp" in record and sensor_type in record:
+            try:
+                record_timestamp = pd.to_datetime(record["timestamp"])
+                # Check if record is within the date range
+                if record_timestamp >= cutoff_date:
+                    data_points.append({
+                        "timestamp": record["timestamp"],
+                        "value": record[sensor_type]
+                    })
+            except (ValueError, KeyError):
+                continue
+    
+    # Sort by timestamp
     data_points.sort(key=lambda x: x["timestamp"])
     return data_points
 
@@ -296,64 +303,86 @@ def explain(sensor_id: str, sensor: str = Query(...)):
 @app.get("/plot/{sensor_id}")
 def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")):
     try:
-        history = fetch_history(sensor_id, sensor, days=3)
-        if not history or len(history) < 20:
-            return error_image("Not enough data for plot")
+        # Use the same data fetching method as other endpoints
+        records = fetch_sensor_history(sensor_id)
+        if not records:
+            return error_image("No data found for this sensor")
+        
+        # Preprocess the data
+        df = preprocess_dataframe(records, sensor)
+        
+        if df.empty or len(df) < 10:
+            return error_image(f"Not enough data for plot. Found {len(df)} records.")
 
-        df = pd.DataFrame(history)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y%m%d_%H%M%S")
-        df["date"] = df["timestamp"].dt.date
-        df["hour"] = df["timestamp"].dt.hour
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna()
+        # Filter last 3 days of data
+        cutoff = datetime.now() - timedelta(days=3)
+        df_recent = df[df["timestamp"] >= cutoff]
+        
+        if df_recent.empty or len(df_recent) < 5:
+            return error_image("Not enough recent data (last 3 days) for plotting")
 
+        # Create hourly features
+        df_recent["hour"] = df_recent["timestamp"].dt.hour
+        df_recent["date"] = df_recent["timestamp"].dt.date
+
+        # Aggregate by hour and date
         agg = (
-            df.groupby(["date", "hour"])["value"]
+            df_recent.groupby(["date", "hour"])["value"]
             .mean()
             .reset_index()
             .sort_values(["date", "hour"])
         )
 
-        if agg.empty or len(agg) < 10:
-            return error_image("Not enough consolidated data")
+        if agg.empty or len(agg) < 5:
+            return error_image("Not enough consolidated hourly data")
+
+        # Prepare features for modeling
+        X = agg[["hour"]]
+        y_agg = agg["value"]
 
         # Train simple model
-        X = agg[["hour"]]
-        y = agg["value"]
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
-        model.fit(X, y)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
+        model.fit(X, y_agg)
 
+        # Calculate SHAP values
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X)
 
         buf = io.BytesIO()
+        
         if chart == "scatter":
-            plt.figure(figsize=(9, 6))
+            plt.figure(figsize=(10, 6))
             scatter = plt.scatter(
-                shap_values[:, 0],
+                shap_values,
                 agg["hour"],
                 c=pd.factorize(agg["date"])[0],
                 cmap="tab10",
-                alpha=0.7
+                alpha=0.7,
+                s=60
             )
-            plt.xlabel("SHAP Value (Impact)")
+            plt.xlabel("SHAP Value (Impact on Prediction)")
             plt.ylabel("Hour of Day")
-            plt.title(f"SHAP Scatter (3-day hourly) - {sensor}")
+            plt.title(f"SHAP Scatter Plot - {sensor} (Last 3 Days)")
+            
+            # Create colorbar with date labels
             cbar = plt.colorbar(scatter, ticks=range(len(agg["date"].unique())))
-            cbar.ax.set_yticklabels([str(d) for d in agg["date"].unique()])
-            plt.axvline(x=0, color="black", linestyle="--")
+            cbar.ax.set_yticklabels([str(d) for d in sorted(agg["date"].unique())])
+            cbar.set_label('Date')
+            
+            plt.axvline(x=0, color="black", linestyle="--", alpha=0.5)
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            plt.savefig(buf, format="png", bbox_inches="tight")
-            plt.close()
-        else:
-            plt.figure(figsize=(9, 6))
-            shap.summary_plot(shap_values, X, feature_names=["hour"], show=False)
-            plt.title(f"SHAP Summary (3-day hourly) - {sensor}")
+            
+        else:  # summary plot
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(shap_values, X, feature_names=["Hour"], show=False)
+            plt.title(f"SHAP Summary - {sensor} (Last 3 Days)")
             plt.tight_layout()
-            plt.savefig(buf, format="png", bbox_inches="tight")
-            plt.close()
 
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
         buf.seek(0)
+
         return StreamingResponse(
             buf,
             media_type="image/png",
@@ -365,7 +394,7 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
         )
 
     except Exception as e:
-        return error_image(str(e))
+        return error_image(f"Error generating plot: {str(e)}")
 
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(sensor_id: str, sensor: str = Query(...)):
