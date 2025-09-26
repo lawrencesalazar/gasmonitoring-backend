@@ -379,56 +379,59 @@ def plot(sensor_id: str, sensor: str = Query(...), chart: str = Query("scatter")
 
     except Exception as e:
         return error_image(str(e))
-        
+  # ---------------------------
+# SHAP_HOUR endpoint (SHAP per hour chart)
+# ---------------------------
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(sensor_id: str, sensor: str = Query(...)):
-    """Detailed SHAP stats for hour feature"""
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    if df.empty or len(df) < 50:
-        return {"error": "Not enough data"}
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
 
-    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    X = df[["hour", "value"]]
-    y = df["value"]
+        if df.empty or len(df) < 50:
+            return error_image("Not enough data for SHAP Hour")
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+        X = df[["hour", "value"]]
+        y = df["value"]
 
-    model = xgb.XGBRegressor(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
-    model.fit(X_train, y_train)
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100)
+        model.fit(X, y)
 
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
 
-    hour_idx = list(X.columns).index("hour")
-    hour_values = X_test["hour"].values
-    hour_shap = shap_values[:, hour_idx]
+        buf = io.BytesIO()
+        plt.figure(figsize=(9, 6))
+        plt.scatter(
+            X["hour"],
+            shap_values[:, 1],  # impact of "value"
+            alpha=0.7,
+            c=X["hour"],
+            cmap="viridis"
+        )
+        plt.colorbar(label="Hour of Day")
+        plt.xlabel("Hour")
+        plt.ylabel("SHAP Value (Impact of Value)")
+        plt.title(f"SHAP per Hour - {sensor}")
+        plt.axhline(y=0, color="black", linestyle="--")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
 
-    stats = {
-        "mean_abs_shap": float(np.abs(hour_shap).mean()),
-        "impact_range": [float(hour_shap.min()), float(hour_shap.max())],
-        "correlation": float(np.corrcoef(hour_values, hour_shap)[0, 1]),
-    }
+        return StreamingResponse(
+            buf,
+            media_type="image/png",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
 
-    plt.figure(figsize=(10, 6))
-    plt.scatter(hour_values, hour_shap, alpha=0.6, s=30, edgecolors="k")
-    plt.xlabel("Hour of Day")
-    plt.ylabel("{sensor} value (Hour)")
-    plt.axhline(y=0, color="black", linestyle="--")
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    return {
-        "sensor_id": sensor_id,
-        "sensor_type": sensor,
-        "stats": stats,
-        "shap_plot": f"data:image/png;base64,{img_b64}"
-    }
+    except Exception as e:
+        return error_image(str(e))
 
 @app.get("/recommendation/{sensor_id}")
 def recommendation(sensor_id: str, sensor: str = Query(...)):
