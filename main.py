@@ -299,24 +299,22 @@ def home():
 def health():
     """Health check endpoint"""
     return {"status": "ok", "timestamp": datetime.now().isoformat(), "service": "Gas Monitoring API"}
-    
+
 @app.get("/dataframe/{sensor_id}")
-async def get_dataframe(
-    sensor_id: str, 
-    sensor: str,
-    range: str = None,
-    start_date: str = None,
-    end_date: str = None
-):
-    if start_date and end_date:
-        # Use custom date range
-        start_date = datetime.fromisoformat(start_date)
-        end_date = datetime.fromisoformat(end_date)
-    else:
-        # Use preset range
-        if range == "1month":
-            start_date = datetime.now() - timedelta(days=30)
-            end_date = datetime.now()
+def get_dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)")):
+    """Get raw sensor data as JSON"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "records": df.to_dict(orient="records"),
+            "count": len(df)
+        }
+    except Exception as e:
+        logger.error(f"Dataframe error: {e}")
+        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
