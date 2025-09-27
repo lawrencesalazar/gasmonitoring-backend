@@ -838,7 +838,8 @@ HYPERPARAM_GRIDS = {
     }
 }
 
-# NEW PERFORMANCE ENDPOINT@app.get("/performance/{sensor_id}")
+# NEW PERFORMANCE ENDPOINT
+@app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
