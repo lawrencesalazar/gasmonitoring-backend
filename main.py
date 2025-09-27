@@ -188,7 +188,7 @@ def compute_classification_metrics(y_true, y_pred, classes):
         "confusion_matrix": conf_matrix.tolist(),
         "classes": classes
     }
-    def create_classification_labels(df, sensor_type):
+def create_classification_labels(df, sensor_type):
     """Create classification labels based on sensor thresholds with better class distribution"""
     if df.empty or len(df) < 5:  # Need at least 5 samples for meaningful classification
         return pd.DataFrame()
@@ -1060,13 +1060,12 @@ def performance_metrics(
             "sensor_type": sensor,
             "status": "error"
         }
-        
 @app.get("/confusion_matrix/{sensor_id}")
 def confusion_matrix_chart(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
     test_size: float = Query(0.2, description="Test size"),
-    cv_folds: int = Query(5, description="CV folds")
+    cv_folds: int = Query(3, description="CV folds")  # Reduced default from 5 to 3
 ):
     """
     Generate confusion matrix chart for best performing algorithm
@@ -1074,52 +1073,89 @@ def confusion_matrix_chart(
     try:
         # Reuse performance endpoint logic
         perf = performance_metrics(sensor_id, sensor, test_size, cv_folds)
+        
+        # Check if performance endpoint returned an error
         if "error" in perf:
-            return error_image(perf["error"])
-
-        best_algo = perf.get("best_algorithm")
-        if not best_algo or best_algo == "No successful models":
-            return error_image("No valid model for confusion matrix")
-
+            error_msg = perf["error"]
+            return error_image(f"Performance metrics error: {error_msg}")
+        
+        # Check if we have successful algorithms
+        if "algorithms" not in perf:
+            return error_image("No algorithms data available")
+        
+        # Find the best algorithm that actually has metrics
+        best_algo = None
+        for algo_name, algo_data in perf["algorithms"].items():
+            if "metrics" in algo_data and "error" not in algo_data:
+                best_algo = algo_name
+                break
+        
+        if not best_algo:
+            return error_image("No valid model with metrics available for confusion matrix")
+        
         metrics = perf["algorithms"][best_algo]["metrics"]
+        
+        # Check if we have confusion matrix data
+        if "confusion_matrix" not in metrics or "classes" not in metrics:
+            return error_image("No confusion matrix data available")
+        
         conf_matrix = np.array(metrics["confusion_matrix"])
         classes = metrics["classes"]
-
+        
+        # Check if we have at least 2 classes
+        if len(classes) < 2:
+            return error_image(f"Need at least 2 classes for confusion matrix. Found: {classes}")
+        
+        # Check if confusion matrix is valid
+        if conf_matrix.size == 0 or conf_matrix.shape[0] != len(classes):
+            return error_image("Invalid confusion matrix dimensions")
+        
         # Plot confusion matrix
         buf = io.BytesIO()
-        plt.figure(figsize=(6, 5))
-        plt.imshow(conf_matrix, interpolation="nearest", cmap=plt.cm.Blues)
-        plt.title(f"Confusion Matrix - {best_algo}")
+        plt.figure(figsize=(8, 6))
+        
+        # Create the confusion matrix plot
+        plt.imshow(conf_matrix, interpolation="nearest", cmap=plt.cm.Blues, alpha=0.7)
+        plt.title(f"Confusion Matrix - {best_algo}\n(Sensor: {sensor})", fontsize=14, pad=20)
         plt.colorbar()
 
         tick_marks = np.arange(len(classes))
-        plt.xticks(tick_marks, classes, rotation=45)
+        plt.xticks(tick_marks, classes, rotation=45, ha='right')
         plt.yticks(tick_marks, classes)
 
-        # Normalize
-        cm_normalized = conf_matrix.astype("float") / conf_matrix.sum(axis=1)[:, np.newaxis]
+        # Normalize and add text annotations
+        cm_normalized = conf_matrix.astype("float") / np.maximum(conf_matrix.sum(axis=1)[:, np.newaxis], 1)  # Avoid division by zero
         thresh = conf_matrix.max() / 2.
+        
         for i in range(conf_matrix.shape[0]):
             for j in range(conf_matrix.shape[1]):
                 plt.text(
                     j, i,
-                    f"{conf_matrix[i, j]} ({cm_normalized[i, j]:.2f})",
+                    f"{conf_matrix[i, j]}\n({cm_normalized[i, j]:.1%})",
                     horizontalalignment="center",
-                    color="white" if conf_matrix[i, j] > thresh else "black"
+                    verticalalignment="center",
+                    color="white" if conf_matrix[i, j] > thresh else "black",
+                    fontsize=10
                 )
 
-        plt.ylabel("True label")
-        plt.xlabel("Predicted label")
+        plt.ylabel("True Label", fontsize=12)
+        plt.xlabel("Predicted Label", fontsize=12)
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=100)
+        
+        # Add some additional info
+        accuracy = metrics.get("accuracy", 0)
+        plt.figtext(0.5, 0.01, f"Accuracy: {accuracy:.2%}", ha="center", fontsize=10, 
+                   bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+        
+        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
         plt.close()
         buf.seek(0)
         return StreamingResponse(buf, media_type="image/png")
 
     except Exception as e:
         logger.error(f"Confusion matrix error: {e}")
-        return error_image(str(e))
-
+        return error_image(f"Error generating confusion matrix: {str(e)}")
+        
 # Run the application
 if __name__ == "__main__":
     import uvicorn
