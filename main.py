@@ -2,6 +2,7 @@
 import json
 import os
 import math
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -18,7 +19,6 @@ from sklearn.svm import SVR
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import io
 import base64
@@ -279,7 +279,30 @@ def error_image(msg: str):
     plt.close()
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
-
+    
+def filter_by_date_range(df, date_range):
+    """Filter dataframe by date range"""
+    if df.empty or "timestamp" not in df.columns:
+        return df
+    
+    now = datetime.now()
+    
+    date_filters = {
+        "1week": now - timedelta(weeks=1),
+        "1month": now - timedelta(days=30),
+        "3months": now - timedelta(days=90),
+        "6months": now - timedelta(days=180),
+        "1year": now - timedelta(days=365),
+        "all": datetime.min  # No filter
+    }
+    
+    cutoff_date = date_filters.get(date_range, date_filters["1month"])
+    
+    if cutoff_date != datetime.min:
+        return df[df["timestamp"] >= cutoff_date]
+    
+    return df
+    
 def generate_recommendation(sensor_type: str, value: float):
     """Generate OSH recommendations based on sensor values"""
     sensor_type = sensor_type.lower()
@@ -421,30 +444,39 @@ def health():
             "max_age": "3600"
         }
     }
-
 @app.get("/dataframe/{sensor_id}")
-def get_dataframe(sensor_id: str, sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)")):
-    """Get raw sensor data as JSON"""
+def get_dataframe(
+    sensor_id: str, 
+    sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)"),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """Get raw sensor data as JSON with date range filtering"""
     try:
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
+        
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
+        
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "records": df.to_dict(orient="records"),
-            "count": len(df)
+            "date_range": range,
+            "records": df_filtered.to_dict(orient="records"),
+            "count": len(df_filtered),
+            "date_range_applied": True
         }
     except Exception as e:
         logger.error(f"Dataframe error: {e}")
         return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
-
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
     sensor_id: str, 
     sensor: str = Query(..., description="Sensor type"),
-    chart: str = Query("scatter", description="Chart type: scatter or summary")
+    chart: str = Query("scatter", description="Chart type: scatter or summary"),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Generate visualization plots for sensor data"""
+    """Generate visualization plots for sensor data with date range"""
     try:
         records = fetch_sensor_history(sensor_id)
         if not records:
@@ -454,29 +486,34 @@ def plot_sensor_data(
         if df.empty or len(df) < 5:
             return error_image(f"Not enough data for plot. Found {len(df)} records.")
         
-        # Use recent data (last 7 days)
-        cutoff = datetime.now() - timedelta(days=7)
-        df_recent = df[df["timestamp"] >= cutoff]
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
         
-        if df_recent.empty or len(df_recent) < 3:
-            return error_image("Not enough recent data for plotting")
+        if df_filtered.empty or len(df_filtered) < 3:
+            return error_image(f"Not enough data after applying {range} filter. Found {len(df_filtered)} records.")
         
         # Create simple time series plot
         buf = io.BytesIO()
         plt.figure(figsize=(10, 6))
         
         if chart == "scatter":
-            plt.scatter(df_recent["timestamp"], df_recent["value"], alpha=0.7)
+            plt.scatter(df_filtered["timestamp"], df_filtered["value"], alpha=0.7)
             plt.xlabel("Timestamp")
             plt.ylabel("Sensor Value")
-            plt.title(f"Scatter Plot - {sensor} (Sensor {sensor_id})")
-        else:
-            plt.plot(df_recent["timestamp"], df_recent["value"], marker='o')
+            plt.title(f"Scatter Plot - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        elif chart == "line":
+            plt.plot(df_filtered["timestamp"], df_filtered["value"], marker='o', linewidth=2, markersize=4)
             plt.xlabel("Timestamp")
             plt.ylabel("Sensor Value")
-            plt.title(f"Time Series - {sensor} (Sensor {sensor_id})")
+            plt.title(f"Line Plot - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        else:  # summary plot
+            plt.plot(df_filtered["timestamp"], df_filtered["value"], marker='o')
+            plt.xlabel("Timestamp")
+            plt.ylabel("Sensor Value")
+            plt.title(f"Time Series - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
         
         plt.xticks(rotation=45)
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
         plt.close()
@@ -491,9 +528,10 @@ def plot_sensor_data(
 @app.get("/algorithm/{sensor_id}")
 def compare_algorithms(
     sensor_id: str, 
-    sensor: str = Query(..., description="Sensor type")
+    sensor: str = Query(..., description="Sensor type"),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Compare multiple ML algorithms and provide forecasts"""
+    """Compare multiple ML algorithms with date range filtering"""
     try:
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
@@ -501,8 +539,14 @@ def compare_algorithms(
         if df.empty or len(df) < 5:
             return {"error": "Not enough data for analysis", "sensor_id": sensor_id, "sensor_type": sensor}
         
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
+        
+        if df_filtered.empty or len(df_filtered) < 5:
+            return {"error": f"Not enough data after applying {range} filter", "sensor_id": sensor_id, "sensor_type": sensor}
+        
         # Create lag features
-        df_lags = make_lag_features(df, lags=2)
+        df_lags = make_lag_features(df_filtered, lags=2)
         if df_lags.empty:
             return {"error": "Insufficient data after feature engineering", "sensor_id": sensor_id, "sensor_type": sensor}
         
@@ -546,6 +590,7 @@ def compare_algorithms(
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
+            "date_range": range,
             "algorithms": results,
             "best_algorithm": min(results.keys(), key=lambda x: results[x]["rmse"]),
             "forecast": {
@@ -553,7 +598,8 @@ def compare_algorithms(
                 "predicted_value": forecast_val,
                 "recommendation": recommendation
             },
-            "data_points": len(df_lags)
+            "data_points": len(df_lags),
+            "date_range_applied": True
         }
         
     except Exception as e:
@@ -783,300 +829,222 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
     }
 
 # Explain endpoint
+
 @app.get("/explain/{sensor_id}")
-def explain(sensor_id: str, sensor: str = Query(...)):
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    if df.empty or len(df) < 10:
-        return JSONResponse({"error": "Not enough data"})
-    cutoff = datetime.now() - timedelta(days=7)
-    df_recent = df[df["timestamp"] >= cutoff]
-    if df_recent.empty:
-        return JSONResponse({"error": "No recent data"})
-    df_recent["hour"] = df_recent["timestamp"].dt.hour
-    agg = df_recent.groupby("hour")["value"].mean().reset_index()
-    X = agg[["hour"]]
-    y = agg["value"]
-    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
-    model.fit(X, y)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X)
-    return JSONResponse({
-        "sensor_id": sensor_id,
-        "sensor_type": sensor,
-        "shap_values": shap_values.tolist(),
-        "features": X.to_dict(orient="records")
-    })
-
-# SHAP Hour endpoint
-@app.get("/shap_hour/{sensor_id}")
-def shap_hour(sensor_id: str, sensor: str = Query(...)):
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
-    if df.empty:
-        return JSONResponse({"error": "No data"})
-    df["hour"] = df["timestamp"].dt.hour
-    agg = df.groupby("hour")["value"].mean().reset_index()
-    return JSONResponse(agg.to_dict(orient="records"))
-    
-    # Hyperparameter grids for different classifiers
-HYPERPARAM_GRIDS = {
-    'xgboost': {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'subsample': [0.8, 0.9, 1.0]
-    },
-    'random_forest': {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 5, 7, None],
-        'min_samples_split': [2, 5, 10],
-        'min_samples_leaf': [1, 2, 4],
-        'bootstrap': [True, False]
-    },
-    'svc': {
-        'C': [0.1, 1, 10, 100],
-        'kernel': ['linear', 'rbf', 'poly'],
-        'gamma': ['scale', 'auto', 0.1, 1],
-        'degree': [2, 3, 4]
-    },
-    'knn': {
-        'n_neighbors': [3, 5, 7, 9, 11],
-        'weights': ['uniform', 'distance'],
-        'algorithm': ['auto', 'ball_tree', 'kd_tree'],
-        'leaf_size': [20, 30, 40]
-    },
-    'logistic_regression': {
-        'C': [0.1, 1, 10, 100],
-        'penalty': ['l1', 'l2', 'elasticnet'],
-        'solver': ['liblinear', 'saga'],
-        'max_iter': [100, 200, 500]
-    }
-}
-
-# NEW PERFORMANCE ENDPOINT
-@app.get("/performance/{sensor_id}")
-def performance_metrics(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type"),
-    test_size: float = Query(0.2, description="Test set size ratio"),
-    cv_folds: int = Query(3, description="Cross-validation folds")  # Reduced from 5 to 3
+def explain(
+    sensor_id: str, 
+    sensor: str = Query(...),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Get performance metrics for different classifiers with hyperparameter tuning"""
+    """SHAP explanation with date range filtering"""
     try:
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
         
         if df.empty or len(df) < 10:
-            return {
-                "error": f"Not enough data for performance analysis. Need at least 10 samples, got {len(df)}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+            return JSONResponse({"error": "Not enough data"})
         
-        # Create classification dataset
-        df_class = create_classification_labels(df, sensor)
-        if df_class.empty:
-            return {
-                "error": "Failed to create classification labels - insufficient class diversity", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
         
-        # Check class distribution
-        class_distribution = df_class['class'].value_counts()
-        if len(class_distribution) < 2:
-            return {
-                "error": f"Need at least 2 classes for classification. Found only: {class_distribution.to_dict()}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+        if df_filtered.empty or len(df_filtered) < 5:
+            return JSONResponse({"error": f"Not enough data after applying {range} filter"})
         
-        # Ensure each class has at least 2 samples
-        min_samples_per_class = 2
-        valid_classes = class_distribution[class_distribution >= min_samples_per_class].index
-        if len(valid_classes) < 2:
-            return {
-                "error": f"Need at least 2 classes with minimum {min_samples_per_class} samples each. Current distribution: {class_distribution.to_dict()}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+        # Use recent data based on range
+        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
+        agg = df_filtered.groupby("hour")["value"].mean().reset_index()
         
-        df_class = df_class[df_class['class'].isin(valid_classes)]
+        if len(agg) < 3:
+            return JSONResponse({"error": "Insufficient hourly data after filtering"})
         
-        # Create features (using lag features for time series)
-        df_lags = make_lag_features(df_class, lags=2)
-        if df_lags.empty or len(df_lags) < 5:
-            return {
-                "error": "Insufficient data after feature engineering", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+        X = agg[["hour"]]
+        y = agg["value"]
         
-        # Prepare features and target
-        feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
-        X = df_lags[feature_cols]
-        y = df_lags['class']
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        model.fit(X, y)
         
-        # Encode labels
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-        classes = le.classes_.tolist()
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
         
-        if len(classes) < 2:
-            return {
-                "error": f"Need at least 2 classes for classification. Found: {classes}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
+        # Generate SHAP summary plot
+        buf = io.BytesIO()
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values, X, show=False)
+        plt.title(f"SHAP Summary - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
         
-        # Adjust test_size and cv_folds based on data size
-        n_samples = len(X)
-        actual_test_size = min(test_size, 0.3)  # Cap at 30%
-        actual_cv_folds = min(cv_folds, max(2, n_samples // 3))  # Adaptive CV folds
-        
-        # Split data with stratification
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
-        )
-        
-        # Check if we have enough training data
-        if len(X_train) < 5:
-            return {
-                "error": f"Insufficient training data: {len(X_train)} samples. Need at least 5.", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor
-            }
-        
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        results = {}
-        
-        # Simplified hyperparameter grids for small datasets
-        simple_hyperparam_grids = {
-            'xgboost': {
-                'n_estimators': [30, 50],
-                'max_depth': [3, 5],
-                'learning_rate': [0.1, 0.2]
-            },
-            'random_forest': {
-                'n_estimators': [30, 50],
-                'max_depth': [3, 5]
-            },
-            'svc': {
-                'C': [0.1, 1],
-                'kernel': ['linear', 'rbf']
-            },
-            'knn': {
-                'n_neighbors': [3, 5]
-            },
-            'logistic_regression': {
-                'C': [0.1, 1],
-                'max_iter': [100, 200]
-            }
+        # Return both image and data
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": range,
+            "shap_values": shap_values.tolist(),
+            "features": X.to_dict(orient="records"),
+            "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
         }
         
-        # 1. XGBoost Classifier with simplified tuning
-        try:
-            xgb_clf = xgb.XGBClassifier(random_state=42, eval_metric='logloss')
-            grid_search_xgb = GridSearchCV(
-                xgb_clf, simple_hyperparam_grids['xgboost'], 
-                cv=min(actual_cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=1
-            )
-            grid_search_xgb.fit(X_train_scaled, y_train)
-            best_xgb = grid_search_xgb.best_estimator_
-            y_pred_xgb = best_xgb.predict(X_test_scaled)
-            
-            results['XGBoost'] = {
-                'best_params': grid_search_xgb.best_params_,
-                'metrics': compute_classification_metrics(y_test, y_pred_xgb, classes),
-                'cv_score': float(grid_search_xgb.best_score_)
-            }
-        except Exception as e:
-            logger.error(f"XGBoost tuning failed: {e}")
-            results['XGBoost'] = {'error': str(e)}
+    except Exception as e:
+        logger.error(f"SHAP explanation error: {e}")
+        return JSONResponse({"error": str(e)})
         
-        # 2. Random Forest Classifier with simplified tuning
-        try:
-            rf_clf = RandomForestClassifier(random_state=42)
-            grid_search_rf = GridSearchCV(
-                rf_clf, simple_hyperparam_grids['random_forest'],
-                cv=min(actual_cv_folds, len(X_train)), scoring='f1_weighted', n_jobs=1
-            )
-            grid_search_rf.fit(X_train, y_train)
-            best_rf = grid_search_rf.best_estimator_
-            y_pred_rf = best_rf.predict(X_test)
-            
-            results['RandomForest'] = {
-                'best_params': grid_search_rf.best_params_,
-                'metrics': compute_classification_metrics(y_test, y_pred_rf, classes),
-                'cv_score': float(grid_search_rf.best_score_)
-            }
-        except Exception as e:
-            logger.error(f"Random Forest tuning failed: {e}")
-            results['RandomForest'] = {'error': str(e)}
+# SHAP Hour endpoint@app.get("/shap_hour/{sensor_id}")
+def shap_hour(
+    sensor_id: str, 
+    sensor: str = Query(...),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """SHAP hourly analysis with date range filtering"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
         
-        # 3. Logistic Regression (most stable for small datasets)
-        try:
-            lr_clf = LogisticRegression(random_state=42, max_iter=1000)
-            grid_search_lr = GridSearchCV(
-                lr_clf, simple_hyperparam_grids['logistic_regression'],
-                cv=min(actual_cv_folds, len(X_train_scaled)), scoring='f1_weighted', n_jobs=1
-            )
-            grid_search_lr.fit(X_train_scaled, y_train)
-            best_lr = grid_search_lr.best_estimator_
-            y_pred_lr = best_lr.predict(X_test_scaled)
-            
-            results['LogisticRegression'] = {
-                'best_params': grid_search_lr.best_params_,
-                'metrics': compute_classification_metrics(y_test, y_pred_lr, classes),
-                'cv_score': float(grid_search_lr.best_score_)
-            }
-        except Exception as e:
-            logger.error(f"Logistic Regression tuning failed: {e}")
-            results['LogisticRegression'] = {'error': str(e)}
+        if df.empty:
+            return JSONResponse({"error": "No data"})
         
-        # Determine best algorithm
-        successful_models = {k: v for k, v in results.items() if 'metrics' in v}
-        if successful_models:
-            best_algorithm = max(successful_models.keys(), 
-                               key=lambda x: successful_models[x]['metrics']['f1_score'])
-            best_score = successful_models[best_algorithm]['metrics']['f1_score']
-        else:
-            best_algorithm = "No successful models"
-            best_score = 0
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
+        
+        if df_filtered.empty:
+            return JSONResponse({"error": f"No data after applying {range} filter"})
+        
+        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
+        agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
+        agg = agg.rename(columns={'mean': 'value'})
+        
+        # Generate hourly analysis plot
+        buf = io.BytesIO()
+        plt.figure(figsize=(10, 6))
+        
+        plt.plot(agg["hour"], agg["value"], marker='o', linewidth=2, label='Average Value')
+        if 'std' in agg.columns:
+            plt.fill_between(agg["hour"], agg["value"] - agg["std"], agg["value"] + agg["std"], alpha=0.2, label='Standard Deviation')
+        
+        plt.xlabel("Hour of Day")
+        plt.ylabel("Sensor Value")
+        plt.title(f"Hourly Analysis - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(range(0, 24))
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
         
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "dataset_info": {
-                "total_samples": len(df_lags),
-                "training_samples": len(X_train),
-                "test_samples": len(X_test),
-                "feature_count": len(feature_cols),
-                "classes": classes,
-                "class_distribution": dict(df_lags['class'].value_counts()),
-                "original_data_points": len(df)
-            },
-            "algorithms": results,
-            "best_algorithm": best_algorithm,
-            "best_score": best_score,
-            "test_size_used": actual_test_size,
-            "cv_folds_used": actual_cv_folds,
-            "status": "success"
+            "date_range": range,
+            "hourly_data": agg.to_dict(orient="records"),
+            "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
         }
         
     except Exception as e:
-        logger.error(f"Performance metrics error: {e}")
-        return {
-            "error": str(e), 
-            "sensor_id": sensor_id, 
-            "sensor_type": sensor,
-            "status": "error"
-        }
+        logger.error(f"SHAP hour analysis error: {e}")
+        return JSONResponse({"error": str(e)})
+
+
+
+# NEW PERFORMANCE ENDPOINT
+@app.get("/confusion_matrix/{sensor_id}")
+def confusion_matrix_chart(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    test_size: float = Query(0.2, description="Test size"),
+    cv_folds: int = Query(3, description="CV folds"),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """
+    Generate confusion matrix chart for best performing algorithm with date range filtering
+    """
+    try:
+        # Reuse performance endpoint logic with date range
+        perf = performance_metrics(sensor_id, sensor, test_size, cv_folds, range)
+        
+        # Check if performance endpoint returned an error
+        if "error" in perf:
+            error_msg = perf["error"]
+            return error_image(f"Performance metrics error: {error_msg}")
+        
+        # Check if we have successful algorithms
+        if "algorithms" not in perf:
+            return error_image("No algorithms data available")
+        
+        # Find the best algorithm that actually has metrics
+        best_algo = None
+        for algo_name, algo_data in perf["algorithms"].items():
+            if "metrics" in algo_data and "error" not in algo_data:
+                best_algo = algo_name
+                break
+        
+        if not best_algo:
+            return error_image("No valid model with metrics available for confusion matrix")
+        
+        metrics = perf["algorithms"][best_algo]["metrics"]
+        
+        # Check if we have confusion matrix data
+        if "confusion_matrix" not in metrics or "classes" not in metrics:
+            return error_image("No confusion matrix data available")
+        
+        conf_matrix = np.array(metrics["confusion_matrix"])
+        classes = metrics["classes"]
+        
+        # Check if we have at least 2 classes
+        if len(classes) < 2:
+            return error_image(f"Need at least 2 classes for confusion matrix. Found: {classes}")
+        
+        # Check if confusion matrix is valid
+        if conf_matrix.size == 0 or conf_matrix.shape[0] != len(classes):
+            return error_image("Invalid confusion matrix dimensions")
+        
+        # Plot confusion matrix
+        buf = io.BytesIO()
+        plt.figure(figsize=(8, 6))
+        
+        # Create the confusion matrix plot
+        plt.imshow(conf_matrix, interpolation="nearest", cmap=plt.cm.Blues, alpha=0.7)
+        plt.title(f"Confusion Matrix - {best_algo}\n(Sensor: {sensor}, Date Range: {range})", fontsize=14, pad=20)
+        plt.colorbar()
+
+        tick_marks = np.arange(len(classes))
+        plt.xticks(tick_marks, classes, rotation=45, ha='right')
+        plt.yticks(tick_marks, classes)
+
+        # Normalize and add text annotations
+        cm_normalized = conf_matrix.astype("float") / np.maximum(conf_matrix.sum(axis=1)[:, np.newaxis], 1)  # Avoid division by zero
+        thresh = conf_matrix.max() / 2.
+        
+        for i in range(conf_matrix.shape[0]):
+            for j in range(conf_matrix.shape[1]):
+                plt.text(
+                    j, i,
+                    f"{conf_matrix[i, j]}\n({cm_normalized[i, j]:.1%})",
+                    horizontalalignment="center",
+                    verticalalignment="center",
+                    color="white" if conf_matrix[i, j] > thresh else "black",
+                    fontsize=10
+                )
+
+        plt.ylabel("True Label", fontsize=12)
+        plt.xlabel("Predicted Label", fontsize=12)
+        plt.tight_layout()
+        
+        # Add some additional info
+        accuracy = metrics.get("accuracy", 0)
+        plt.figtext(0.5, 0.01, f"Accuracy: {accuracy:.2%} | Date Range: {range}", ha="center", fontsize=10, 
+                   bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+        
+        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+
+    except Exception as e:
+        logger.error(f"Confusion matrix error: {e}")
+        return error_image(f"Error generating confusion matrix: {str(e)}")
+
 @app.get("/confusion_matrix/{sensor_id}")
 def confusion_matrix_chart(
     sensor_id: str,
