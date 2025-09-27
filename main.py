@@ -40,14 +40,42 @@ app = FastAPI(
     version="1.0.0",
     description="API for gas sensor monitoring, forecasting, and SHAP explanations"
 )
-# CORS Middleware
+# CORS Middleware - Place this RIGHT AFTER app initialization
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[  "*"    ],
+    allow_origins=["*"],  # You can restrict this to specific domains in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
+
+# Simplified middleware - remove the duplicate one
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    
+    # Add CORS headers to all responses
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "*"
+    
+    return response
+
+# Enhanced OPTIONS handler
+@app.options("/{path:path}")
+async def preflight_handler(request: Request, path: str):
+    return JSONResponse(
+        content={"status": "ok", "message": "CORS preflight successful"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
 # ---------------------------------------------------
 # Firebase Setup
 # ---------------------------------------------------
@@ -83,26 +111,6 @@ try:
 except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
 
-# Add explicit CORS headers to key endpoints as backup
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
-# Add OPTIONS handler for preflight requests
-@app.options("/{path:path}")
-async def preflight_handler():
-    return JSONResponse(
-        content={"status": "ok"},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
     
 # Utility functions
     # Utility functions
