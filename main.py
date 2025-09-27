@@ -104,10 +104,13 @@ try:
         "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
     )
 
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(service_account_info)
-        firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-        logger.info("Firebase initialized successfully")
+    try:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(service_account_info)
+            firebase_admin.initialize_app(cred, {"databaseURL": database_url})
+            logger.info("Firebase initialized successfully")
+    except Exception as e:
+        logger.warning(f"Firebase initialization note: {e}")
 except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
 
@@ -405,13 +408,18 @@ fetch('https://gasmonitoring-backend-1.onrender.com/health')
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""    
+    """Health check endpoint with detailed CORS info"""    
     return {
         "status": "ok", 
         "timestamp": datetime.now().isoformat(), 
         "service": "Gas Monitoring API",
         "cors_enabled": True,
-        "allowed_origins": "all (*)"
+        "cors_config": {
+            "allow_origins": "all (*)",
+            "allow_methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "allow_headers": "all",
+            "max_age": "3600"
+        }
     }
 
 @app.get("/dataframe/{sensor_id}")
