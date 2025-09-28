@@ -1261,6 +1261,7 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
@@ -1268,371 +1269,309 @@ def performance_metrics(
     test_size: float = Query(0.2, description="Test set size ratio"),
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Get XGBoost performance metrics with detailed accuracy analysis"""
+    """Get XGBoost performance metrics"""
     try:
-        logger.info(f"=== XGBOOST PERFORMANCE ANALYSIS ===")
-        logger.info(f"Sensor: {sensor_id}, Type: {sensor}, Range: {range}")
+        logger.info(f"=== STARTING XGBOOST PERFORMANCE ===")
         
         # Step 1: Fetch data
-        logger.info("Step 1: Fetching sensor history...")
+        logger.info(f"Step 1: Fetching data for sensor {sensor_id}")
         records = fetch_sensor_history(sensor_id)
-        logger.info(f"Fetched {len(records)} records")
+        logger.info(f"Records fetched: {len(records)}")
         
         if not records:
-            return error_response("No data found for sensor", sensor_id, sensor, range)
-        
-        # Step 2: Check if sensor exists in data
-        first_record = records[0]
-        available_sensors = [k for k in first_record.keys() if k not in ['timestamp', 'sensorID', 'time', 'apiUserID', 'apiPass']]
-        logger.info(f"Available sensors: {available_sensors}")
-        
-        if sensor not in first_record:
-            return error_response(f"Sensor '{sensor}' not found. Available: {available_sensors}", sensor_id, sensor, range)
-        
+            return {
+                "error": f"No data found for sensor {sensor_id}",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 2: Check sensor exists
+        logger.info(f"Step 2: Checking sensor {sensor} exists")
+        sample_record = records[0]
+        if sensor not in sample_record:
+            available = [k for k in sample_record.keys() if k not in ['timestamp', 'sensorID', 'time']]
+            return {
+                "error": f"Sensor {sensor} not found. Available: {available}",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
         # Step 3: Preprocess data
-        logger.info("Step 3: Preprocessing data...")
-        df = preprocess_dataframe(records, sensor)
-        logger.info(f"Preprocessed data shape: {df.shape}")
+        logger.info("Step 3: Preprocessing dataframe")
+        df = preprocess_dataframe_simple(records, sensor)
+        logger.info(f"Preprocessed shape: {df.shape}")
         
         if df.empty:
-            return error_response("No valid data after preprocessing", sensor_id, sensor, range)
+            return {
+                "error": "No valid data after preprocessing",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 4: Filter by date
+        logger.info(f"Step 4: Filtering by range: {range}")
+        df_filtered = filter_by_date_range_simple(df, range)
+        logger.info(f"After filtering: {df_filtered.shape}")
         
-        # Step 4: Filter by date range
-        logger.info("Step 4: Filtering by date range...")
-        df_filtered = filter_by_date_range(df, range)
-        logger.info(f"After date filtering: {df_filtered.shape}")
+        if len(df_filtered) < 5:
+            return {
+                "error": f"Not enough data after filtering: {len(df_filtered)} records",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 5: Create binary labels
+        logger.info("Step 5: Creating binary labels")
+        df_binary = create_simple_binary_labels(df_filtered)
+        logger.info(f"Binary data shape: {df_binary.shape}")
         
-        if df_filtered.empty or len(df_filtered) < 10:
-            return error_response(f"Not enough data after {range} filter. Need 10+, got {len(df_filtered)}", sensor_id, sensor, range)
-        
-        # Step 5: Create classification labels (binary for simplicity)
-        logger.info("Step 5: Creating binary classification labels...")
-        df_class = create_binary_classification_labels(df_filtered)
-        logger.info(f"Classification data shape: {df_class.shape}")
-        
-        if df_class.empty:
-            return error_response("Failed to create classification labels", sensor_id, sensor, range)
-        
+        if df_binary.empty:
+            return {
+                "error": "Could not create binary classification labels",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
         # Step 6: Create features
-        logger.info("Step 6: Creating lag features...")
-        df_lags = make_lag_features_simple(df_class, lags=3)
-        logger.info(f"Features data shape: {df_lags.shape}")
+        logger.info("Step 6: Creating lag features")
+        df_features = create_simple_lag_features(df_binary)
+        logger.info(f"Features shape: {df_features.shape}")
         
-        if df_lags.empty or len(df_lags) < 5:
-            return error_response("Insufficient data for feature engineering", sensor_id, sensor, range)
+        if df_features.empty:
+            return {
+                "error": "Could not create features",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 7: Prepare X and y
+        logger.info("Step 7: Preparing features and target")
+        feature_cols = [col for col in df_features.columns if col.startswith('lag')]
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
         
-        # Step 7: Prepare features and target
-        feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
-        X = df_lags[feature_cols]
-        y = df_lags['class']
+        logger.info(f"X shape: {X.shape}, y unique: {np.unique(y)}")
+
+        # Step 8: Train-test split
+        logger.info("Step 8: Train-test split")
+        if len(X) < 10:
+            # Use all data for training if very small dataset
+            X_train, X_test, y_train, y_test = X, X, y, y
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=min(test_size, 0.3), random_state=42
+            )
         
-        logger.info(f"Features: {feature_cols}, Target distribution: {y.value_counts().to_dict()}")
+        logger.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
+
+        # Step 9: Train simple XGBoost
+        logger.info("Step 9: Training XGBoost")
+        try:
+            model = xgb.XGBClassifier(
+                n_estimators=50,
+                max_depth=3,
+                learning_rate=0.1,
+                random_state=42
+            )
+            model.fit(X_train, y_train)
+            logger.info("XGBoost trained successfully")
+        except Exception as e:
+            logger.error(f"XGBoost training failed: {e}")
+            return {
+                "error": f"Model training failed: {str(e)}",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 10: Evaluate model
+        logger.info("Step 10: Evaluating model")
+        y_pred = model.predict(X_test)
         
-        # Step 8: Encode labels
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-        classes = le.classes_.tolist()
-        
-        if len(classes) < 2:
-            return error_response("Need at least 2 classes for classification", sensor_id, sensor, range)
-        
-        # Step 9: Split data
-        n_samples = len(X)
-        actual_test_size = min(test_size, 0.3)
-        
-        logger.info(f"Splitting data: {n_samples} samples, test_size: {actual_test_size}")
-        
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
-        )
-        
-        if len(X_train) < 5:
-            return error_response("Insufficient training data", sensor_id, sensor, range)
-        
-        # Step 10: Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Step 11: Train XGBoost with multiple configurations
-        logger.info("Step 11: Training XGBoost models...")
-        xgboost_results = train_xgboost_models(X_train_scaled, X_test_scaled, y_train, y_test, feature_cols, classes)
-        
-        # Step 12: Generate accuracy proof metrics
-        accuracy_proof = generate_accuracy_proof(xgboost_results, X_test_scaled, y_test, classes)
-        
-        # Step 13: Prepare final response
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+        # Step 11: Prepare response
+        logger.info("Step 11: Preparing response")
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
             "algorithm": "XGBoost",
-            "dataset_info": {
-                "total_samples": len(df_lags),
+            "performance_metrics": {
+                "accuracy": float(accuracy),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1_score": float(f1),
+                "test_samples": len(y_test)
+            },
+            "model_info": {
+                "n_estimators": 50,
+                "max_depth": 3,
+                "learning_rate": 0.1
+            },
+            "data_info": {
+                "total_samples": len(df_features),
                 "training_samples": len(X_train),
                 "test_samples": len(X_test),
                 "features_used": feature_cols,
-                "classes": classes,
-                "class_distribution": dict(df_lags['class'].value_counts()),
-                "data_range": {
-                    "start": df_lags["timestamp"].min().strftime("%Y-%m-%d"),
-                    "end": df_lags["timestamp"].max().strftime("%Y-%m-%d")
+                "class_distribution": {
+                    "class_0": int(np.sum(y == 0)),
+                    "class_1": int(np.sum(y == 1))
                 }
             },
-            "xgboost_results": xgboost_results,
-            "accuracy_proof": accuracy_proof,
-            "test_size_used": actual_test_size,
+            "accuracy_assessment": get_accuracy_assessment(accuracy),
             "status": "success"
         }
-        
-        logger.info("=== XGBOOST PERFORMANCE ANALYSIS COMPLETED ===")
+
+        logger.info("=== XGBOOST PERFORMANCE COMPLETED ===")
         return response
-        
+
     except Exception as e:
-        logger.error(f"XGBoost performance analysis error: {str(e)}", exc_info=True)
-        return error_response(f"Analysis failed: {str(e)}", sensor_id, sensor, range)
+        logger.error(f"PERFORMANCE ENDPOINT CRASH: {str(e)}", exc_info=True)
+        return {
+            "error": f"Internal server error: {str(e)}",
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "status": "error"
+        }
 
 
-def train_xgboost_models(X_train, X_test, y_train, y_test, feature_names, classes):
-    """Train XGBoost with different configurations"""
-    results = {}
-    
-    # Configuration 1: Default XGBoost
+def preprocess_dataframe_simple(records, sensor):
+    """Simplified dataframe preprocessing"""
     try:
-        logger.info("Training default XGBoost...")
-        model1 = xgb.XGBClassifier(
-            random_state=42,
-            eval_metric='logloss',
-            n_estimators=100
-        )
-        model1.fit(X_train, y_train)
-        y_pred1 = model1.predict(X_test)
-        
-        results["default"] = {
-            "metrics": compute_classification_metrics_safe(y_test, y_pred1, classes),
-            "feature_importance": dict(zip(feature_names, model1.feature_importances_.tolist())),
-            "parameters": {
-                "n_estimators": 100,
-                "learning_rate": 0.3,
-                "max_depth": 6
-            }
-        }
-        logger.info("Default XGBoost trained successfully")
-    except Exception as e:
-        logger.error(f"Default XGBoost failed: {e}")
-        results["default"] = {"error": str(e)}
-    
-    # Configuration 2: Optimized for small datasets
-    try:
-        logger.info("Training optimized XGBoost...")
-        model2 = xgb.XGBClassifier(
-            random_state=42,
-            eval_metric='logloss',
-            n_estimators=50,
-            max_depth=4,
-            learning_rate=0.1,
-            subsample=0.8
-        )
-        model2.fit(X_train, y_train)
-        y_pred2 = model2.predict(X_test)
-        
-        results["optimized"] = {
-            "metrics": compute_classification_metrics_safe(y_test, y_pred2, classes),
-            "feature_importance": dict(zip(feature_names, model2.feature_importances_.tolist())),
-            "parameters": {
-                "n_estimators": 50,
-                "learning_rate": 0.1,
-                "max_depth": 4,
-                "subsample": 0.8
-            }
-        }
-        logger.info("Optimized XGBoost trained successfully")
-    except Exception as e:
-        logger.error(f"Optimized XGBoost failed: {e}")
-        results["optimized"] = {"error": str(e)}
-    
-    return results
-
-
-def generate_accuracy_proof(xgboost_results, X_test, y_test, classes):
-    """Generate comprehensive accuracy proof metrics"""
-    accuracy_proof = {}
-    
-    # Find the best configuration
-    best_config = None
-    best_score = -1
-    
-    for config_name, result in xgboost_results.items():
-        if "metrics" in result and "error" not in result:
-            score = result["metrics"]["f1_score"]
-            if score > best_score:
-                best_score = score
-                best_config = config_name
-    
-    if best_config:
-        best_result = xgboost_results[best_config]
-        
-        # Accuracy assessment
-        accuracy = best_result["metrics"]["accuracy"]
-        f1_score = best_result["metrics"]["f1_score"]
-        
-        if accuracy >= 0.9:
-            accuracy_level = "Excellent"
-            confidence = "Very High"
-        elif accuracy >= 0.8:
-            accuracy_level = "Very Good"
-            confidence = "High"
-        elif accuracy >= 0.7:
-            accuracy_level = "Good"
-            confidence = "Medium-High"
-        elif accuracy >= 0.6:
-            accuracy_level = "Fair"
-            confidence = "Medium"
-        else:
-            accuracy_level = "Needs Improvement"
-            confidence = "Low"
-        
-        # Feature importance analysis
-        top_features = sorted(
-            best_result["feature_importance"].items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:3]  # Top 3 features
-        
-        accuracy_proof = {
-            "best_configuration": best_config,
-            "accuracy_assessment": {
-                "accuracy_level": accuracy_level,
-                "confidence_level": confidence,
-                "accuracy_score": accuracy,
-                "f1_score": f1_score,
-                "interpretation": f"XGBoost shows {accuracy_level.lower()} accuracy with {confidence.lower()} confidence"
-            },
-            "key_metrics": {
-                "accuracy": best_result["metrics"]["accuracy"],
-                "precision": best_result["metrics"]["precision"],
-                "recall": best_result["metrics"]["recall"],
-                "f1_score": best_result["metrics"]["f1_score"]
-            },
-            "feature_analysis": {
-                "top_features": top_features,
-                "most_important_feature": top_features[0][0] if top_features else "None",
-                "feature_importance_summary": f"Model relies most on {top_features[0][0] if top_features else 'no specific features'}"
-            },
-            "performance_evidence": [
-                f"Accuracy: {accuracy:.1%} on test data",
-                f"F1 Score: {f1_score:.3f} (balanced metric)",
-                f"Top feature importance: {top_features[0][1]:.3f}" if top_features else "No feature importance data",
-                f"Confidence: {confidence} based on performance metrics"
-            ]
-        }
-    else:
-        accuracy_proof = {
-            "accuracy_assessment": {
-                "accuracy_level": "Failed",
-                "confidence_level": "None",
-                "accuracy_score": 0.0,
-                "interpretation": "XGBoost training failed on all configurations"
-            }
-        }
-    
-    return accuracy_proof
-
-
-def create_binary_classification_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Create simple binary classification labels based on median"""
-    if df.empty or len(df) < 5:
-        return pd.DataFrame()
-    
-    try:
-        df_class = df.copy()
-        
-        # Binary classification: above/below median
-        median_val = df_class['value'].median()
-        df_class['class'] = np.where(df_class['value'] > median_val, 'above_median', 'below_median')
-        
-        # Check if we have both classes
-        class_counts = df_class['class'].value_counts()
-        if len(class_counts) < 2:
+        if not records:
             return pd.DataFrame()
         
-        return df_class
+        # Create DataFrame with only necessary columns
+        data = []
+        for record in records:
+            if sensor in record and 'timestamp' in record:
+                try:
+                    value = float(record[sensor])
+                    timestamp = pd.to_datetime(record['timestamp'])
+                    data.append({'timestamp': timestamp, 'value': value})
+                except (ValueError, TypeError):
+                    continue
         
-    except Exception as e:
-        logger.error(f"Error creating binary labels: {e}")
-        return pd.DataFrame()
-
-
-def make_lag_features_simple(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
-    """Create lag features safely"""
-    if df.empty:
+        if not data:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(data)
+        df = df.sort_values('timestamp')
+        df = df.dropna()
+        
         return df
-    
-    try:
-        df_copy = df.copy()
-        for i in range(1, lags + 1):
-            df_copy[f"lag{i}"] = df_copy["value"].shift(i)
         
-        # Drop rows with NaN values
-        df_copy = df_copy.dropna()
-        return df_copy
     except Exception as e:
-        logger.error(f"Error creating lag features: {e}")
+        logger.error(f"Preprocessing error: {e}")
         return pd.DataFrame()
 
 
-def compute_classification_metrics_safe(y_true, y_pred, classes):
-    """Safe computation of classification metrics"""
+def filter_by_date_range_simple(df, date_range):
+    """Simplified date filtering"""
     try:
-        if len(y_true) == 0 or len(y_pred) == 0:
-            return create_default_metrics(classes)
+        if df.empty:
+            return df
+            
+        now = pd.Timestamp.now()
         
-        accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        if date_range == "1week":
+            cutoff = now - pd.Timedelta(weeks=1)
+        elif date_range == "1month":
+            cutoff = now - pd.Timedelta(days=30)
+        elif date_range == "3months":
+            cutoff = now - pd.Timedelta(days=90)
+        elif date_range == "6months":
+            cutoff = now - pd.Timedelta(days=180)
+        elif date_range == "1year":
+            cutoff = now - pd.Timedelta(days=365)
+        else:  # "all"
+            return df
+            
+        return df[df['timestamp'] >= cutoff]
         
-        # Confusion matrix
-        try:
-            conf_matrix = confusion_matrix(y_true, y_pred).tolist()
-        except:
-            conf_matrix = [[0, 0], [0, 0]]
-        
-        return {
-            "accuracy": float(accuracy),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1_score": float(f1),
-            "confusion_matrix": conf_matrix,
-            "classes": classes,
-            "samples": len(y_true)
-        }
     except Exception as e:
-        logger.error(f"Error computing metrics: {e}")
-        return create_default_metrics(classes)
+        logger.error(f"Date filtering error: {e}")
+        return df
 
 
-def create_default_metrics(classes):
-    """Create default metrics when computation fails"""
+def create_simple_binary_labels(df):
+    """Create simple binary labels"""
+    try:
+        if df.empty:
+            return pd.DataFrame()
+            
+        df_copy = df.copy()
+        
+        # Use median for binary classification
+        median_val = df_copy['value'].median()
+        df_copy['class_binary'] = (df_copy['value'] > median_val).astype(int)
+        
+        # Check if we have both classes
+        class_counts = df_copy['class_binary'].value_counts()
+        if len(class_counts) < 2:
+            return pd.DataFrame()
+            
+        return df_copy
+        
+    except Exception as e:
+        logger.error(f"Binary labels error: {e}")
+        return pd.DataFrame()
+
+
+def create_simple_lag_features(df, lags=2):
+    """Create simple lag features"""
+    try:
+        if df.empty:
+            return pd.DataFrame()
+            
+        df_copy = df.copy()
+        
+        # Create lag features
+        for i in range(1, lags + 1):
+            df_copy[f'lag{i}'] = df_copy['value'].shift(i)
+        
+        # Drop rows with NaN
+        df_copy = df_copy.dropna()
+        
+        return df_copy
+        
+    except Exception as e:
+        logger.error(f"Lag features error: {e}")
+        return pd.DataFrame()
+
+
+def get_accuracy_assessment(accuracy):
+    """Get accuracy assessment"""
+    if accuracy >= 0.9:
+        level = "Excellent"
+        confidence = "Very High"
+    elif accuracy >= 0.8:
+        level = "Very Good" 
+        confidence = "High"
+    elif accuracy >= 0.7:
+        level = "Good"
+        confidence = "Medium"
+    elif accuracy >= 0.6:
+        level = "Fair"
+        confidence = "Low-Medium"
+    else:
+        level = "Needs Improvement"
+        confidence = "Low"
+    
     return {
-        "accuracy": 0.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1_score": 0.0,
-        "confusion_matrix": [[0, 0], [0, 0]] if len(classes) == 2 else [[0]],
-        "classes": classes,
-        "samples": 0
-    }
-
-
-def error_response(message, sensor_id, sensor_type, date_range):
-    """Standard error response"""
-    return {
-        "error": message,
-        "sensor_id": sensor_id,
-        "sensor_type": sensor_type,
-        "date_range": date_range,
-        "status": "error"
+        "accuracy_level": level,
+        "confidence": confidence,
+        "interpretation": f"XGBoost shows {level.lower()} performance with {confidence.lower()} confidence"
     }
 
 # Run the application
