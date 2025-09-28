@@ -584,6 +584,61 @@ async def get_sensor_stats(sensor_id: str):
 # =============================================================================
 # DATA ENDPOINTS
 # =============================================================================
+# SHAP Hour endpoint@app.get("/shap_hour/{sensor_id}")
+def shap_hour(
+    sensor_id: str, 
+    sensor: str = Query(...),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """SHAP hourly analysis with date range filtering"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        
+        if df.empty:
+            return JSONResponse({"error": "No data"})
+        
+        # Apply date range filter
+        df_filtered = filter_by_date_range(df, range)
+        
+        if df_filtered.empty:
+            return JSONResponse({"error": f"No data after applying {range} filter"})
+        
+        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
+        agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
+        agg = agg.rename(columns={'mean': 'value'})
+        
+        # Generate hourly analysis plot
+        buf = io.BytesIO()
+        plt.figure(figsize=(10, 6))
+        
+        plt.plot(agg["hour"], agg["value"], marker='o', linewidth=2, label='Average Value')
+        if 'std' in agg.columns:
+            plt.fill_between(agg["hour"], agg["value"] - agg["std"], agg["value"] + agg["std"], alpha=0.2, label='Standard Deviation')
+        
+        plt.xlabel("Hour of Day")
+        plt.ylabel("Sensor Value")
+        plt.title(f"Hourly Analysis - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(range(0, 24))
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": range,
+            "hourly_data": agg.to_dict(orient="records"),
+            "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
+        }
+        
+    except Exception as e:
+        logger.error(f"SHAP hour analysis error: {e}")
+        return JSONResponse({"error": str(e)})
+
 
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(
