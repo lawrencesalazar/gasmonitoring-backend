@@ -639,7 +639,6 @@ def explain(
     except Exception as e:
         logger.error(f"SHAP explanation error: {e}")
         return JSONResponse({"error": str(e)})
-
 @app.get("/shap_hour/{sensor_id}")
 def shap_hour(
     sensor_id: str, 
@@ -652,23 +651,42 @@ def shap_hour(
         df = preprocess_dataframe(records, sensor)
         
         if df.empty:
-            return JSONResponse({"error": "No data"})
+            return {"error": "No data", "sensor_id": sensor_id, "sensor_type": sensor}
         
         df_filtered = filter_by_date_range(df, range)
         
         if df_filtered.empty:
-            return JSONResponse({"error": f"No data after applying {range} filter"})
+            return {"error": f"No data after applying {range} filter", "sensor_id": sensor_id, "sensor_type": sensor}
         
+        # Check if we have enough data after filtering
+        if len(df_filtered) < 3:
+            return {"error": f"Not enough data after filtering. Need at least 3 records, got {len(df_filtered)}", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Create hour column and aggregate
         df_filtered["hour"] = df_filtered["timestamp"].dt.hour
         agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
         agg = agg.rename(columns={'mean': 'value'})
         
+        # Check if we have any aggregated data
+        if agg.empty:
+            return {"error": "No hourly data available after aggregation", "sensor_id": sensor_id, "sensor_type": sensor}
+        
+        # Generate plot
         buf = io.BytesIO()
         plt.figure(figsize=(10, 6))
         
         plt.plot(agg["hour"], agg["value"], marker='o', linewidth=2, label='Average Value')
-        if 'std' in agg.columns:
-            plt.fill_between(agg["hour"], agg["value"] - agg["std"], agg["value"] + agg["std"], alpha=0.2, label='Standard Deviation')
+        if 'std' in agg.columns and not agg['std'].isna().all():
+            # Filter out NaN values for fill_between
+            valid_hours = agg[~agg['std'].isna()]
+            if not valid_hours.empty:
+                plt.fill_between(
+                    valid_hours["hour"], 
+                    valid_hours["value"] - valid_hours["std"], 
+                    valid_hours["value"] + valid_hours["std"], 
+                    alpha=0.2, 
+                    label='Standard Deviation'
+                )
         
         plt.xlabel("Hour of Day")
         plt.ylabel("Sensor Value")
@@ -681,19 +699,29 @@ def shap_hour(
         plt.close()
         buf.seek(0)
         
+        # Prepare response data
+        hourly_data = agg.to_dict(orient="records")
+        image_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
-            "hourly_data": agg.to_dict(orient="records"),
-            "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
+            "hourly_data": hourly_data,
+            "image_data": image_data,
+            "status": "success",
+            "data_points": len(df_filtered),
+            "hourly_points": len(hourly_data)
         }
         
     except Exception as e:
         logger.error(f"SHAP hour analysis error: {e}")
-        return JSONResponse({"error": str(e)})
-
-
+        return {
+            "error": str(e), 
+            "sensor_id": sensor_id, 
+            "sensor_type": sensor,
+            "status": "error"
+        }
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(
     sensor_id: str, 
@@ -1157,10 +1185,36 @@ def performance_metrics(
 ):
     """Get performance metrics for different classifiers with hyperparameter tuning and date range filtering"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
+        logger.info(f"Starting performance metrics for sensor {sensor_id}, type {sensor}, range {range}")
         
+        # Step 1: Fetch and preprocess data
+        records = fetch_sensor_history(sensor_id)
+        logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
+        
+        if not records:
+            return {
+                "error": f"No data found for sensor {sensor_id}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "date_range": range,
+                "status": "error"
+            }
+        
+        df = preprocess_dataframe(records, sensor)
+        logger.info(f"Preprocessed dataframe shape: {df.shape}")
+        
+        if df.empty:
+            return {
+                "error": f"No valid data for sensor {sensor_id} and type {sensor}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "date_range": range,
+                "status": "error"
+            }
+        
+        # Step 2: Filter by date range
         df_filtered = filter_by_date_range(df, range)
+        logger.info(f"After date filtering shape: {df_filtered.shape}")
         
         if df_filtered.empty or len(df_filtered) < 10:
             return {
@@ -1171,7 +1225,10 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Step 3: Create classification labels
         df_class = create_classification_labels(df_filtered, sensor)
+        logger.info(f"Classification labels created. Shape: {df_class.shape if not df_class.empty else 'empty'}")
+        
         if df_class.empty:
             return {
                 "error": f"Failed to create classification labels - insufficient class diversity after {range} filter", 
@@ -1181,7 +1238,10 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Step 4: Check class distribution
         class_distribution = df_class['class'].value_counts()
+        logger.info(f"Class distribution: {class_distribution.to_dict()}")
+        
         if len(class_distribution) < 2:
             return {
                 "error": f"Need at least 2 classes for classification after {range} filter. Found only: {class_distribution.to_dict()}", 
@@ -1192,7 +1252,9 @@ def performance_metrics(
             }
         
         min_samples_per_class = 2
-        valid_classes = class_distribution[class_distribution >= min_samples_per_class].index
+        valid_classes = class_distribution[class_distribution >= min_samples_per_class].index.tolist()
+        logger.info(f"Valid classes with min {min_samples_per_class} samples: {valid_classes}")
+        
         if len(valid_classes) < 2:
             return {
                 "error": f"Need at least 2 classes with minimum {min_samples_per_class} samples each after {range} filter. Current distribution: {class_distribution.to_dict()}", 
@@ -1203,24 +1265,35 @@ def performance_metrics(
             }
         
         df_class = df_class[df_class['class'].isin(valid_classes)]
+        logger.info(f"After filtering valid classes shape: {df_class.shape}")
         
+        # Step 5: Create lag features
         df_lags = make_lag_features(df_class, lags=2)
+        logger.info(f"After creating lag features shape: {df_lags.shape}")
+        
         if df_lags.empty or len(df_lags) < 5:
             return {
-                "error": f"Insufficient data after feature engineering with {range} filter", 
+                "error": f"Insufficient data after feature engineering with {range} filter. Need at least 5 samples, got {len(df_lags)}", 
                 "sensor_id": sensor_id, 
                 "sensor_type": sensor,
                 "date_range": range,
                 "status": "error"
             }
         
+        # Step 6: Prepare features and target
         feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
         X = df_lags[feature_cols]
         y = df_lags['class']
         
+        logger.info(f"Feature matrix shape: {X.shape}")
+        logger.info(f"Target distribution: {y.value_counts().to_dict()}")
+        
+        # Step 7: Encode labels
         le = LabelEncoder()
         y_encoded = le.fit_transform(y)
         classes = le.classes_.tolist()
+        
+        logger.info(f"Encoded classes: {classes}")
         
         if len(classes) < 2:
             return {
@@ -1231,13 +1304,28 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Step 8: Split data
         n_samples = len(X)
         actual_test_size = min(test_size, 0.3)
         actual_cv_folds = min(cv_folds, max(2, n_samples // 3))
         
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
-        )
+        logger.info(f"Data split - total: {n_samples}, test_size: {actual_test_size}, cv_folds: {actual_cv_folds}")
+        
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
+            )
+        except ValueError as e:
+            logger.error(f"Train-test split failed: {e}")
+            return {
+                "error": f"Data splitting failed: {str(e)}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "date_range": range,
+                "status": "error"
+            }
+        
+        logger.info(f"Training set: {X_train.shape}, Test set: {X_test.shape}")
         
         if len(X_train) < 5:
             return {
@@ -1248,61 +1336,60 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Step 9: Scale features
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
         results = {}
         
-        # XGBoost Classifier
-        try:
-            xgb_clf = xgb.XGBClassifier(random_state=42, eval_metric='logloss')
-            xgb_clf.fit(X_train_scaled, y_train)
-            y_pred_xgb = xgb_clf.predict(X_test_scaled)
-            
-            results['XGBoost'] = {
-                'metrics': compute_classification_metrics(y_test, y_pred_xgb, classes)
-            }
-        except Exception as e:
-            logger.error(f"XGBoost failed: {e}")
-            results['XGBoost'] = {'error': str(e)}
+        # Step 10: Train and evaluate models
+        models_to_try = [
+            ('XGBoost', xgb.XGBClassifier(random_state=42, eval_metric='logloss', n_estimators=50)),
+            ('RandomForest', RandomForestClassifier(random_state=42, n_estimators=50)),
+            ('LogisticRegression', LogisticRegression(random_state=42, max_iter=1000))
+        ]
         
-        # Random Forest Classifier
-        try:
-            rf_clf = RandomForestClassifier(random_state=42, n_estimators=50)
-            rf_clf.fit(X_train, y_train)
-            y_pred_rf = rf_clf.predict(X_test)
-            
-            results['RandomForest'] = {
-                'metrics': compute_classification_metrics(y_test, y_pred_rf, classes)
-            }
-        except Exception as e:
-            logger.error(f"Random Forest failed: {e}")
-            results['RandomForest'] = {'error': str(e)}
+        for model_name, model in models_to_try:
+            try:
+                logger.info(f"Training {model_name}...")
+                
+                if model_name == 'LogisticRegression':
+                    # Use scaled features for Logistic Regression
+                    model.fit(X_train_scaled, y_train)
+                    y_pred = model.predict(X_test_scaled)
+                else:
+                    # Use original features for tree-based models
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
+                
+                metrics = compute_classification_metrics(y_test, y_pred, classes)
+                
+                results[model_name] = {
+                    'metrics': metrics
+                }
+                
+                logger.info(f"{model_name} trained successfully. Accuracy: {metrics['accuracy']:.3f}")
+                
+            except Exception as e:
+                logger.error(f"{model_name} failed: {str(e)}")
+                results[model_name] = {'error': str(e)}
         
-        # Logistic Regression
-        try:
-            lr_clf = LogisticRegression(random_state=42, max_iter=1000)
-            lr_clf.fit(X_train_scaled, y_train)
-            y_pred_lr = lr_clf.predict(X_test_scaled)
-            
-            results['LogisticRegression'] = {
-                'metrics': compute_classification_metrics(y_test, y_pred_lr, classes)
-            }
-        except Exception as e:
-            logger.error(f"Logistic Regression failed: {e}")
-            results['LogisticRegression'] = {'error': str(e)}
+        # Step 11: Determine best algorithm
+        successful_models = {k: v for k, v in results.items() if 'metrics' in v and 'error' not in v}
         
-        successful_models = {k: v for k, v in results.items() if 'metrics' in v}
         if successful_models:
             best_algorithm = max(successful_models.keys(), 
                                key=lambda x: successful_models[x]['metrics']['f1_score'])
             best_score = successful_models[best_algorithm]['metrics']['f1_score']
+            logger.info(f"Best algorithm: {best_algorithm} with F1 score: {best_score:.3f}")
         else:
             best_algorithm = "No successful models"
             best_score = 0
+            logger.warning("No models trained successfully")
         
-        return {
+        # Step 12: Prepare final response
+        response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
@@ -1319,22 +1406,25 @@ def performance_metrics(
             },
             "algorithms": results,
             "best_algorithm": best_algorithm,
-            "best_score": best_score,
+            "best_score": float(best_score),
             "test_size_used": actual_test_size,
             "cv_folds_used": actual_cv_folds,
             "status": "success"
         }
         
+        logger.info(f"Performance metrics completed successfully for sensor {sensor_id}")
+        return response
+        
     except Exception as e:
-        logger.error(f"Performance metrics error: {e}")
+        logger.error(f"Performance metrics error: {str(e)}", exc_info=True)
         return {
-            "error": str(e), 
+            "error": f"Internal server error: {str(e)}", 
             "sensor_id": sensor_id, 
             "sensor_type": sensor,
             "date_range": range,
             "status": "error"
         }
-
+        
 @app.get("/confusion_matrix/{sensor_id}")
 def confusion_matrix_chart(
     sensor_id: str,
