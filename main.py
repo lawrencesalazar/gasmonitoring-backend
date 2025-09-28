@@ -49,16 +49,16 @@ app.add_middleware(
 )
 
 # Simplified middleware
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    response = await call_next(request)
+# @app.middleware("http")
+# async def add_cors_headers(request: Request, call_next):
+    # response = await call_next(request)
     
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "*"
+    # response.headers["Access-Control-Allow-Origin"] = "*"
+    # response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    # response.headers["Access-Control-Allow-Headers"] = "*"
+    # response.headers["Access-Control-Expose-Headers"] = "*"
     
-    return response
+    # return response
 
 # Enhanced OPTIONS handler
 @app.options("/{path:path}")
@@ -108,6 +108,7 @@ try:
         logger.warning(f"Firebase initialization note: {e}")
 except Exception as e:
     logger.error(f"Firebase initialization failed: {e}")
+    
 
 # Utility functions
 def fetch_sensor_history(sensor_id: str):
