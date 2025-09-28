@@ -3,7 +3,7 @@ import json
 import os
 import math
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Query, Request, Form
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import firebase_admin
@@ -132,6 +132,23 @@ def fetch_sensor_history(sensor_id: str):
     except Exception as e:
         logger.error(f"Error fetching sensor history: {e}")
         return []
+
+def get_current_sensor_reading(sensor_id: str):
+    """Get current sensor reading from sensorReadings"""
+    try:
+        ref = db.reference(f"sensorReadings/{sensor_id}")
+        snapshot = ref.get()
+        if snapshot and isinstance(snapshot, dict):
+            if "timestamp" in snapshot:
+                try:
+                    snapshot["timestamp"] = pd.to_datetime(snapshot["timestamp"])
+                except Exception:
+                    snapshot["timestamp"] = None
+            return snapshot
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching current sensor reading: {e}")
+        return None
 
 def preprocess_dataframe(records, sensor: str):
     """Preprocess dataframe for analysis"""
@@ -388,88 +405,13 @@ def calculate_risk_index(data: Dict[str, Any]) -> float:
         return 0.0
 
 # =============================================================================
-# NEW ENDPOINTS FOR ESP32 SENSOR DATA INSERTION
+# NEW ENDPOINTS FOR ESP32 SENSOR DATA INSERTION (JSON ONLY)
 # =============================================================================
 
 @app.post("/api/sensor/data")
-async def receive_sensor_data(
-    request: Request,
-    sensorID: str = Form(...),
-    timestamp: str = Form(...),
-    co2: float = Form(...),
-    methane: float = Form(...),
-    ammonia: float = Form(...),
-    temperature: float = Form(...),
-    humidity: float = Form(...),
-    apiUserID: Optional[str] = Form(None),
-    apiPass: Optional[str] = Form(None)
-):
+async def receive_sensor_data(request: Request):
     """
-    Receive sensor data from ESP32 devices and store in Firebase
-    """
-    try:
-        # Create data dictionary
-        sensor_data = {
-            'sensorID': sensorID,
-            'timestamp': timestamp,
-            'co2': co2,
-            'methane': methane,
-            'ammonia': ammonia,
-            'temperature': temperature,
-            'humidity': humidity,
-            'apiUserID': apiUserID,
-            'apiPass': apiPass,
-            'time': timestamp  # Duplicate for compatibility
-        }
-        
-        # Validate data
-        is_valid, message = validate_sensor_data(sensor_data)
-        if not is_valid:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": message}
-            )
-        
-        # Calculate risk index
-        risk_index = calculate_risk_index(sensor_data)
-        sensor_data['riskIndex'] = risk_index
-        
-        # Get current timestamp for unique key
-        current_timestamp = int(datetime.now().timestamp())
-        
-        # Store in history
-        history_ref = db.reference(f"history/{sensorID}/{current_timestamp}")
-        history_ref.set(sensor_data)
-        
-        # Update current reading
-        current_ref = db.reference(f"sensorReadings/{sensorID}")
-        current_ref.set(sensor_data)
-        
-        logger.info(f"Successfully stored data for sensor {sensorID} at {timestamp}")
-        
-        return {
-            "status": "success",
-            "message": "Sensor data stored successfully",
-            "sensorID": sensorID,
-            "timestamp": timestamp,
-            "riskIndex": risk_index,
-            "storage": {
-                "history_key": current_timestamp,
-                "current_reading_updated": True
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error storing sensor data: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal server error: {str(e)}"}
-        )
-
-@app.post("/api/sensor/data/json")
-async def receive_sensor_data_json(request: Request):
-    """
-    Receive sensor data from ESP32 in JSON format
+    Receive sensor data from ESP32 devices and store in Firebase (JSON format)
     """
     try:
         data = await request.json()
@@ -502,7 +444,7 @@ async def receive_sensor_data_json(request: Request):
         current_ref = db.reference(f"sensorReadings/{data['sensorID']}")
         current_ref.set(data)
         
-        logger.info(f"Successfully stored JSON data for sensor {data['sensorID']} at {data['timestamp']}")
+        logger.info(f"Successfully stored data for sensor {data['sensorID']} at {data['timestamp']}")
         
         return {
             "status": "success",
@@ -517,7 +459,7 @@ async def receive_sensor_data_json(request: Request):
         }
         
     except Exception as e:
-        logger.error(f"Error storing JSON sensor data: {e}")
+        logger.error(f"Error storing sensor data: {e}")
         return JSONResponse(
             status_code=500,
             content={"status": "error", "message": f"Internal server error: {str(e)}"}
@@ -606,7 +548,7 @@ async def get_sensor_stats(sensor_id: str):
         )
 
 # =============================================================================
-# EXISTING ENDPOINTS (keep all your existing endpoints)
+# EXISTING ENDPOINTS 
 # =============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -642,8 +584,7 @@ def home():
         <div class="endpoint new">
             <h3>📱 ESP32 Sensor Endpoints (NEW)</h3>
             <ul>
-                <li><code>POST /api/sensor/data</code> - Receive sensor data from ESP32 (form data)</li>
-                <li><code>POST /api/sensor/data/json</code> - Receive sensor data from ESP32 (JSON)</li>
+                <li><code>POST /api/sensor/data</code> - Receive sensor data from ESP32 (JSON)</li>
                 <li><code>GET /api/sensor/current/{sensor_id}</code> - Get current sensor reading</li>
                 <li><code>GET /api/sensor/{sensor_id}/stats</code> - Get sensor statistics</li>
             </ul>
@@ -677,21 +618,31 @@ def home():
         </div>
 
         <h2>ESP32 Integration Example</h2>
-        <pre><code>// Example Arduino/ESP32 code
+        <pre><code>// Example Arduino/ESP32 code (JSON version)
 #include &lt;WiFi.h&gt;
 #include &lt;HTTPClient.h&gt;
+#include &lt;ArduinoJson.h&gt;
 
 void sendSensorData() {
     HTTPClient http;
     http.begin("https://your-api-url.com/api/sensor/data");
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.addHeader("Content-Type", "application/json");
     
-    String postData = "sensorID=321&timestamp=2025-01-01 12:00:00";
-    postData += "&co2=0.20405&methane=0.96845&ammonia=0.08162";
-    postData += "&temperature=25.6&humidity=40.8";
-    postData += "&apiUserID=12322&apiPass=12333";
+    DynamicJsonDocument doc(1024);
+    doc["sensorID"] = "321";
+    doc["timestamp"] = "2025-01-01 12:00:00";
+    doc["co2"] = 0.20405;
+    doc["methane"] = 0.96845;
+    doc["ammonia"] = 0.08162;
+    doc["temperature"] = 25.6;
+    doc["humidity"] = 40.8;
+    doc["apiUserID"] = "12322";
+    doc["apiPass"] = "12333";
     
-    int httpResponseCode = http.POST(postData);
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    int httpResponseCode = http.POST(jsonString);
     
     if (httpResponseCode > 0) {
         String response = http.getString();
@@ -708,6 +659,8 @@ void sendSensorData() {
     </body>
     </html>
     """
+
+# ... (Keep all your existing endpoints as they were)
 
 @app.get("/health")
 def health():
