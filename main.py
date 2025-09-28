@@ -584,7 +584,63 @@ async def get_sensor_stats(sensor_id: str):
 # =============================================================================
 # DATA ENDPOINTS
 # =============================================================================
-# SHAP Hour endpoint@app.get("/shap_hour/{sensor_id}")
+@app.get("/explain/{sensor_id}")
+def explain(
+    sensor_id: str, 
+    sensor: str = Query(...),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """SHAP explanation with date range filtering"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        
+        if df.empty or len(df) < 10:
+            return JSONResponse({"error": "Not enough data"})
+        
+        df_filtered = filter_by_date_range(df, range)
+        
+        if df_filtered.empty or len(df_filtered) < 5:
+            return JSONResponse({"error": f"Not enough data after applying {range} filter"})
+        
+        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
+        agg = df_filtered.groupby("hour")["value"].mean().reset_index()
+        
+        if len(agg) < 3:
+            return JSONResponse({"error": "Insufficient hourly data after filtering"})
+        
+        X = agg[["hour"]]
+        y = agg["value"]
+        
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        model.fit(X, y)
+        
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        
+        buf = io.BytesIO()
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values, X, show=False)
+        plt.title(f"SHAP Summary - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": range,
+            "shap_values": shap_values.tolist(),
+            "features": X.to_dict(orient="records"),
+            "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
+        }
+        
+    except Exception as e:
+        logger.error(f"SHAP explanation error: {e}")
+        return JSONResponse({"error": str(e)})
+
+@app.get("/shap_hour/{sensor_id}")
 def shap_hour(
     sensor_id: str, 
     sensor: str = Query(...),
@@ -598,7 +654,6 @@ def shap_hour(
         if df.empty:
             return JSONResponse({"error": "No data"})
         
-        # Apply date range filter
         df_filtered = filter_by_date_range(df, range)
         
         if df_filtered.empty:
@@ -608,7 +663,6 @@ def shap_hour(
         agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
         agg = agg.rename(columns={'mean': 'value'})
         
-        # Generate hourly analysis plot
         buf = io.BytesIO()
         plt.figure(figsize=(10, 6))
         
