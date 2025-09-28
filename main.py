@@ -1145,6 +1145,7 @@ def shap_hour(
     except Exception as e:
         logger.error(f"SHAP hour analysis error: {e}")
         return JSONResponse({"error": str(e)})
+# Add these missing imports and functions to your code
 
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
@@ -1159,6 +1160,7 @@ def performance_metrics(
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
         
+        # Apply date range filter
         df_filtered = filter_by_date_range(df, range)
         
         if df_filtered.empty or len(df_filtered) < 10:
@@ -1170,6 +1172,7 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Create classification dataset using filtered data
         df_class = create_classification_labels(df_filtered, sensor)
         if df_class.empty:
             return {
@@ -1180,6 +1183,7 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Check class distribution
         class_distribution = df_class['class'].value_counts()
         if len(class_distribution) < 2:
             return {
@@ -1190,6 +1194,7 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Ensure each class has at least 2 samples
         min_samples_per_class = 2
         valid_classes = class_distribution[class_distribution >= min_samples_per_class].index
         if len(valid_classes) < 2:
@@ -1203,6 +1208,7 @@ def performance_metrics(
         
         df_class = df_class[df_class['class'].isin(valid_classes)]
         
+        # Create features (using lag features for time series)
         df_lags = make_lag_features(df_class, lags=2)
         if df_lags.empty or len(df_lags) < 5:
             return {
@@ -1213,10 +1219,12 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Prepare features and target
         feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
         X = df_lags[feature_cols]
         y = df_lags['class']
         
+        # Encode labels
         le = LabelEncoder()
         y_encoded = le.fit_transform(y)
         classes = le.classes_.tolist()
@@ -1230,14 +1238,17 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Adjust test_size and cv_folds based on data size
         n_samples = len(X)
-        actual_test_size = min(test_size, 0.3)
-        actual_cv_folds = min(cv_folds, max(2, n_samples // 3))
+        actual_test_size = min(test_size, 0.3)  # Cap at 30%
+        actual_cv_folds = min(cv_folds, max(2, n_samples // 3))  # Adaptive CV folds
         
+        # Split data with stratification
         X_train, X_test, y_train, y_test = train_test_split(
             X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
         )
         
+        # Check if we have enough training data
         if len(X_train) < 5:
             return {
                 "error": f"Insufficient training data after {range} filter: {len(X_train)} samples. Need at least 5.", 
@@ -1247,12 +1258,14 @@ def performance_metrics(
                 "status": "error"
             }
         
+        # Scale features
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
         results = {}
         
+        # Simplified hyperparameter grids for small datasets
         simple_hyperparam_grids = {
             'xgboost': {
                 'n_estimators': [30, 50],
@@ -1276,7 +1289,7 @@ def performance_metrics(
             }
         }
         
-        # XGBoost Classifier
+        # 1. XGBoost Classifier with simplified tuning
         try:
             xgb_clf = xgb.XGBClassifier(random_state=42, eval_metric='logloss')
             grid_search_xgb = GridSearchCV(
@@ -1296,7 +1309,7 @@ def performance_metrics(
             logger.error(f"XGBoost tuning failed: {e}")
             results['XGBoost'] = {'error': str(e)}
         
-        # Random Forest Classifier
+        # 2. Random Forest Classifier with simplified tuning
         try:
             rf_clf = RandomForestClassifier(random_state=42)
             grid_search_rf = GridSearchCV(
@@ -1316,7 +1329,7 @@ def performance_metrics(
             logger.error(f"Random Forest tuning failed: {e}")
             results['RandomForest'] = {'error': str(e)}
         
-        # Logistic Regression
+        # 3. Logistic Regression (most stable for small datasets)
         try:
             lr_clf = LogisticRegression(random_state=42, max_iter=1000)
             grid_search_lr = GridSearchCV(
@@ -1386,17 +1399,23 @@ def confusion_matrix_chart(
     cv_folds: int = Query(3, description="CV folds"),
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Generate confusion matrix chart for best performing algorithm with date range filtering"""
+    """
+    Generate confusion matrix chart for best performing algorithm with date range filtering
+    """
     try:
+        # Call the performance_metrics function to get the data
         perf_response = performance_metrics(sensor_id, sensor, test_size, cv_folds, range)
         
+        # Check if performance endpoint returned an error
         if "error" in perf_response:
             error_msg = perf_response["error"]
             return error_image(f"Performance metrics error: {error_msg}")
         
+        # Check if we have successful algorithms
         if "algorithms" not in perf_response:
             return error_image("No algorithms data available")
         
+        # Find the best algorithm that actually has metrics
         best_algo = None
         for algo_name, algo_data in perf_response["algorithms"].items():
             if "metrics" in algo_data and "error" not in algo_data:
@@ -1408,21 +1427,26 @@ def confusion_matrix_chart(
         
         metrics = perf_response["algorithms"][best_algo]["metrics"]
         
+        # Check if we have confusion matrix data
         if "confusion_matrix" not in metrics or "classes" not in metrics:
             return error_image("No confusion matrix data available")
         
         conf_matrix = np.array(metrics["confusion_matrix"])
         classes = metrics["classes"]
         
+        # Check if we have at least 2 classes
         if len(classes) < 2:
             return error_image(f"Need at least 2 classes for confusion matrix. Found: {classes}")
         
+        # Check if confusion matrix is valid
         if conf_matrix.size == 0 or conf_matrix.shape[0] != len(classes):
             return error_image("Invalid confusion matrix dimensions")
         
+        # Plot confusion matrix
         buf = io.BytesIO()
         plt.figure(figsize=(8, 6))
         
+        # Create the confusion matrix plot
         plt.imshow(conf_matrix, interpolation="nearest", cmap=plt.cm.Blues, alpha=0.7)
         plt.title(f"Confusion Matrix - {best_algo}\n(Sensor: {sensor}, Date Range: {range})", fontsize=14, pad=20)
         plt.colorbar()
@@ -1431,7 +1455,8 @@ def confusion_matrix_chart(
         plt.xticks(tick_marks, classes, rotation=45, ha='right')
         plt.yticks(tick_marks, classes)
 
-        cm_normalized = conf_matrix.astype("float") / np.maximum(conf_matrix.sum(axis=1)[:, np.newaxis], 1)
+        # Normalize and add text annotations
+        cm_normalized = conf_matrix.astype("float") / np.maximum(conf_matrix.sum(axis=1)[:, np.newaxis], 1)  # Avoid division by zero
         thresh = conf_matrix.max() / 2.
         
         for i in range(conf_matrix.shape[0]):
@@ -1449,6 +1474,7 @@ def confusion_matrix_chart(
         plt.xlabel("Predicted Label", fontsize=12)
         plt.tight_layout()
         
+        # Add some additional info
         accuracy = metrics.get("accuracy", 0)
         plt.figtext(0.5, 0.01, f"Accuracy: {accuracy:.2%} | Date Range: {range}", ha="center", fontsize=10, 
                    bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
@@ -1460,8 +1486,7 @@ def confusion_matrix_chart(
 
     except Exception as e:
         logger.error(f"Confusion matrix error: {e}")
-        return error_image(f"Error generating confusion matrix: {str(e)}")
-        
+        return error_image(f"Error generating confusion matrix: {str(e)}")      
 # Run the application
 if __name__ == "__main__":
     import uvicorn
