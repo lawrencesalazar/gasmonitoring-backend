@@ -1163,257 +1163,7 @@ def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, class
             "confusion_matrix": [],
             "classes": classes
         }
-
-@app.get("/performance/{sensor_id}")
-def performance_metrics(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type"),
-    test_size: float = Query(0.2, description="Test set size ratio"),
-    cv_folds: int = Query(3, description="Cross-validation folds"),
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
-):
-    """Get performance metrics for different classifiers with hyperparameter tuning and date range filtering"""
-    try:
-        logger.info(f"Starting performance metrics for sensor {sensor_id}, type {sensor}, range {range}")
-        
-        # Step 1: Fetch and preprocess data
-        records = fetch_sensor_history(sensor_id)
-        logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
-        
-        if not records:
-            return {
-                "error": f"No data found for sensor {sensor_id}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        df = preprocess_dataframe(records, sensor)
-        logger.info(f"Preprocessed dataframe shape: {df.shape}")
-        
-        if df.empty:
-            return {
-                "error": f"No valid data for sensor {sensor_id} and type {sensor}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 2: Filter by date range
-        df_filtered = filter_by_date_range(df, range)
-        logger.info(f"After date filtering shape: {df_filtered.shape}")
-        
-        if df_filtered.empty or len(df_filtered) < 10:
-            return {
-                "error": f"Not enough data for performance analysis after {range} filter. Need at least 10 samples, got {len(df_filtered)}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 3: Create classification labels
-        df_class = create_classification_labels(df_filtered, sensor)
-        logger.info(f"Classification labels created. Shape: {df_class.shape if not df_class.empty else 'empty'}")
-        
-        if df_class.empty:
-            return {
-                "error": f"Failed to create classification labels - insufficient class diversity after {range} filter", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 4: Check class distribution
-        class_distribution = df_class['class'].value_counts()
-        logger.info(f"Class distribution: {class_distribution.to_dict()}")
-        
-        if len(class_distribution) < 2:
-            return {
-                "error": f"Need at least 2 classes for classification after {range} filter. Found only: {class_distribution.to_dict()}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        min_samples_per_class = 2
-        valid_classes = class_distribution[class_distribution >= min_samples_per_class].index.tolist()
-        logger.info(f"Valid classes with min {min_samples_per_class} samples: {valid_classes}")
-        
-        if len(valid_classes) < 2:
-            return {
-                "error": f"Need at least 2 classes with minimum {min_samples_per_class} samples each after {range} filter. Current distribution: {class_distribution.to_dict()}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        df_class = df_class[df_class['class'].isin(valid_classes)]
-        logger.info(f"After filtering valid classes shape: {df_class.shape}")
-        
-        # Step 5: Create lag features
-        df_lags = make_lag_features(df_class, lags=2)
-        logger.info(f"After creating lag features shape: {df_lags.shape}")
-        
-        if df_lags.empty or len(df_lags) < 5:
-            return {
-                "error": f"Insufficient data after feature engineering with {range} filter. Need at least 5 samples, got {len(df_lags)}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 6: Prepare features and target
-        feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
-        X = df_lags[feature_cols]
-        y = df_lags['class']
-        
-        logger.info(f"Feature matrix shape: {X.shape}")
-        logger.info(f"Target distribution: {y.value_counts().to_dict()}")
-        
-        # Step 7: Encode labels
-        le = LabelEncoder()
-        y_encoded = le.fit_transform(y)
-        classes = le.classes_.tolist()
-        
-        logger.info(f"Encoded classes: {classes}")
-        
-        if len(classes) < 2:
-            return {
-                "error": f"Need at least 2 classes for classification after {range} filter. Found: {classes}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 8: Split data
-        n_samples = len(X)
-        actual_test_size = min(test_size, 0.3)
-        actual_cv_folds = min(cv_folds, max(2, n_samples // 3))
-        
-        logger.info(f"Data split - total: {n_samples}, test_size: {actual_test_size}, cv_folds: {actual_cv_folds}")
-        
-        try:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
-            )
-        except ValueError as e:
-            logger.error(f"Train-test split failed: {e}")
-            return {
-                "error": f"Data splitting failed: {str(e)}", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        logger.info(f"Training set: {X_train.shape}, Test set: {X_test.shape}")
-        
-        if len(X_train) < 5:
-            return {
-                "error": f"Insufficient training data after {range} filter: {len(X_train)} samples. Need at least 5.", 
-                "sensor_id": sensor_id, 
-                "sensor_type": sensor,
-                "date_range": range,
-                "status": "error"
-            }
-        
-        # Step 9: Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        results = {}
-        
-        # Step 10: Train and evaluate models
-        models_to_try = [
-            ('XGBoost', xgb.XGBClassifier(random_state=42, eval_metric='logloss', n_estimators=50)),
-            ('RandomForest', RandomForestClassifier(random_state=42, n_estimators=50)),
-            ('LogisticRegression', LogisticRegression(random_state=42, max_iter=1000))
-        ]
-        
-        for model_name, model in models_to_try:
-            try:
-                logger.info(f"Training {model_name}...")
-                
-                if model_name == 'LogisticRegression':
-                    # Use scaled features for Logistic Regression
-                    model.fit(X_train_scaled, y_train)
-                    y_pred = model.predict(X_test_scaled)
-                else:
-                    # Use original features for tree-based models
-                    model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-                
-                metrics = compute_classification_metrics(y_test, y_pred, classes)
-                
-                results[model_name] = {
-                    'metrics': metrics
-                }
-                
-                logger.info(f"{model_name} trained successfully. Accuracy: {metrics['accuracy']:.3f}")
-                
-            except Exception as e:
-                logger.error(f"{model_name} failed: {str(e)}")
-                results[model_name] = {'error': str(e)}
-        
-        # Step 11: Determine best algorithm
-        successful_models = {k: v for k, v in results.items() if 'metrics' in v and 'error' not in v}
-        
-        if successful_models:
-            best_algorithm = max(successful_models.keys(), 
-                               key=lambda x: successful_models[x]['metrics']['f1_score'])
-            best_score = successful_models[best_algorithm]['metrics']['f1_score']
-            logger.info(f"Best algorithm: {best_algorithm} with F1 score: {best_score:.3f}")
-        else:
-            best_algorithm = "No successful models"
-            best_score = 0
-            logger.warning("No models trained successfully")
-        
-        # Step 12: Prepare final response
-        response = {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "date_range": range,
-            "dataset_info": {
-                "total_samples": len(df_lags),
-                "training_samples": len(X_train),
-                "test_samples": len(X_test),
-                "feature_count": len(feature_cols),
-                "classes": classes,
-                "class_distribution": dict(df_lags['class'].value_counts()),
-                "original_data_points": len(df),
-                "filtered_data_points": len(df_filtered),
-                "date_range_applied": range
-            },
-            "algorithms": results,
-            "best_algorithm": best_algorithm,
-            "best_score": float(best_score),
-            "test_size_used": actual_test_size,
-            "cv_folds_used": actual_cv_folds,
-            "status": "success"
-        }
-        
-        logger.info(f"Performance metrics completed successfully for sensor {sensor_id}")
-        return response
-        
-    except Exception as e:
-        logger.error(f"Performance metrics error: {str(e)}", exc_info=True)
-        return {
-            "error": f"Internal server error: {str(e)}", 
-            "sensor_id": sensor_id, 
-            "sensor_type": sensor,
-            "date_range": range,
-            "status": "error"
-        }
-        
+      
 @app.get("/confusion_matrix/{sensor_id}")
 def confusion_matrix_chart(
     sensor_id: str,
@@ -1511,411 +1261,379 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
-
-def train_test_split_validation(X, y, test_size, feature_names):
-    """Train-test split validation with detailed metrics"""
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, shuffle=False
-        )
-        
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42
-        )
-        
-        model.fit(X_train, y_train)
-        
-        # Predictions
-        y_pred_train = model.predict(X_train)
-        y_pred_test = model.predict(X_test)
-        
-        # Calculate metrics
-        train_metrics = calculate_regression_metrics(y_train, y_pred_train, "train")
-        test_metrics = calculate_regression_metrics(y_test, y_pred_test, "test")
-        
-        # Feature importance
-        feature_importance = dict(zip(feature_names, model.feature_importances_))
-        
-        # Prediction vs Actual comparison
-        comparison = []
-        for i, (actual, pred) in enumerate(zip(y_test[:10], y_pred_test[:10])):  # First 10 examples
-            comparison.append({
-                "index": i,
-                "actual": float(actual),
-                "predicted": float(pred),
-                "error": float(abs(actual - pred)),
-                "error_percentage": float(abs((actual - pred) / actual) * 100) if actual != 0 else 0
-            })
-        
-        return {
-            "train_metrics": train_metrics,
-            "test_metrics": test_metrics,
-            "feature_importance": feature_importance,
-            "prediction_comparison": comparison,
-            "overfitting_gap": train_metrics["rmse"] - test_metrics["rmse"]
-        }
-        
-    except Exception as e:
-        logger.error(f"Train-test split validation failed: {e}")
-        return {"error": str(e)}
-
-def cross_validation(X, y, cv_folds=5):
-    """Cross-validation with detailed metrics"""
-    try:
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=100,
-            random_state=42
-        )
-        
-        # Perform cross-validation
-        cv_scores = {
-            'neg_mean_squared_error': cross_val_score(model, X, y, cv=cv_folds, scoring='neg_mean_squared_error'),
-            'neg_mean_absolute_error': cross_val_score(model, X, y, cv=cv_folds, scoring='neg_mean_absolute_error'),
-            'r2': cross_val_score(model, X, y, cv=cv_folds, scoring='r2')
-        }
-        
-        # Calculate statistics
-        cv_results = {}
-        for metric, scores in cv_scores.items():
-            if 'neg' in metric:
-                # Convert negative MSE/MAE to positive
-                positive_scores = -scores
-                cv_results[metric.replace('neg_', '')] = {
-                    "fold_scores": positive_scores.tolist(),
-                    "mean": float(np.mean(positive_scores)),
-                    "std": float(np.std(positive_scores)),
-                    "min": float(np.min(positive_scores)),
-                    "max": float(np.max(positive_scores))
-                }
-            else:
-                cv_results[metric] = {
-                    "fold_scores": scores.tolist(),
-                    "mean": float(np.mean(scores)),
-                    "std": float(np.std(scores)),
-                    "min": float(np.min(scores)),
-                    "max": float(np.max(scores))
-                }
-        
-        return {
-            "cv_folds": cv_folds,
-            "scores": cv_results,
-            "consistency_score": 1 - (cv_results['r2']['std'] / max(0.001, cv_results['r2']['mean']))
-        }
-        
-    except Exception as e:
-        logger.error(f"Cross-validation failed: {e}")
-        return {"error": str(e)}
-
-def walk_forward_validation(df, feature_cols, steps=5):
-    """Walk-forward validation for time series data"""
-    try:
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=100,
-            random_state=42
-        )
-        
-        X = df[feature_cols].values
-        y = df["value"].values
-        
-        # Use expanding window approach
-        train_size = len(X) - steps
-        forecasts = []
-        actuals = []
-        
-        for i in range(steps):
-            # Split data
-            X_train = X[:train_size + i]
-            y_train = y[:train_size + i]
-            X_test = X[train_size + i:train_size + i + 1]
-            y_test = y[train_size + i:train_size + i + 1]
-            
-            if len(X_test) == 0:
-                break
-                
-            # Train and predict
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            
-            forecasts.append(float(y_pred[0]))
-            actuals.append(float(y_test[0]))
-        
-        # Calculate walk-forward metrics
-        if len(forecasts) > 0:
-            wf_metrics = calculate_regression_metrics(np.array(actuals), np.array(forecasts), "walk_forward")
-            
-            # Forecast accuracy by step
-            step_accuracy = []
-            for i, (actual, forecast) in enumerate(zip(actuals, forecasts)):
-                step_accuracy.append({
-                    "step": i + 1,
-                    "actual": actual,
-                    "forecast": forecast,
-                    "absolute_error": abs(actual - forecast),
-                    "percentage_error": abs((actual - forecast) / actual) * 100 if actual != 0 else 0
-                })
-            
-            return {
-                "metrics": wf_metrics,
-                "step_accuracy": step_accuracy,
-                "forecast_stability": np.std(forecasts) / max(0.001, np.mean(forecasts))
-            }
-        else:
-            return {"error": "Insufficient data for walk-forward validation"}
-            
-    except Exception as e:
-        logger.error(f"Walk-forward validation failed: {e}")
-        return {"error": str(e)}
-
-def future_prediction_with_confidence(df, feature_cols, sensor_type, days=7):
-    """Future predictions with confidence intervals"""
-    try:
-        X = df[feature_cols].values
-        y = df["value"].values
-        
-        model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=100,
-            random_state=42
-        )
-        
-        model.fit(X, y)
-        
-        # Generate future predictions
-        last_features = X[-1].copy()
-        forecasts = []
-        confidence_intervals = []
-        
-        for day in range(days):
-            # Predict next value
-            next_pred = model.predict(last_features.reshape(1, -1))[0]
-            
-            # Simple confidence interval based on recent error
-            recent_errors = np.abs(y[-10:] - model.predict(X[-10:]))
-            confidence_margin = np.std(recent_errors) if len(recent_errors) > 1 else 0.1 * next_pred
-            
-            forecast_date = df["timestamp"].iloc[-1] + timedelta(days=day + 1)
-            
-            forecasts.append({
-                "date": forecast_date.strftime("%Y-%m-%d"),
-                "predicted_value": float(next_pred),
-                "confidence_lower": float(next_pred - confidence_margin),
-                "confidence_upper": float(next_pred + confidence_margin),
-                "confidence_interval": float(confidence_margin),
-                "recommendation": generate_recommendation(sensor_type, float(next_pred))
-            })
-            
-            # Update features for next prediction (shift window)
-            last_features = np.roll(last_features, -1)
-            last_features[-1] = next_pred
-        
-        return {
-            "forecast_horizon": days,
-            "predictions": forecasts,
-            "confidence_level": "estimated based on recent prediction errors",
-            "last_actual_value": float(y[-1]),
-            "last_actual_date": df["timestamp"].iloc[-1].strftime("%Y-%m-%d")
-        }
-        
-    except Exception as e:
-        logger.error(f"Future prediction failed: {e}")
-        return {"error": str(e)}
-def calculate_regression_metrics(y_true, y_pred, dataset_type):
-    """Calculate comprehensive regression metrics"""
-    try:
-        mse = mean_squared_error(y_true, y_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_true, y_pred)
-        r2 = r2_score(y_true, y_pred)
-        
-        # Additional metrics
-        mape = np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), 1e-8))) * 100
-        max_error = np.max(np.abs(y_true - y_pred))
-        
-        # Accuracy percentage (1 - normalized RMSE)
-        range_y = np.max(y_true) - np.min(y_true)
-        accuracy_percentage = max(0, (1 - (rmse / max(range_y, 1e-8))) * 100)
-        
-        return {
-            "dataset": dataset_type,
-            "mse": float(mse),
-            "rmse": float(rmse),
-            "mae": float(mae),
-            "r2_score": float(r2),
-            "mape": float(mape),
-            "max_error": float(max_error),
-            "accuracy_percentage": float(accuracy_percentage),
-            "samples": len(y_true)
-        }
-    except Exception as e:
-        logger.error(f"Metrics calculation failed: {e}")
-        return {"error": str(e)}
-
-def assess_prediction_accuracy(results):
-    """Assess overall prediction accuracy across all validation methods"""
-    try:
-        accuracy_scores = []
-        consistency_scores = []
-        
-        # Collect accuracy from different methods
-        if "train_test_split" in results and "error" not in results["train_test_split"]:
-            test_r2 = results["train_test_split"]["test_metrics"]["r2_score"]
-            accuracy_scores.append(max(0, test_r2))
-        
-        if "cross_validation" in results and "error" not in results["cross_validation"]:
-            cv_r2_mean = results["cross_validation"]["scores"]["r2"]["mean"]
-            accuracy_scores.append(max(0, cv_r2_mean))
-            consistency_scores.append(results["cross_validation"]["consistency_score"])
-        
-        if "walk_forward_validation" in results and "error" not in results["walk_forward_validation"]:
-            wf_r2 = results["walk_forward_validation"]["metrics"]["r2_score"]
-            accuracy_scores.append(max(0, wf_r2))
-        
-        if accuracy_scores:
-            overall_accuracy = np.mean(accuracy_scores)
-            consistency = np.mean(consistency_scores) if consistency_scores else 1.0
-            
-            # Accuracy assessment
-            if overall_accuracy >= 0.9:
-                accuracy_level = "Excellent"
-                confidence = "Very High"
-            elif overall_accuracy >= 0.7:
-                accuracy_level = "Good"
-                confidence = "High"
-            elif overall_accuracy >= 0.5:
-                accuracy_level = "Moderate"
-                confidence = "Medium"
-            else:
-                accuracy_level = "Low"
-                confidence = "Low"
-            
-            return {
-                "overall_accuracy_score": float(overall_accuracy),
-                "accuracy_level": accuracy_level,
-                "prediction_confidence": confidence,
-                "consistency_score": float(consistency),
-                "validation_methods_used": len(accuracy_scores),
-                "recommendation": f"Model shows {accuracy_level.lower()} accuracy with {confidence.lower()} confidence for predictions"
-            }
-        else:
-            return {
-                "overall_accuracy_score": 0.0,
-                "accuracy_level": "Unknown",
-                "prediction_confidence": "Low",
-                "consistency_score": 0.0,
-                "validation_methods_used": 0,
-                "recommendation": "Insufficient data for accuracy assessment"
-            }
-            
-    except Exception as e:
-        logger.error(f"Accuracy assessment failed: {e}")
-        return {"error": str(e)}
-        
-
-@app.get("/xgboost_accuracy/{sensor_id}")
-def xgboost_accuracy_metrics(
+@app.get("/performance/{sensor_id}")
+def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
     test_size: float = Query(0.2, description="Test set size ratio"),
-    range: str = Query("1month", description="Date range"),
-    validation_method: str = Query("split", description="Validation method: split, cv, or walk_forward")
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Comprehensive XGBoost accuracy metrics with multiple validation methods"""
+    """Get XGBoost performance metrics with detailed accuracy analysis"""
     try:
-        logger.info(f"Starting XGBoost accuracy analysis for sensor {sensor_id}, type {sensor}")
+        logger.info(f"=== XGBOOST PERFORMANCE ANALYSIS ===")
+        logger.info(f"Sensor: {sensor_id}, Type: {sensor}, Range: {range}")
         
-        # Fetch and preprocess data
+        # Step 1: Fetch data
+        logger.info("Step 1: Fetching sensor history...")
         records = fetch_sensor_history(sensor_id)
+        logger.info(f"Fetched {len(records)} records")
+        
+        if not records:
+            return error_response("No data found for sensor", sensor_id, sensor, range)
+        
+        # Step 2: Check if sensor exists in data
+        first_record = records[0]
+        available_sensors = [k for k in first_record.keys() if k not in ['timestamp', 'sensorID', 'time', 'apiUserID', 'apiPass']]
+        logger.info(f"Available sensors: {available_sensors}")
+        
+        if sensor not in first_record:
+            return error_response(f"Sensor '{sensor}' not found. Available: {available_sensors}", sensor_id, sensor, range)
+        
+        # Step 3: Preprocess data
+        logger.info("Step 3: Preprocessing data...")
         df = preprocess_dataframe(records, sensor)
+        logger.info(f"Preprocessed data shape: {df.shape}")
         
-        if df.empty or len(df) < 10:
-            return {
-                "error": f"Not enough data for accuracy analysis. Need at least 10 samples, got {len(df)}",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+        if df.empty:
+            return error_response("No valid data after preprocessing", sensor_id, sensor, range)
         
+        # Step 4: Filter by date range
+        logger.info("Step 4: Filtering by date range...")
         df_filtered = filter_by_date_range(df, range)
+        logger.info(f"After date filtering: {df_filtered.shape}")
         
         if df_filtered.empty or len(df_filtered) < 10:
-            return {
-                "error": f"Not enough data after {range} filter. Need at least 10 samples, got {len(df_filtered)}",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return error_response(f"Not enough data after {range} filter. Need 10+, got {len(df_filtered)}", sensor_id, sensor, range)
         
-        # Create features
-        df_lags = make_lag_features(df_filtered, lags=3)
+        # Step 5: Create classification labels (binary for simplicity)
+        logger.info("Step 5: Creating binary classification labels...")
+        df_class = create_binary_classification_labels(df_filtered)
+        logger.info(f"Classification data shape: {df_class.shape}")
+        
+        if df_class.empty:
+            return error_response("Failed to create classification labels", sensor_id, sensor, range)
+        
+        # Step 6: Create features
+        logger.info("Step 6: Creating lag features...")
+        df_lags = make_lag_features_simple(df_class, lags=3)
+        logger.info(f"Features data shape: {df_lags.shape}")
+        
         if df_lags.empty or len(df_lags) < 5:
-            return {
-                "error": "Insufficient data after feature engineering",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return error_response("Insufficient data for feature engineering", sensor_id, sensor, range)
         
+        # Step 7: Prepare features and target
         feature_cols = [col for col in df_lags.columns if col.startswith('lag')]
-        X = df_lags[feature_cols].values
-        y = df_lags["value"].values
+        X = df_lags[feature_cols]
+        y = df_lags['class']
         
-        results = {}
+        logger.info(f"Features: {feature_cols}, Target distribution: {y.value_counts().to_dict()}")
         
-        # Method 1: Train-Test Split Validation
-        if validation_method in ["split", "all"]:
-            split_results = train_test_split_validation(X, y, test_size, feature_cols)
-            results["train_test_split"] = split_results
+        # Step 8: Encode labels
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y)
+        classes = le.classes_.tolist()
         
-        # Method 2: Cross-Validation
-        if validation_method in ["cv", "all"]:
-            cv_results = cross_validation(X, y, cv_folds=5)
-            results["cross_validation"] = cv_results
+        if len(classes) < 2:
+            return error_response("Need at least 2 classes for classification", sensor_id, sensor, range)
         
-        # Method 3: Walk-Forward Validation (Time Series)
-        if validation_method in ["walk_forward", "all"]:
-            wf_results = walk_forward_validation(df_lags, feature_cols)
-            results["walk_forward_validation"] = wf_results
+        # Step 9: Split data
+        n_samples = len(X)
+        actual_test_size = min(test_size, 0.3)
         
-        # Method 4: Future Prediction with Confidence Intervals
-        forecast_results = future_prediction_with_confidence(df_lags, feature_cols, sensor)
-        results["future_forecast"] = forecast_results
+        logger.info(f"Splitting data: {n_samples} samples, test_size: {actual_test_size}")
         
-        # Overall accuracy assessment
-        accuracy_assessment = assess_prediction_accuracy(results)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_encoded, test_size=actual_test_size, random_state=42, stratify=y_encoded
+        )
         
-        return {
+        if len(X_train) < 5:
+            return error_response("Insufficient training data", sensor_id, sensor, range)
+        
+        # Step 10: Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Step 11: Train XGBoost with multiple configurations
+        logger.info("Step 11: Training XGBoost models...")
+        xgboost_results = train_xgboost_models(X_train_scaled, X_test_scaled, y_train, y_test, feature_cols, classes)
+        
+        # Step 12: Generate accuracy proof metrics
+        accuracy_proof = generate_accuracy_proof(xgboost_results, X_test_scaled, y_test, classes)
+        
+        # Step 13: Prepare final response
+        response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
-            "validation_method": validation_method,
+            "algorithm": "XGBoost",
             "dataset_info": {
                 "total_samples": len(df_lags),
+                "training_samples": len(X_train),
+                "test_samples": len(X_test),
                 "features_used": feature_cols,
+                "classes": classes,
+                "class_distribution": dict(df_lags['class'].value_counts()),
                 "data_range": {
                     "start": df_lags["timestamp"].min().strftime("%Y-%m-%d"),
                     "end": df_lags["timestamp"].max().strftime("%Y-%m-%d")
                 }
             },
-            "accuracy_metrics": results,
-            "accuracy_assessment": accuracy_assessment,
+            "xgboost_results": xgboost_results,
+            "accuracy_proof": accuracy_proof,
+            "test_size_used": actual_test_size,
             "status": "success"
         }
         
-    except Exception as e:
-        logger.error(f"XGBoost accuracy analysis error: {str(e)}", exc_info=True)
-        return {
-            "error": f"Accuracy analysis failed: {str(e)}",
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "status": "error"
-        }
+        logger.info("=== XGBOOST PERFORMANCE ANALYSIS COMPLETED ===")
+        return response
         
+    except Exception as e:
+        logger.error(f"XGBoost performance analysis error: {str(e)}", exc_info=True)
+        return error_response(f"Analysis failed: {str(e)}", sensor_id, sensor, range)
+
+
+def train_xgboost_models(X_train, X_test, y_train, y_test, feature_names, classes):
+    """Train XGBoost with different configurations"""
+    results = {}
+    
+    # Configuration 1: Default XGBoost
+    try:
+        logger.info("Training default XGBoost...")
+        model1 = xgb.XGBClassifier(
+            random_state=42,
+            eval_metric='logloss',
+            n_estimators=100
+        )
+        model1.fit(X_train, y_train)
+        y_pred1 = model1.predict(X_test)
+        
+        results["default"] = {
+            "metrics": compute_classification_metrics_safe(y_test, y_pred1, classes),
+            "feature_importance": dict(zip(feature_names, model1.feature_importances_.tolist())),
+            "parameters": {
+                "n_estimators": 100,
+                "learning_rate": 0.3,
+                "max_depth": 6
+            }
+        }
+        logger.info("Default XGBoost trained successfully")
+    except Exception as e:
+        logger.error(f"Default XGBoost failed: {e}")
+        results["default"] = {"error": str(e)}
+    
+    # Configuration 2: Optimized for small datasets
+    try:
+        logger.info("Training optimized XGBoost...")
+        model2 = xgb.XGBClassifier(
+            random_state=42,
+            eval_metric='logloss',
+            n_estimators=50,
+            max_depth=4,
+            learning_rate=0.1,
+            subsample=0.8
+        )
+        model2.fit(X_train, y_train)
+        y_pred2 = model2.predict(X_test)
+        
+        results["optimized"] = {
+            "metrics": compute_classification_metrics_safe(y_test, y_pred2, classes),
+            "feature_importance": dict(zip(feature_names, model2.feature_importances_.tolist())),
+            "parameters": {
+                "n_estimators": 50,
+                "learning_rate": 0.1,
+                "max_depth": 4,
+                "subsample": 0.8
+            }
+        }
+        logger.info("Optimized XGBoost trained successfully")
+    except Exception as e:
+        logger.error(f"Optimized XGBoost failed: {e}")
+        results["optimized"] = {"error": str(e)}
+    
+    return results
+
+
+def generate_accuracy_proof(xgboost_results, X_test, y_test, classes):
+    """Generate comprehensive accuracy proof metrics"""
+    accuracy_proof = {}
+    
+    # Find the best configuration
+    best_config = None
+    best_score = -1
+    
+    for config_name, result in xgboost_results.items():
+        if "metrics" in result and "error" not in result:
+            score = result["metrics"]["f1_score"]
+            if score > best_score:
+                best_score = score
+                best_config = config_name
+    
+    if best_config:
+        best_result = xgboost_results[best_config]
+        
+        # Accuracy assessment
+        accuracy = best_result["metrics"]["accuracy"]
+        f1_score = best_result["metrics"]["f1_score"]
+        
+        if accuracy >= 0.9:
+            accuracy_level = "Excellent"
+            confidence = "Very High"
+        elif accuracy >= 0.8:
+            accuracy_level = "Very Good"
+            confidence = "High"
+        elif accuracy >= 0.7:
+            accuracy_level = "Good"
+            confidence = "Medium-High"
+        elif accuracy >= 0.6:
+            accuracy_level = "Fair"
+            confidence = "Medium"
+        else:
+            accuracy_level = "Needs Improvement"
+            confidence = "Low"
+        
+        # Feature importance analysis
+        top_features = sorted(
+            best_result["feature_importance"].items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:3]  # Top 3 features
+        
+        accuracy_proof = {
+            "best_configuration": best_config,
+            "accuracy_assessment": {
+                "accuracy_level": accuracy_level,
+                "confidence_level": confidence,
+                "accuracy_score": accuracy,
+                "f1_score": f1_score,
+                "interpretation": f"XGBoost shows {accuracy_level.lower()} accuracy with {confidence.lower()} confidence"
+            },
+            "key_metrics": {
+                "accuracy": best_result["metrics"]["accuracy"],
+                "precision": best_result["metrics"]["precision"],
+                "recall": best_result["metrics"]["recall"],
+                "f1_score": best_result["metrics"]["f1_score"]
+            },
+            "feature_analysis": {
+                "top_features": top_features,
+                "most_important_feature": top_features[0][0] if top_features else "None",
+                "feature_importance_summary": f"Model relies most on {top_features[0][0] if top_features else 'no specific features'}"
+            },
+            "performance_evidence": [
+                f"Accuracy: {accuracy:.1%} on test data",
+                f"F1 Score: {f1_score:.3f} (balanced metric)",
+                f"Top feature importance: {top_features[0][1]:.3f}" if top_features else "No feature importance data",
+                f"Confidence: {confidence} based on performance metrics"
+            ]
+        }
+    else:
+        accuracy_proof = {
+            "accuracy_assessment": {
+                "accuracy_level": "Failed",
+                "confidence_level": "None",
+                "accuracy_score": 0.0,
+                "interpretation": "XGBoost training failed on all configurations"
+            }
+        }
+    
+    return accuracy_proof
+
+
+def create_binary_classification_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Create simple binary classification labels based on median"""
+    if df.empty or len(df) < 5:
+        return pd.DataFrame()
+    
+    try:
+        df_class = df.copy()
+        
+        # Binary classification: above/below median
+        median_val = df_class['value'].median()
+        df_class['class'] = np.where(df_class['value'] > median_val, 'above_median', 'below_median')
+        
+        # Check if we have both classes
+        class_counts = df_class['class'].value_counts()
+        if len(class_counts) < 2:
+            return pd.DataFrame()
+        
+        return df_class
+        
+    except Exception as e:
+        logger.error(f"Error creating binary labels: {e}")
+        return pd.DataFrame()
+
+
+def make_lag_features_simple(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
+    """Create lag features safely"""
+    if df.empty:
+        return df
+    
+    try:
+        df_copy = df.copy()
+        for i in range(1, lags + 1):
+            df_copy[f"lag{i}"] = df_copy["value"].shift(i)
+        
+        # Drop rows with NaN values
+        df_copy = df_copy.dropna()
+        return df_copy
+    except Exception as e:
+        logger.error(f"Error creating lag features: {e}")
+        return pd.DataFrame()
+
+
+def compute_classification_metrics_safe(y_true, y_pred, classes):
+    """Safe computation of classification metrics"""
+    try:
+        if len(y_true) == 0 or len(y_pred) == 0:
+            return create_default_metrics(classes)
+        
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        
+        # Confusion matrix
+        try:
+            conf_matrix = confusion_matrix(y_true, y_pred).tolist()
+        except:
+            conf_matrix = [[0, 0], [0, 0]]
+        
+        return {
+            "accuracy": float(accuracy),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1_score": float(f1),
+            "confusion_matrix": conf_matrix,
+            "classes": classes,
+            "samples": len(y_true)
+        }
+    except Exception as e:
+        logger.error(f"Error computing metrics: {e}")
+        return create_default_metrics(classes)
+
+
+def create_default_metrics(classes):
+    """Create default metrics when computation fails"""
+    return {
+        "accuracy": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1_score": 0.0,
+        "confusion_matrix": [[0, 0], [0, 0]] if len(classes) == 2 else [[0]],
+        "classes": classes,
+        "samples": 0
+    }
+
+
+def error_response(message, sensor_id, sensor_type, date_range):
+    """Standard error response"""
+    return {
+        "error": message,
+        "sensor_id": sensor_id,
+        "sensor_type": sensor_type,
+        "date_range": date_range,
+        "status": "error"
+    }
 
 # Run the application
 if __name__ == "__main__":
