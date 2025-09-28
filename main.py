@@ -103,30 +103,37 @@ except Exception as e:
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-
 def fetch_sensor_history(sensor_id: str) -> List[Dict[str, Any]]:
     """Fetch sensor history from Firebase"""
     try:
+        logger.info(f"Fetching sensor history for {sensor_id}")
         ref = db.reference(f"history/{sensor_id}")
         snapshot = ref.get()
+        
         if not snapshot:
+            logger.warning(f"No data found for sensor {sensor_id}")
             return []
+        
         records = []
         for key, value in snapshot.items():
             if isinstance(value, dict):
                 row = value.copy()
                 if "timestamp" in row:
                     try:
+                        # Ensure timestamp is properly parsed
                         row["timestamp"] = pd.to_datetime(row["timestamp"])
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"Failed to parse timestamp for record {key}: {e}")
                         row["timestamp"] = None
                 records.append(row)
+        
         logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
         return records
+        
     except Exception as e:
-        logger.error(f"Error fetching sensor history: {e}")
+        logger.error(f"Error fetching sensor history for {sensor_id}: {e}")
         return []
-
+        
 def get_current_sensor_reading(sensor_id: str) -> Optional[Dict[str, Any]]:
     """Get current sensor reading from sensorReadings"""
     try:
@@ -147,27 +154,37 @@ def get_current_sensor_reading(sensor_id: str) -> Optional[Dict[str, Any]]:
 def preprocess_dataframe(records: List[Dict[str, Any]], sensor: str) -> pd.DataFrame:
     """Preprocess dataframe for analysis"""
     if not records:
+        logger.warning("No records to preprocess")
         return pd.DataFrame()
     
     try:
         df = pd.DataFrame(records)
+        logger.info(f"Created dataframe with columns: {df.columns.tolist()}")
+        
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
             df = df.sort_values("timestamp")
+            logger.info(f"Sorted by timestamp. Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
         
         if sensor not in df.columns:
+            logger.error(f"Sensor column '{sensor}' not found in dataframe. Available columns: {df.columns.tolist()}")
             return pd.DataFrame()
         
+        # Select only necessary columns and drop NaN
         df = df[["timestamp", sensor]].dropna()
         df = df.rename(columns={sensor: "value"})
+        
+        logger.info(f"Final preprocessed dataframe shape: {df.shape}")
         return df
+        
     except Exception as e:
         logger.error(f"Error preprocessing dataframe: {e}")
         return pd.DataFrame()
-
+  
 def filter_by_date_range(df: pd.DataFrame, date_range: str) -> pd.DataFrame:
     """Filter dataframe by date range"""
     if df.empty or "timestamp" not in df.columns:
+        logger.warning("Cannot filter empty dataframe or dataframe without timestamp")
         return df
     
     try:
@@ -183,15 +200,19 @@ def filter_by_date_range(df: pd.DataFrame, date_range: str) -> pd.DataFrame:
         }
         
         cutoff_date = date_filters.get(date_range, date_filters["1month"])
+        logger.info(f"Filtering data from {cutoff_date} for range {date_range}")
         
         if cutoff_date != datetime.min:
-            return df[df["timestamp"] >= cutoff_date]
+            filtered_df = df[df["timestamp"] >= cutoff_date]
+            logger.info(f"After filtering: {len(filtered_df)} records")
+            return filtered_df
         
         return df
+        
     except Exception as e:
         logger.error(f"Error filtering by date range: {e}")
         return df
-
+        
 def make_lag_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     """Create lag features for time series forecasting"""
     if df.empty:
@@ -647,63 +668,125 @@ def shap_hour(
 ):
     """SHAP hourly analysis with date range filtering"""
     try:
+        logger.info(f"Starting SHAP hour analysis for sensor {sensor_id}, type {sensor}, range {range}")
+        
+        # Step 1: Fetch data
         records = fetch_sensor_history(sensor_id)
+        logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
+        
+        if not records:
+            return {
+                "error": "No data found for sensor", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
+        
+        # Step 2: Preprocess dataframe
         df = preprocess_dataframe(records, sensor)
+        logger.info(f"Preprocessed dataframe shape: {df.shape}")
         
         if df.empty:
-            return {"error": "No data", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": "No valid data after preprocessing", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
+        # Step 3: Filter by date range
         df_filtered = filter_by_date_range(df, range)
+        logger.info(f"After date filtering shape: {df_filtered.shape}")
         
         if df_filtered.empty:
-            return {"error": f"No data after applying {range} filter", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": f"No data after applying {range} filter", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
         # Check if we have enough data after filtering
         if len(df_filtered) < 3:
-            return {"error": f"Not enough data after filtering. Need at least 3 records, got {len(df_filtered)}", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": f"Not enough data after filtering. Need at least 3 records, got {len(df_filtered)}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
-        # Create hour column and aggregate
-        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
-        agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
-        agg = agg.rename(columns={'mean': 'value'})
+        # Step 4: Create hour column and aggregate
+        try:
+            df_filtered["hour"] = df_filtered["timestamp"].dt.hour
+            agg = df_filtered.groupby("hour")["value"].agg(['mean', 'std', 'count']).reset_index()
+            agg = agg.rename(columns={'mean': 'value'})
+            logger.info(f"Aggregated data shape: {agg.shape}")
+        except Exception as e:
+            logger.error(f"Error in aggregation: {e}")
+            return {
+                "error": f"Data aggregation failed: {str(e)}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
         # Check if we have any aggregated data
         if agg.empty:
-            return {"error": "No hourly data available after aggregation", "sensor_id": sensor_id, "sensor_type": sensor}
+            return {
+                "error": "No hourly data available after aggregation", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
-        # Generate plot
-        buf = io.BytesIO()
-        plt.figure(figsize=(10, 6))
+        # Step 5: Generate plot
+        try:
+            buf = io.BytesIO()
+            plt.figure(figsize=(10, 6))
+            
+            # Plot main line
+            plt.plot(agg["hour"], agg["value"], marker='o', linewidth=2, label='Average Value')
+            
+            # Add standard deviation shading if available
+            if 'std' in agg.columns and not agg['std'].isna().all():
+                valid_hours = agg[~agg['std'].isna()]
+                if not valid_hours.empty:
+                    plt.fill_between(
+                        valid_hours["hour"], 
+                        valid_hours["value"] - valid_hours["std"], 
+                        valid_hours["value"] + valid_hours["std"], 
+                        alpha=0.2, 
+                        label='Standard Deviation'
+                    )
+            
+            plt.xlabel("Hour of Day")
+            plt.ylabel("Sensor Value")
+            plt.title(f"Hourly Analysis - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks(range(0, 24))
+            plt.tight_layout()
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            plt.close()
+            buf.seek(0)
+            
+            # Convert to base64
+            image_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+            logger.info("Plot generated successfully")
+            
+        except Exception as e:
+            logger.error(f"Plot generation failed: {e}")
+            return {
+                "error": f"Plot generation failed: {str(e)}", 
+                "sensor_id": sensor_id, 
+                "sensor_type": sensor,
+                "status": "error"
+            }
         
-        plt.plot(agg["hour"], agg["value"], marker='o', linewidth=2, label='Average Value')
-        if 'std' in agg.columns and not agg['std'].isna().all():
-            # Filter out NaN values for fill_between
-            valid_hours = agg[~agg['std'].isna()]
-            if not valid_hours.empty:
-                plt.fill_between(
-                    valid_hours["hour"], 
-                    valid_hours["value"] - valid_hours["std"], 
-                    valid_hours["value"] + valid_hours["std"], 
-                    alpha=0.2, 
-                    label='Standard Deviation'
-                )
-        
-        plt.xlabel("Hour of Day")
-        plt.ylabel("Sensor Value")
-        plt.title(f"Hourly Analysis - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(range(0, 24))
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close()
-        buf.seek(0)
-        
-        # Prepare response data
+        # Step 6: Prepare response
         hourly_data = agg.to_dict(orient="records")
-        image_data = base64.b64encode(buf.getvalue()).decode('utf-8')
         
-        return {
+        response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
@@ -714,14 +797,18 @@ def shap_hour(
             "hourly_points": len(hourly_data)
         }
         
+        logger.info(f"SHAP hour analysis completed successfully. Data points: {len(df_filtered)}")
+        return response
+        
     except Exception as e:
-        logger.error(f"SHAP hour analysis error: {e}")
+        logger.error(f"SHAP hour analysis error: {str(e)}", exc_info=True)
         return {
-            "error": str(e), 
+            "error": f"Internal server error: {str(e)}", 
             "sensor_id": sensor_id, 
             "sensor_type": sensor,
             "status": "error"
         }
+
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(
     sensor_id: str, 
