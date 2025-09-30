@@ -109,7 +109,7 @@ except Exception as e:
 # UTILITY FUNCTIONS
 # =============================================================================
 def fetch_sensor_history(sensor_id: str) -> List[Dict[str, Any]]:
-    """Fetch sensor history from Firebase"""
+    """Fetch sensor history from Firebase with robust timestamp parsing"""
     try:
         logger.info(f"Fetching sensor history for {sensor_id}")
         ref = db.reference(f"history/{sensor_id}")
@@ -120,36 +120,92 @@ def fetch_sensor_history(sensor_id: str) -> List[Dict[str, Any]]:
             return []
         
         records = []
+        valid_records = 0
+        error_records = 0
+        
         for key, value in snapshot.items():
             if isinstance(value, dict):
                 row = value.copy()
+                
+                # Robust timestamp parsing
                 if "timestamp" in row:
+                    timestamp_str = str(row["timestamp"]).strip()
+                    
+                    # Skip records with "Time Error" or other invalid timestamp strings
+                    if timestamp_str.lower() in ["time error", "error", "none", "null", "nan", ""]:
+                        error_records += 1
+                        continue
+                    
                     try:
-                        # Ensure timestamp is properly parsed
-                        row["timestamp"] = pd.to_datetime(row["timestamp"])
-                    except Exception as e:
-                        logger.warning(f"Failed to parse timestamp for record {key}: {e}")
-                        row["timestamp"] = None
-                records.append(row)
+                        # Try multiple datetime formats
+                        if timestamp_str.isdigit() and len(timestamp_str) == 10:
+                            # Unix timestamp (seconds)
+                            row["timestamp"] = datetime.fromtimestamp(int(timestamp_str))
+                        elif timestamp_str.isdigit() and len(timestamp_str) == 13:
+                            # Unix timestamp (milliseconds)
+                            row["timestamp"] = datetime.fromtimestamp(int(timestamp_str) / 1000)
+                        else:
+                            # Try ISO format or other common formats
+                            row["timestamp"] = pd.to_datetime(timestamp_str, errors='coerce')
+                            
+                            # Check if parsing was successful
+                            if pd.isna(row["timestamp"]):
+                                error_records += 1
+                                continue
+                                
+                        valid_records += 1
+                        records.append(row)
+                        
+                    except (ValueError, TypeError, OSError) as e:
+                        error_records += 1
+                        logger.debug(f"Failed to parse timestamp '{timestamp_str}' for record {key}: {e}")
+                        continue
+                else:
+                    # Record has no timestamp, skip it
+                    error_records += 1
+                    continue
         
-        logger.info(f"Fetched {len(records)} records for sensor {sensor_id}")
+        logger.info(f"Fetched {valid_records} valid records and skipped {error_records} invalid records for sensor {sensor_id}")
+        
+        # Sort by timestamp
+        if records:
+            records.sort(key=lambda x: x["timestamp"])
+            logger.info(f"Date range: {records[0]['timestamp']} to {records[-1]['timestamp']}")
+        
         return records
         
     except Exception as e:
         logger.error(f"Error fetching sensor history for {sensor_id}: {e}")
         return []
-        
+
 def get_current_sensor_reading(sensor_id: str) -> Optional[Dict[str, Any]]:
-    """Get current sensor reading from sensorReadings"""
+    """Get current sensor reading from sensorReadings with robust timestamp parsing"""
     try:
         ref = db.reference(f"sensorReadings/{sensor_id}")
         snapshot = ref.get()
         if snapshot and isinstance(snapshot, dict):
+            # Robust timestamp parsing for current reading
             if "timestamp" in snapshot:
-                try:
-                    snapshot["timestamp"] = pd.to_datetime(snapshot["timestamp"])
-                except Exception:
+                timestamp_str = str(snapshot["timestamp"]).strip()
+                
+                # Skip if timestamp is invalid
+                if timestamp_str.lower() in ["time error", "error", "none", "null", "nan", ""]:
+                    logger.warning(f"Invalid timestamp in current reading for sensor {sensor_id}: {timestamp_str}")
                     snapshot["timestamp"] = None
+                else:
+                    try:
+                        if timestamp_str.isdigit() and len(timestamp_str) == 10:
+                            snapshot["timestamp"] = datetime.fromtimestamp(int(timestamp_str))
+                        elif timestamp_str.isdigit() and len(timestamp_str) == 13:
+                            snapshot["timestamp"] = datetime.fromtimestamp(int(timestamp_str) / 1000)
+                        else:
+                            parsed_time = pd.to_datetime(timestamp_str, errors='coerce')
+                            if pd.isna(parsed_time):
+                                snapshot["timestamp"] = None
+                            else:
+                                snapshot["timestamp"] = parsed_time
+                    except (ValueError, TypeError, OSError):
+                        snapshot["timestamp"] = None
             return snapshot
         return None
     except Exception as e:
@@ -157,35 +213,53 @@ def get_current_sensor_reading(sensor_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 def preprocess_dataframe(records: List[Dict[str, Any]], sensor: str) -> pd.DataFrame:
-    """Preprocess dataframe for analysis"""
+    """Preprocess dataframe for analysis with robust data validation"""
     if not records:
         logger.warning("No records to preprocess")
         return pd.DataFrame()
     
     try:
-        df = pd.DataFrame(records)
-        logger.info(f"Created dataframe with columns: {df.columns.tolist()}")
+        # Filter out records with invalid timestamps or missing sensor data
+        valid_records = []
+        for record in records:
+            # Check if timestamp exists and is valid
+            if "timestamp" not in record or record["timestamp"] is None:
+                continue
+                
+            # Check if sensor data exists and is numeric
+            if sensor not in record:
+                continue
+                
+            try:
+                sensor_value = float(record[sensor])
+                # Skip NaN or infinite values
+                if not np.isfinite(sensor_value):
+                    continue
+                    
+                valid_records.append({
+                    "timestamp": record["timestamp"],
+                    "value": sensor_value
+                })
+            except (ValueError, TypeError):
+                continue
         
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-            df = df.sort_values("timestamp")
-            logger.info(f"Sorted by timestamp. Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-        
-        if sensor not in df.columns:
-            logger.error(f"Sensor column '{sensor}' not found in dataframe. Available columns: {df.columns.tolist()}")
+        if not valid_records:
+            logger.warning("No valid records after filtering")
             return pd.DataFrame()
+            
+        df = pd.DataFrame(valid_records)
+        df = df.sort_values("timestamp")
         
-        # Select only necessary columns and drop NaN
-        df = df[["timestamp", sensor]].dropna()
-        df = df.rename(columns={sensor: "value"})
+        logger.info(f"Final preprocessed dataframe: {len(df)} valid records")
+        logger.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        logger.info(f"Value range: {df['value'].min():.2f} to {df['value'].max():.2f}")
         
-        logger.info(f"Final preprocessed dataframe shape: {df.shape}")
         return df
         
     except Exception as e:
         logger.error(f"Error preprocessing dataframe: {e}")
         return pd.DataFrame()
-  
+        
 def filter_by_date_range(df: pd.DataFrame, date_range: str) -> pd.DataFrame:
     """Filter dataframe by date range"""
     if df.empty or "timestamp" not in df.columns:
@@ -468,10 +542,11 @@ def home():
 # ESP32 SENSOR ENDPOINTS
 # =============================================================================
 
+# Also update the ESP32 data reception endpoint to validate timestamps
 @app.post("/api/sensor/data")
 async def receive_sensor_data(request: Request):
     """
-    Receive sensor data from ESP32 devices and store in Firebase (JSON format)
+    Receive sensor data from ESP32 devices and store in Firebase with timestamp validation
     """
     try:
         data = await request.json()
@@ -484,6 +559,25 @@ async def receive_sensor_data(request: Request):
                     status_code=400,
                     content={"status": "error", "message": f"Missing required field: {field}"}
                 )
+        
+        # Validate and parse timestamp
+        timestamp_str = str(data['timestamp']).strip()
+        valid_timestamp = None
+        
+        try:
+            if timestamp_str.isdigit() and len(timestamp_str) == 10:
+                valid_timestamp = datetime.fromtimestamp(int(timestamp_str))
+            elif timestamp_str.isdigit() and len(timestamp_str) == 13:
+                valid_timestamp = datetime.fromtimestamp(int(timestamp_str) / 1000)
+            else:
+                valid_timestamp = pd.to_datetime(timestamp_str, errors='coerce')
+                if pd.isna(valid_timestamp):
+                    valid_timestamp = datetime.now()  # Fallback to current time
+        except (ValueError, TypeError, OSError):
+            valid_timestamp = datetime.now()  # Fallback to current time
+        
+        # Replace the timestamp with validated one
+        data['timestamp'] = valid_timestamp.isoformat()
         
         # Calculate risk index
         risk_index = calculate_risk_index(data)
@@ -524,7 +618,7 @@ async def receive_sensor_data(request: Request):
             status_code=500,
             content={"status": "error", "message": f"Internal server error: {str(e)}"}
         )
-
+        
 @app.get("/api/sensor/current/{sensor_id}")
 async def get_current_sensor_data(sensor_id: str):
     """
