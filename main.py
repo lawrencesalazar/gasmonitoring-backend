@@ -1261,23 +1261,35 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+ 
 
+# Updated endpoint
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
     test_size: float = Query(0.2, description="Test set size ratio"),
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+
+    # enable/disable grid search
+    use_grid_search: bool = Query(False, description="Enable Grid Search for hyperparameters (slower)"),
+
+    # optional manual overrides for grid
+    grid_n_estimators: str = Query("50,100", description="Comma-separated values for n_estimators"),
+    grid_max_depth: str = Query("3,4,5", description="Comma-separated values for max_depth"),
+    grid_learning_rate: str = Query("0.1,0.05", description="Comma-separated values for learning_rate"),
+    grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
+    grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
 ):
-    """Get XGBoost performance metrics"""
+    """Get XGBoost performance metrics with optional Grid Search"""
     try:
-        logger.info(f"=== STARTING XGBOOST PERFORMANCE ===")
-        
+        logger.info("=== STARTING XGBOOST PERFORMANCE ===")
+        logger.info(f"Fetching data for sensor_id={sensor_id} sensor={sensor}")
+
         # Step 1: Fetch data
-        logger.info(f"Step 1: Fetching data for sensor {sensor_id}")
         records = fetch_sensor_history(sensor_id)
         logger.info(f"Records fetched: {len(records)}")
-        
+
         if not records:
             return {
                 "error": f"No data found for sensor {sensor_id}",
@@ -1286,24 +1298,21 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 2: Check sensor exists
-        logger.info(f"Step 2: Checking sensor {sensor} exists")
-        sample_record = records[0]
+        # Step 2: Check sensor exists in sample
+        sample_record = records[0] if records else {}
         if sensor not in sample_record:
             available = [k for k in sample_record.keys() if k not in ['timestamp', 'sensorID', 'time']]
             return {
-                "error": f"Sensor {sensor} not found. Available: {available}",
+                "error": f"Sensor '{sensor}' not found. Available keys: {available}",
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
                 "status": "error"
             }
 
-        # Step 3: Preprocess data
-        logger.info("Step 3: Preprocessing dataframe")
+        # Step 3: Preprocess to dataframe
         df = preprocess_dataframe_simple(records, sensor)
-        logger.info(f"Preprocessed shape: {df.shape}")
-        
-        if df.empty:
+        logger.info(f"Preprocessed shape: {getattr(df, 'shape', None)}")
+        if df is None or df.empty:
             return {
                 "error": "No valid data after preprocessing",
                 "sensor_id": sensor_id,
@@ -1311,117 +1320,165 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 4: Filter by date
-        logger.info(f"Step 4: Filtering by range: {range}")
-        df_filtered = filter_by_date_range_simple(df, range)
-        logger.info(f"After filtering: {df_filtered.shape}")
-        
-        if len(df_filtered) < 5:
+        # Step 4: Filter by date_range
+        df_filtered = filter_by_date_range_simple(df, date_range)
+        logger.info(f"After filtering: {getattr(df_filtered, 'shape', None)}")
+        if df_filtered is None or len(df_filtered) < 5:
             return {
-                "error": f"Not enough data after filtering: {len(df_filtered)} records",
+                "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
                 "status": "error"
             }
 
-        # Step 5: Create binary labels
-        logger.info("Step 5: Creating binary labels")
+        # Step 5: Create binary labels (must produce two classes)
         df_binary = create_simple_binary_labels(df_filtered)
-        logger.info(f"Binary data shape: {df_binary.shape}")
-        
-        if df_binary.empty:
+        if df_binary is None or df_binary.empty:
             return {
-                "error": "Could not create binary classification labels",
+                "error": "Could not create binary labels (possibly single-class).",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+        classes_present = df_binary['class_binary'].unique().tolist()
+        logger.info(f"Classes present: {classes_present}")
+
+        # ensure we have at least two classes
+        if len(classes_present) < 2:
+            return {
+                "error": "Binary classification requires at least two classes in the data.",
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
                 "status": "error"
             }
 
-        # Step 6: Create features
-        logger.info("Step 6: Creating lag features")
+        # Step 6: Create lag features
         df_features = create_simple_lag_features(df_binary)
-        logger.info(f"Features shape: {df_features.shape}")
-        
-        if df_features.empty:
+        logger.info(f"Features shape: {getattr(df_features, 'shape', None)}")
+        if df_features is None or df_features.empty:
             return {
-                "error": "Could not create features",
+                "error": "Could not create features (likely because of insufficient rows for lags).",
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
                 "status": "error"
             }
 
         # Step 7: Prepare X and y
-        logger.info("Step 7: Preparing features and target")
         feature_cols = [col for col in df_features.columns if col.startswith('lag')]
-        X = df_features[feature_cols].values
-        y = df_features['class_binary'].values
-        
-        logger.info(f"X shape: {X.shape}, y unique: {np.unique(y)}")
-
-        # Step 8: Train-test split
-        logger.info("Step 8: Train-test split")
-        if len(X) < 10:
-            # Use all data for training if very small dataset
-            X_train, X_test, y_train, y_test = X, X, y, y
-        else:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=min(test_size, 0.3), random_state=42
-            )
-        
-        logger.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
-
-        # Step 9: Train simple XGBoost
-        logger.info("Step 9: Training XGBoost")
-        try:
-            model = xgb.XGBClassifier(
-                n_estimators=50,
-                max_depth=3,
-                learning_rate=0.1,
-                random_state=42
-            )
-            model.fit(X_train, y_train)
-            logger.info("XGBoost trained successfully")
-        except Exception as e:
-            logger.error(f"XGBoost training failed: {e}")
+        if not feature_cols:
             return {
-                "error": f"Model training failed: {str(e)}",
+                "error": "No lag features found. Make sure create_simple_lag_features produced columns starting with 'lag'.",
                 "sensor_id": sensor_id,
                 "sensor_type": sensor,
                 "status": "error"
             }
 
-        # Step 10: Evaluate model
-        logger.info("Step 10: Evaluating model")
-        y_pred = model.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
 
-        # Step 11: Prepare response
-        logger.info("Step 11: Preparing response")
+        logger.info(f"X shape: {X.shape}, y distribution: {np.bincount(y)}")
+
+        if X.size == 0 or len(y) == 0:
+            return {
+                "error": "Empty feature matrix or target vector",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            }
+
+        # Step 8: Train-test split (handle small datasets)
+        if len(X) < 10 or len(np.unique(y)) == 1:
+            # fallback: train and test on same small dataset (not ideal but avoids crash)
+            X_train, X_test, y_train, y_test = X, X, y, y
+            logger.warning("Very small dataset — using all data for train and test (no split).")
+        else:
+            safe_test_size = float(np.clip(test_size, 0.01, 0.3))
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=safe_test_size, random_state=42, stratify=y if len(np.unique(y))>1 else None
+            )
+
+        logger.info(f"Train shape: {getattr(X_train,'shape',None)}, Test shape: {getattr(X_test,'shape',None)}")
+
+        # Step 9: Train XGBoost with hyperparameters
+      if use_grid_search:
+            logger.info("Running Grid Search for XGBoost...")
+
+            # Build parameter grid from query strings
+            param_grid = {
+                "n_estimators": [int(x) for x in grid_n_estimators.split(",")],
+                "max_depth": [int(x) for x in grid_max_depth.split(",")],
+                "learning_rate": [float(x) for x in grid_learning_rate.split(",")],
+                "subsample": [float(x) for x in grid_subsample.split(",")],
+                "colsample_bytree": [float(x) for x in grid_colsample_bytree.split(",")]
+            }
+
+            base_model = xgb.XGBClassifier(
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+
+            try:
+                grid_search = GridSearchCV(
+                    estimator=base_model,
+                    param_grid=param_grid,
+                    scoring="f1_weighted",
+                    cv=3,
+                    n_jobs=-1,
+                    verbose=1
+                )
+                grid_search.fit(X_train, y_train)
+                model = grid_search.best_estimator_
+                best_params = grid_search.best_params_
+                logger.info(f"Grid Search best params: {best_params}")
+            except Exception as e:
+                logger.exception("Grid Search failed")
+                return {
+                    "error": f"Grid Search failed: {str(e)}",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                }
+        else:
+            # Default training (fast)
+            model = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                subsample=1.0,
+                colsample_bytree=1.0,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+            model.fit(X_train, y_train)
+            best_params = model.get_params()
+
+        # --- evaluation (same as before) ---
+        y_pred = model.predict(X_test)
+
+        accuracy = float(accuracy_score(y_test, y_pred))
+        precision = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
+        recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
+        f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
+
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "date_range": range,
-            "algorithm": "XGBoost",
+            "date_range": date_range,
+            "algorithm": "XGBoost (Grid Search)" if use_grid_search else "XGBoost",
             "performance_metrics": {
-                "accuracy": float(accuracy),
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1_score": float(f1),
-                "test_samples": len(y_test)
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "test_samples": int(len(y_test))
             },
-            "model_info": {
-                "n_estimators": 50,
-                "max_depth": 3,
-                "learning_rate": 0.1
-            },
+            "best_hyperparameters": best_params,
             "data_info": {
-                "total_samples": len(df_features),
-                "training_samples": len(X_train),
-                "test_samples": len(X_test),
+                "total_samples": int(len(df_features)),
+                "training_samples": int(len(X_train)),
+                "test_samples": int(len(X_test)),
                 "features_used": feature_cols,
                 "class_distribution": {
                     "class_0": int(np.sum(y == 0)),
@@ -1431,19 +1488,16 @@ def performance_metrics(
             "accuracy_assessment": get_accuracy_assessment(accuracy),
             "status": "success"
         }
-
-        logger.info("=== XGBOOST PERFORMANCE COMPLETED ===")
         return response
 
     except Exception as e:
-        logger.error(f"PERFORMANCE ENDPOINT CRASH: {str(e)}", exc_info=True)
+        logger.exception("PERFORMANCE ENDPOINT CRASH")
         return {
             "error": f"Internal server error: {str(e)}",
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "status": "error"
         }
-
 
 def preprocess_dataframe_simple(records, sensor):
     """Simplified dataframe preprocessing"""
