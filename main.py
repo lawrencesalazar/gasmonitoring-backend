@@ -1,5 +1,7 @@
 # --- main.py ---
 import json
+import gc
+import psutil
 import os
 import math
 from datetime import datetime, timedelta
@@ -108,6 +110,14 @@ except Exception as e:
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+
+def log_memory_usage(prefix=""):
+    """Log current memory usage"""
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    logger.info(f"{prefix} Memory usage: {memory_mb:.2f} MB")
+    return memory_mb
+    
 def fetch_sensor_history(sensor_id: str) -> List[Dict[str, Any]]:
     """Fetch sensor history from Firebase with robust timestamp parsing"""
     try:
@@ -704,14 +714,17 @@ async def get_sensor_stats(sensor_id: str):
 # =============================================================================
 # DATA ENDPOINTS
 # =============================================================================
+
 @app.get("/explain/{sensor_id}")
 def explain(
     sensor_id: str, 
     sensor: str = Query(...),
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """SHAP explanation with date range filtering"""
+    """SHAP explanation with date range filtering and memory optimization"""
     try:
+        log_memory_usage("Before SHAP explanation")
+        
         records = fetch_sensor_history(sensor_id)
         df = preprocess_dataframe(records, sensor)
         
@@ -723,6 +736,12 @@ def explain(
         if df_filtered.empty or len(df_filtered) < 5:
             return JSONResponse({"error": f"Not enough data after applying {range} filter"})
         
+        # Limit data size for SHAP analysis
+        max_shap_samples = 1000
+        if len(df_filtered) > max_shap_samples:
+            df_filtered = df_filtered.sample(max_shap_samples, random_state=42)
+            logger.info(f"Sampled {max_shap_samples} records for SHAP analysis")
+        
         df_filtered["hour"] = df_filtered["timestamp"].dt.hour
         agg = df_filtered.groupby("hour")["value"].mean().reset_index()
         
@@ -732,26 +751,33 @@ def explain(
         X = agg[["hour"]]
         y = agg["value"]
         
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
+        # Use smaller model for SHAP
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
         model.fit(X, y)
         
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X)
         
         buf = io.BytesIO()
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 5))  # Smaller figure size
         shap.summary_plot(shap_values, X, show=False)
         plt.title(f"SHAP Summary - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close()
+        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")  # Lower DPI
+        plt.close('all')  # Explicitly close plot
         buf.seek(0)
+        
+        # Force garbage collection
+        del model, explainer, shap_values, df, df_filtered, agg
+        gc.collect()
+        
+        log_memory_usage("After SHAP explanation")
         
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
-            "shap_values": shap_values.tolist(),
+            "shap_values": shap_values.tolist() if 'shap_values' in locals() else [],
             "features": X.to_dict(orient="records"),
             "image_data": base64.b64encode(buf.getvalue()).decode('utf-8')
         }
@@ -759,6 +785,129 @@ def explain(
     except Exception as e:
         logger.error(f"SHAP explanation error: {e}")
         return JSONResponse({"error": str(e)})
+
+@app.get("/plot/{sensor_id}")
+def plot_sensor_data(
+    sensor_id: str, 
+    sensor: str = Query(..., description="Sensor type"),
+    chart: str = Query("scatter", description="Chart type: scatter, line, summary, distribution"),
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """Generate visualization plots with memory optimization"""
+    try:
+        log_memory_usage("Before plot generation")
+        
+        records = fetch_sensor_history(sensor_id)
+        if not records:
+            return error_image("No data found for this sensor")
+        
+        df = preprocess_dataframe(records, sensor)
+        if df.empty or len(df) < 5:
+            return error_image(f"Not enough data for plot. Found {len(df)} records.")
+        
+        df_filtered = filter_by_date_range(df, range)
+        
+        if df_filtered.empty or len(df_filtered) < 3:
+            return error_image(f"Not enough data after applying {range} filter. Found {len(df_filtered)} records.")
+        
+        # Limit data size for plotting
+        max_plot_samples = 2000
+        if len(df_filtered) > max_plot_samples:
+            df_filtered = df_filtered.sample(max_plot_samples, random_state=42)
+            logger.info(f"Sampled {max_plot_samples} records for plotting")
+        
+        buf = io.BytesIO()
+        
+        if chart == "distribution":
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))  # Smaller figure
+            
+            sns.histplot(data=df_filtered, x="value", kde=True, ax=ax1, color='skyblue', alpha=0.7)
+            ax1.set_xlabel(f"{sensor.upper()} Value")
+            ax1.set_ylabel("Frequency")
+            ax1.set_title(f"Distribution - {sensor.upper()}")
+            
+            sns.boxplot(data=df_filtered, y="value", ax=ax2, color='lightcoral')
+            ax2.set_ylabel(f"{sensor.upper()} Value")
+            ax2.set_title(f"Box Plot - {sensor.upper()}")
+            
+        elif chart == "scatter":
+            plt.figure(figsize=(10, 6))  # Smaller figure
+            
+            # Sample data for scatter plot
+            if len(df_filtered) > 500:
+                plot_data = df_filtered.sample(500, random_state=42)
+            else:
+                plot_data = df_filtered
+                
+            plt.scatter(plot_data["timestamp"], plot_data["value"], alpha=0.6, s=10)
+            plt.xlabel("Timestamp")
+            plt.ylabel(f"{sensor.upper()} Value")
+            plt.title(f"Scatter Plot - {sensor.upper()} (Sensor {sensor_id})")
+            plt.xticks(rotation=45)
+            
+        elif chart == "line":
+            plt.figure(figsize=(10, 6))
+            
+            # Resample for line plot to reduce points
+            if len(df_filtered) > 1000:
+                df_resampled = df_filtered.set_index('timestamp').resample('12H').mean().reset_index()
+            else:
+                df_resampled = df_filtered
+                
+            plt.plot(df_resampled["timestamp"], df_resampled["value"], linewidth=1)
+            plt.xlabel("Timestamp")
+            plt.ylabel(f"{sensor.upper()} Value")
+            plt.title(f"Time Series - {sensor.upper()} (Sensor {sensor_id})")
+            plt.xticks(rotation=45)
+            
+        else:  # summary plot - simplified
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+            
+            # Time series
+            ax1.plot(df_filtered["timestamp"], df_filtered["value"], linewidth=0.5)
+            ax1.set_title("Time Series")
+            ax1.tick_params(axis='x', rotation=45)
+            
+            # Distribution
+            ax2.hist(df_filtered["value"], bins=20, alpha=0.7, color='green')
+            ax2.set_title("Distribution")
+            
+            # Rolling mean with sampling
+            if len(df_filtered) > 100:
+                sample_df = df_filtered.sample(100, random_state=42).sort_values('timestamp')
+                ax3.plot(sample_df["timestamp"], sample_df["value"], alpha=0.7)
+            else:
+                ax3.plot(df_filtered["timestamp"], df_filtered["value"], alpha=0.7)
+            ax3.set_title("Sample Values")
+            ax3.tick_params(axis='x', rotation=45)
+            
+            # Simple stats
+            stats_text = f"Mean: {df_filtered['value'].mean():.2f}\nStd: {df_filtered['value'].std():.2f}\nCount: {len(df_filtered)}"
+            ax4.text(0.1, 0.5, stats_text, fontsize=12, va='center')
+            ax4.set_title("Statistics")
+            ax4.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
+        plt.close('all')  # Explicitly close all figures
+        
+        # Clean up memory
+        del df, df_filtered, records
+        if 'plot_data' in locals():
+            del plot_data
+        if 'df_resampled' in locals():
+            del df_resampled
+        gc.collect()
+        
+        log_memory_usage("After plot generation")
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        logger.error(f"Plot generation error: {e}")
+        return error_image(f"Error generating plot: {str(e)}")
+
 
 @app.get("/shap_hour_minimal/{sensor_id}")
 def shap_hour_minimal(
@@ -837,6 +986,7 @@ def get_dataframe(
         logger.error(f"Dataframe error: {e}")
         return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
+ 
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
     sensor_id: str, 
@@ -844,8 +994,10 @@ def plot_sensor_data(
     chart: str = Query("scatter", description="Chart type: scatter, line, summary, distribution"),
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
-    """Generate enhanced visualization plots for sensor data with date range using Seaborn"""
+    """Generate visualization plots with memory optimization"""
     try:
+        log_memory_usage("Before plot generation")
+        
         records = fetch_sensor_history(sensor_id)
         if not records:
             return error_image("No data found for this sensor")
@@ -859,115 +1011,96 @@ def plot_sensor_data(
         if df_filtered.empty or len(df_filtered) < 3:
             return error_image(f"Not enough data after applying {range} filter. Found {len(df_filtered)} records.")
         
+        # Limit data size for plotting
+        max_plot_samples = 2000
+        if len(df_filtered) > max_plot_samples:
+            df_filtered = df_filtered.sample(max_plot_samples, random_state=42)
+            logger.info(f"Sampled {max_plot_samples} records for plotting")
+        
         buf = io.BytesIO()
         
         if chart == "distribution":
-            # Enhanced distribution plot with KDE and histogram
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))  # Smaller figure
             
-            # Histogram with KDE
             sns.histplot(data=df_filtered, x="value", kde=True, ax=ax1, color='skyblue', alpha=0.7)
             ax1.set_xlabel(f"{sensor.upper()} Value")
             ax1.set_ylabel("Frequency")
-            ax1.set_title(f"Distribution of {sensor.upper()} Values\nDate Range: {range}")
-            ax1.grid(True, alpha=0.3)
+            ax1.set_title(f"Distribution - {sensor.upper()}")
             
-            # Box plot
             sns.boxplot(data=df_filtered, y="value", ax=ax2, color='lightcoral')
             ax2.set_ylabel(f"{sensor.upper()} Value")
-            ax2.set_title(f"Box Plot - {sensor.upper()}\nDate Range: {range}")
-            ax2.grid(True, alpha=0.3)
+            ax2.set_title(f"Box Plot - {sensor.upper()}")
             
         elif chart == "scatter":
-            # Enhanced scatter plot with regression line
-            plt.figure(figsize=(12, 8))
+            plt.figure(figsize=(10, 6))  # Smaller figure
             
-            # Create numeric x-axis for regression
-            df_filtered = df_filtered.copy()
-            df_filtered['time_numeric'] = (df_filtered['timestamp'] - df_filtered['timestamp'].min()).dt.total_seconds()
-            
-            # Create subplot for scatter and distribution
-            fig = plt.figure(figsize=(15, 10))
-            gs = fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[3, 1])
-            
-            ax_scatter = fig.add_subplot(gs[0, 0])
-            ax_hist_x = fig.add_subplot(gs[1, 0])
-            ax_hist_y = fig.add_subplot(gs[0, 1])
-            
-            # Main scatter plot with regression
-            sns.scatterplot(data=df_filtered, x="timestamp", y="value", alpha=0.7, ax=ax_scatter)
-            sns.regplot(data=df_filtered, x="time_numeric", y="value", scatter=False, 
-                       line_kws={'color': 'red', 'linewidth': 2}, ax=ax_scatter)
-            ax_scatter.set_xlabel("Timestamp")
-            ax_scatter.set_ylabel(f"{sensor.upper()} Value")
-            ax_scatter.set_title(f"Scatter Plot with Trend Line - {sensor.upper()} (Sensor {sensor_id})\nDate Range: {range}")
-            ax_scatter.tick_params(axis='x', rotation=45)
-            
-            # Time distribution
-            sns.histplot(data=df_filtered, x="timestamp", ax=ax_hist_x, color='gray', alpha=0.7)
-            ax_hist_x.set_xlabel("Timestamp")
-            ax_hist_x.set_ylabel("Count")
-            ax_hist_x.tick_params(axis='x', rotation=45)
-            
-            # Value distribution
-            sns.histplot(data=df_filtered, y="value", ax=ax_hist_y, color='lightblue', alpha=0.7)
-            ax_hist_y.set_ylabel(f"{sensor.upper()} Value")
-            ax_hist_y.set_xlabel("Count")
+            # Sample data for scatter plot
+            if len(df_filtered) > 500:
+                plot_data = df_filtered.sample(500, random_state=42)
+            else:
+                plot_data = df_filtered
+                
+            plt.scatter(plot_data["timestamp"], plot_data["value"], alpha=0.6, s=10)
+            plt.xlabel("Timestamp")
+            plt.ylabel(f"{sensor.upper()} Value")
+            plt.title(f"Scatter Plot - {sensor.upper()} (Sensor {sensor_id})")
+            plt.xticks(rotation=45)
             
         elif chart == "line":
-            # Enhanced line plot with confidence interval
-            plt.figure(figsize=(12, 8))
+            plt.figure(figsize=(10, 6))
             
-            # Resample for smoother line if we have enough data
-            if len(df_filtered) > 50:
-                df_resampled = df_filtered.set_index('timestamp').resample('6H').mean().reset_index()
-                sns.lineplot(data=df_resampled, x="timestamp", y="value", 
-                           err_style="band", ci=95, linewidth=2.5)
+            # Resample for line plot to reduce points
+            if len(df_filtered) > 1000:
+                df_resampled = df_filtered.set_index('timestamp').resample('12H').mean().reset_index()
             else:
-                sns.lineplot(data=df_filtered, x="timestamp", y="value", 
-                           marker='o', markersize=4, linewidth=2.5)
-            
-            plt.xlabel("Timestamp", fontsize=12)
-            plt.ylabel(f"{sensor.upper()} Value", fontsize=12)
-            plt.title(f"Time Series with Confidence Interval - {sensor.upper()} (Sensor {sensor_id})\nDate Range: {range}", fontsize=14, pad=20)
+                df_resampled = df_filtered
+                
+            plt.plot(df_resampled["timestamp"], df_resampled["value"], linewidth=1)
+            plt.xlabel("Timestamp")
+            plt.ylabel(f"{sensor.upper()} Value")
+            plt.title(f"Time Series - {sensor.upper()} (Sensor {sensor_id})")
             plt.xticks(rotation=45)
-            plt.grid(True, alpha=0.3)
             
-        else:  # summary plot
-            # Enhanced summary plot with multiple visualizations
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        else:  # summary plot - simplified
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
             
             # Time series
-            sns.lineplot(data=df_filtered, x="timestamp", y="value", ax=ax1, color='blue')
-            ax1.set_title(f"Time Series - {sensor.upper()}")
+            ax1.plot(df_filtered["timestamp"], df_filtered["value"], linewidth=0.5)
+            ax1.set_title("Time Series")
             ax1.tick_params(axis='x', rotation=45)
             
             # Distribution
-            sns.histplot(data=df_filtered, x="value", kde=True, ax=ax2, color='green')
-            ax2.set_title(f"Value Distribution - {sensor.upper()}")
+            ax2.hist(df_filtered["value"], bins=20, alpha=0.7, color='green')
+            ax2.set_title("Distribution")
             
-            # Rolling mean
-            df_rolling = df_filtered.copy()
-            df_rolling.set_index('timestamp', inplace=True)
-            df_rolling['rolling_mean'] = df_rolling['value'].rolling(window=min(7, len(df_rolling)//10)).mean()
-            sns.lineplot(data=df_rolling.reset_index(), x="timestamp", y="rolling_mean", ax=ax3, color='red')
-            ax3.set_title(f"7-Point Rolling Mean - {sensor.upper()}")
+            # Rolling mean with sampling
+            if len(df_filtered) > 100:
+                sample_df = df_filtered.sample(100, random_state=42).sort_values('timestamp')
+                ax3.plot(sample_df["timestamp"], sample_df["value"], alpha=0.7)
+            else:
+                ax3.plot(df_filtered["timestamp"], df_filtered["value"], alpha=0.7)
+            ax3.set_title("Sample Values")
             ax3.tick_params(axis='x', rotation=45)
             
-            # Daily pattern if we have enough data
-            if len(df_filtered) > 24:
-                df_filtered['hour'] = df_filtered['timestamp'].dt.hour
-                hourly_agg = df_filtered.groupby('hour')['value'].mean().reset_index()
-                sns.lineplot(data=hourly_agg, x="hour", y="value", ax=ax4, marker='o')
-                ax4.set_title(f"Daily Pattern - {sensor.upper()}")
-            else:
-                # Box plot instead
-                sns.boxplot(data=df_filtered, y="value", ax=ax4, color='orange')
-                ax4.set_title(f"Value Spread - {sensor.upper()}")
+            # Simple stats
+            stats_text = f"Mean: {df_filtered['value'].mean():.2f}\nStd: {df_filtered['value'].std():.2f}\nCount: {len(df_filtered)}"
+            ax4.text(0.1, 0.5, stats_text, fontsize=12, va='center')
+            ax4.set_title("Statistics")
+            ax4.axis('off')
         
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close()
+        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
+        plt.close('all')  # Explicitly close all figures
+        
+        # Clean up memory
+        del df, df_filtered, records
+        if 'plot_data' in locals():
+            del plot_data
+        if 'df_resampled' in locals():
+            del df_resampled
+        gc.collect()
+        
+        log_memory_usage("After plot generation")
         buf.seek(0)
         
         return StreamingResponse(buf, media_type="image/png")
@@ -975,7 +1108,6 @@ def plot_sensor_data(
     except Exception as e:
         logger.error(f"Plot generation error: {e}")
         return error_image(f"Error generating plot: {str(e)}")
-
 # =============================================================================
 # AI/ML ENDPOINTS
 # =============================================================================
@@ -1447,8 +1579,6 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "timestamp": datetime.now().isoformat()
     }
  
-
-# Updated endpoint with fixed indentation and grid search
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
@@ -1463,15 +1593,14 @@ def performance_metrics(
     grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
     grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
 ):
-    """Get XGBoost performance metrics with optional Grid Search"""
+    """Get XGBoost performance metrics with memory optimization"""
     try:
-        logger.info("=== STARTING XGBOOST PERFORMANCE ===")
-        logger.info(f"Fetching data for sensor_id={sensor_id} sensor={sensor}")
-
-        # Step 1: Fetch data
+        log_memory_usage("Before performance metrics")
+        
+        # Limit data size for performance analysis
+        max_training_samples = 5000
+        
         records = fetch_sensor_history(sensor_id)
-        logger.info(f"Records fetched: {len(records)}")
-
         if not records:
             return {
                 "error": f"No data found for sensor {sensor_id}",
@@ -1480,20 +1609,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 2: Check sensor exists in sample
-        sample_record = records[0] if records else {}
-        if sensor not in sample_record:
-            available = [k for k in sample_record.keys() if k not in ['timestamp', 'sensorID', 'time']]
-            return {
-                "error": f"Sensor '{sensor}' not found. Available keys: {available}",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
-
-        # Step 3: Preprocess to dataframe
         df = preprocess_dataframe_simple(records, sensor)
-        logger.info(f"Preprocessed shape: {getattr(df, 'shape', None)}")
         if df is None or df.empty:
             return {
                 "error": "No valid data after preprocessing",
@@ -1502,9 +1618,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 4: Filter by date_range
         df_filtered = filter_by_date_range_simple(df, date_range)
-        logger.info(f"After filtering: {getattr(df_filtered, 'shape', None)}")
         if df_filtered is None or len(df_filtered) < 5:
             return {
                 "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
@@ -1513,7 +1627,11 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 5: Create binary labels (must produce two classes)
+        # Sample data if too large
+        if len(df_filtered) > max_training_samples:
+            df_filtered = df_filtered.sample(max_training_samples, random_state=42)
+            logger.info(f"Sampled {max_training_samples} records for performance analysis")
+
         df_binary = create_simple_binary_labels(df_filtered)
         if df_binary is None or df_binary.empty:
             return {
@@ -1522,21 +1640,8 @@ def performance_metrics(
                 "sensor_type": sensor,
                 "status": "error"
             }
-        classes_present = df_binary['class_binary'].unique().tolist()
-        logger.info(f"Classes present: {classes_present}")
 
-        # ensure we have at least two classes
-        if len(classes_present) < 2:
-            return {
-                "error": "Binary classification requires at least two classes in the data.",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
-
-        # Step 6: Create lag features
         df_features = create_simple_lag_features(df_binary)
-        logger.info(f"Features shape: {getattr(df_features, 'shape', None)}")
         if df_features is None or df_features.empty:
             return {
                 "error": "Could not create features (likely because of insufficient rows for lags).",
@@ -1545,125 +1650,30 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # Step 7: Prepare X and y
         feature_cols = [col for col in df_features.columns if col.startswith('lag')]
-        if not feature_cols:
-            return {
-                "error": "No lag features found. Make sure create_simple_lag_features produced columns starting with 'lag'.",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
-
         X = df_features[feature_cols].values
         y = df_features['class_binary'].values
 
-        logger.info(f"X shape: {X.shape}, y distribution: {np.bincount(y)}")
-
-        if X.size == 0 or len(y) == 0:
-            return {
-                "error": "Empty feature matrix or target vector",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
-
-        # Step 8: Train-test split (handle small datasets)
-        if len(X) < 10 or len(np.unique(y)) == 1:
-            # fallback: train and test on same small dataset (not ideal but avoids crash)
+        # Use smaller test size for large datasets
+        actual_test_size = min(test_size, 0.2)
+        if len(X) < 10:
             X_train, X_test, y_train, y_test = X, X, y, y
-            logger.warning("Very small dataset — using all data for train and test (no split).")
         else:
-            safe_test_size = float(np.clip(test_size, 0.01, 0.3))
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=safe_test_size, random_state=42, stratify=y if len(np.unique(y))>1 else None
+                X, y, test_size=actual_test_size, random_state=42, stratify=y if len(np.unique(y))>1 else None
             )
 
-        logger.info(f"Train shape: {getattr(X_train,'shape',None)}, Test shape: {getattr(X_test,'shape',None)}")
+        # Simplified model training without grid search for memory efficiency
+        model = xgb.XGBClassifier(
+            n_estimators=50,  # Smaller model
+            max_depth=4,
+            learning_rate=0.1,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            random_state=42
+        )
+        model.fit(X_train, y_train)
 
-        # Step 9: Train XGBoost with hyperparameters
-        if use_grid_search:
-            logger.info("Running Grid Search for XGBoost...")
-
-            # Build parameter grid from query strings with proper error handling
-            try:
-                param_grid = {
-                    "n_estimators": [int(x.strip()) for x in grid_n_estimators.split(",")],
-                    "max_depth": [int(x.strip()) for x in grid_max_depth.split(",")],
-                    "learning_rate": [float(x.strip()) for x in grid_learning_rate.split(",")],
-                    "subsample": [float(x.strip()) for x in grid_subsample.split(",")],
-                    "colsample_bytree": [float(x.strip()) for x in grid_colsample_bytree.split(",")]
-                }
-                
-                # Validate parameter grid
-                for param_name, param_values in param_grid.items():
-                    if not param_values:
-                        raise ValueError(f"Empty parameter values for {param_name}")
-                    logger.info(f"Grid parameter {param_name}: {param_values}")
-                    
-            except Exception as e:
-                logger.error(f"Parameter grid parsing error: {e}")
-                return {
-                    "error": f"Invalid grid parameters: {str(e)}",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                }
-
-            base_model = xgb.XGBClassifier(
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-
-            try:
-                # Use smaller CV folds for small datasets
-                actual_cv_folds = min(cv_folds, len(X_train) // 2)
-                if actual_cv_folds < 2:
-                    actual_cv_folds = 2
-                    
-                grid_search = GridSearchCV(
-                    estimator=base_model,
-                    param_grid=param_grid,
-                    scoring="f1_weighted",
-                    cv=actual_cv_folds,
-                    n_jobs=1,  # Reduce to 1 to avoid memory issues
-                    verbose=1
-                )
-                grid_search.fit(X_train, y_train)
-                model = grid_search.best_estimator_
-                best_params = grid_search.best_params_
-                logger.info(f"Grid Search best params: {best_params}")
-            except Exception as e:
-                logger.exception("Grid Search failed")
-                # Fallback to default parameters
-                logger.info("Falling back to default XGBoost parameters")
-                model = xgb.XGBClassifier(
-                    n_estimators=100,
-                    max_depth=6,
-                    learning_rate=0.1,
-                    use_label_encoder=False,
-                    eval_metric="logloss",
-                    random_state=42
-                )
-                model.fit(X_train, y_train)
-                best_params = model.get_params()
-        else:
-            # Default training (fast)
-            model = xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=1.0,
-                colsample_bytree=1.0,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-            model.fit(X_train, y_train)
-            best_params = model.get_params()
-
-        # --- evaluation ---
         y_pred = model.predict(X_test)
 
         accuracy = float(accuracy_score(y_test, y_pred))
@@ -1675,7 +1685,7 @@ def performance_metrics(
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": date_range,
-            "algorithm": "XGBoost (Grid Search)" if use_grid_search else "XGBoost",
+            "algorithm": "XGBoost",
             "performance_metrics": {
                 "accuracy": accuracy,
                 "precision": precision,
@@ -1683,20 +1693,22 @@ def performance_metrics(
                 "f1_score": f1,
                 "test_samples": int(len(y_test))
             },
-            "best_hyperparameters": best_params,
             "data_info": {
                 "total_samples": int(len(df_features)),
                 "training_samples": int(len(X_train)),
                 "test_samples": int(len(X_test)),
-                "features_used": feature_cols,
-                "class_distribution": {
-                    "class_0": int(np.sum(y == 0)),
-                    "class_1": int(np.sum(y == 1))
-                }
+                "features_used": feature_cols
             },
-            "accuracy_assessment": get_accuracy_assessment(accuracy),
             "status": "success"
         }
+
+        # Clean up memory
+        del records, df, df_filtered, df_binary, df_features, model
+        del X, y, X_train, X_test, y_train, y_test, y_pred
+        gc.collect()
+        
+        log_memory_usage("After performance metrics")
+        
         return response
 
     except Exception as e:
@@ -1707,7 +1719,7 @@ def performance_metrics(
             "sensor_type": sensor,
             "status": "error"
         }
-
+        
 def preprocess_dataframe_simple(records, sensor):
     """Simplified dataframe preprocessing"""
     try:
@@ -1844,72 +1856,98 @@ def get_accuracy_assessment(accuracy):
 @app.get("/correlation")
 def correlation(
     sensor_ids: str = Query(..., description="Comma-separated sensor IDs"),
-    plot_type: str = Query("scatter", enum=["scatter", "heatmap", "pairplot"]),
+    plot_type: str = Query("heatmap", enum=["heatmap", "scatter", "pairplot"]),
     output: str = Query("img", enum=["img", "json"]),
-    limit: int = 1000,
+    limit: int = Query(500, description="Maximum number of records"),  # Reduced default limit
 ):
-    sensor_list = [s.strip() for s in sensor_ids.split(",") if s.strip()]
-    if not sensor_list:
-        return JSONResponse({"error": "No sensor IDs provided"}, status_code=400)
-
-    all_data = []
-    for sid in sensor_list:
-        records = fetch_sensor_history(sid)
-        if records:
-            df = pd.DataFrame(records)
-            df["sensor_id"] = sid
-            all_data.append(df)
-
-    if not all_data:
-        return JSONResponse({"error": "No data found for given sensors"}, status_code=404)
-
-    df = pd.concat(all_data, ignore_index=True)
-
-    # Keep only numeric fields
-    numeric_fields = ["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]
-    df = df[[col for col in numeric_fields if col in df.columns]]
-
-    # Downsample
-    if len(df) > limit:
-        df = df.sample(limit, random_state=42)
-
-    # JSON output → correlation matrix
-    if output == "json":
-        corr = df.corr().to_dict()
-        return {
-            "sensors": sensor_list,
-            "correlation": corr
-        }
-
-    # IMG output → visualization
-    plt.figure(figsize=(12, 10) if plot_type == "pairplot" else (10, 8))
-
-    if plot_type == "heatmap":
-        # Enhanced heatmap
-        mask = np.triu(np.ones_like(df.corr(), dtype=bool))
-        sns.heatmap(df.corr(), annot=True, cmap="coolwarm", fmt=".2f", 
-                   square=True, mask=mask, cbar_kws={"shrink": .8})
-        plt.title(f"Correlation Heatmap - Sensors {', '.join(sensor_list)}", fontsize=16, pad=20)
+    """Correlation analysis with memory optimization"""
+    try:
+        log_memory_usage("Before correlation analysis")
         
-    elif plot_type == "pairplot":
-        # Enhanced pairplot
-        g = sns.pairplot(df, diag_kind='kde', plot_kws={'alpha': 0.6})
-        g.fig.suptitle(f"Pair Plot Matrix - Sensors {', '.join(sensor_list)}", y=1.02, fontsize=16)
+        sensor_list = [s.strip() for s in sensor_ids.split(",") if s.strip()]
+        if not sensor_list:
+            return JSONResponse({"error": "No sensor IDs provided"}, status_code=400)
+
+        all_data = []
+        for sid in sensor_list:
+            records = fetch_sensor_history(sid)
+            if records:
+                df = pd.DataFrame(records)
+                df["sensor_id"] = sid
+                all_data.append(df)
+
+        if not all_data:
+            return JSONResponse({"error": "No data found for given sensors"}, status_code=404)
+
+        df = pd.concat(all_data, ignore_index=True)
+
+        # Keep only numeric fields
+        numeric_fields = ["methane", "co2", "ammonia", "humidity", "temperature", "riskIndex"]
+        df = df[[col for col in numeric_fields if col in df.columns]].dropna()
+
+        # Aggressive downsampling
+        max_correlation_samples = 1000
+        if len(df) > max_correlation_samples:
+            df = df.sample(max_correlation_samples, random_state=42)
+            logger.info(f"Sampled {max_correlation_samples} records for correlation analysis")
+
+        if output == "json":
+            corr = df.corr().to_dict()
+            
+            # Clean up
+            del all_data, df
+            gc.collect()
+            log_memory_usage("After correlation JSON")
+            
+            return {
+                "sensors": sensor_list,
+                "correlation": corr
+            }
+
+        # IMG output with memory optimization
+        plt.figure(figsize=(8, 6))  # Smaller figure
         
-    else:  # scatter matrix
-        # Create a custom scatter matrix with regression lines
-        from pandas.plotting import scatter_matrix
-        scatter_matrix(df, alpha=0.8, figsize=(12, 12), diagonal='kde')
-        plt.suptitle(f"Scatter Matrix with KDE - Sensors {', '.join(sensor_list)}", y=0.95, fontsize=16)
+        if plot_type == "heatmap":
+            sns.heatmap(df.corr(), annot=True, cmap="coolwarm", fmt=".2f", 
+                       cbar_kws={"shrink": .8})
+            plt.title(f"Correlation Heatmap", fontsize=14)
+            
+        elif plot_type == "pairplot":
+            # Use only 3 columns for pairplot to reduce memory
+            if len(df.columns) > 3:
+                df_small = df[df.columns[:3]]
+            else:
+                df_small = df
+            sns.pairplot(df_small, diag_kind='hist', plot_kws={'alpha': 0.6})
+            plt.suptitle(f"Pair Plot", y=1.02)
+            
+        else:  # scatter
+            if len(df.columns) >= 2:
+                plt.scatter(df.iloc[:, 0], df.iloc[:, 1], alpha=0.6)
+                plt.xlabel(df.columns[0])
+                plt.ylabel(df.columns[1])
+                plt.title(f"Scatter Plot: {df.columns[0]} vs {df.columns[1]}")
 
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    buf.seek(0)
-    plt.close()
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
+        plt.close('all')
+        buf.seek(0)
+        
+        # Clean up memory
+        del all_data, df
+        if 'df_small' in locals():
+            del df_small
+        gc.collect()
+        
+        log_memory_usage("After correlation image")
+        
+        return StreamingResponse(buf, media_type="image/png")
 
-    return StreamingResponse(buf, media_type="image/png")
-
+    except Exception as e:
+        logger.error(f"Correlation analysis error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+        
 # Run the application
 if __name__ == "__main__":
     import uvicorn
