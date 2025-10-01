@@ -13,13 +13,13 @@ from firebase_admin import credentials, db
 import pandas as pd
 import numpy as np
 import shap
-import xgboost as xgb
+import xgboost as xgb  
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR, SVC
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import  GridSearchCV, train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
@@ -1578,8 +1578,7 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
- 
-@app.get("/performance/{sensor_id}")
+ @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
@@ -1660,19 +1659,48 @@ def performance_metrics(
             X_train, X_test, y_train, y_test = X, X, y, y
         else:
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=actual_test_size, random_state=42, stratify=y if len(np.unique(y))>1 else None
+                X, y, test_size=actual_test_size, random_state=42,
+                stratify=y if len(np.unique(y)) > 1 else None
             )
 
-        # Simplified model training without grid search for memory efficiency
-        model = xgb.XGBClassifier(
-            n_estimators=50,  # Smaller model
-            max_depth=4,
-            learning_rate=0.1,
-            use_label_encoder=False,
-            eval_metric="logloss",
-            random_state=42
-        )
-        model.fit(X_train, y_train)
+        # Decide if grid search should be used
+        allow_grid = use_grid_search and len(X_train) <= 2000  # ✅ only small datasets
+        if allow_grid:
+            param_grid = {
+                "n_estimators": [int(v) for v in grid_n_estimators.split(",")],
+                "max_depth": [int(v) for v in grid_max_depth.split(",")],
+                "learning_rate": [float(v) for v in grid_learning_rate.split(",")],
+                "subsample": [float(v) for v in grid_subsample.split(",")],
+                "colsample_bytree": [float(v) for v in grid_colsample_bytree.split(",")],
+            }
+            base_model = xgb.XGBClassifier(
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+            grid_search = GridSearchCV(
+                estimator=base_model,
+                param_grid=param_grid,
+                scoring="accuracy",
+                cv=cv_folds,
+                n_jobs=1,   # ✅ safer for low memory
+                verbose=1
+            )
+            grid_search.fit(X_train, y_train)
+            model = grid_search.best_estimator_
+            best_params = grid_search.best_params_
+        else:
+            # Fallback: simple model
+            model = xgb.XGBClassifier(
+                n_estimators=50,
+                max_depth=4,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+            model.fit(X_train, y_train)
+            best_params = None
 
         y_pred = model.predict(X_test)
 
@@ -1685,7 +1713,8 @@ def performance_metrics(
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": date_range,
-            "algorithm": "XGBoost",
+            "algorithm": "XGBoost (GridSearch)" if allow_grid else "XGBoost (Simple)",
+            "best_params": best_params,
             "performance_metrics": {
                 "accuracy": accuracy,
                 "precision": precision,
@@ -1719,7 +1748,7 @@ def performance_metrics(
             "sensor_type": sensor,
             "status": "error"
         }
-        
+
 def preprocess_dataframe_simple(records, sensor):
     """Simplified dataframe preprocessing"""
     try:
