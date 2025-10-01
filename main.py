@@ -1578,7 +1578,7 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
- @app.get("/performance/{sensor_id}")
+@app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
