@@ -1758,7 +1758,7 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
             # "sensor_type": sensor,
             # "status": "error"
         # } 
-    @app.get("/performance/{sensor_id}")
+@app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
@@ -1798,7 +1798,7 @@ def performance_metrics(
             }
 
         df_filtered = filter_by_date_range_simple(df, date_range)
-        if df_filtered is None or len(df_filtered) < 10:  # Increased minimum from 5 to 10 for better features
+        if df_filtered is None or len(df_filtered) < 10:
             return {
                 "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
                 "sensor_id": sensor_id,
@@ -1820,7 +1820,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # ✅ ENHANCED: Use improved feature creation
+        # Enhanced feature creation
         df_features = create_enhanced_features(df_binary, sensor_col='value')
         if df_features is None or df_features.empty:
             return {
@@ -1830,7 +1830,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # ✅ ENHANCED: Get ALL feature columns (not just lag)
+        # Get ALL feature columns (not just lag)
         feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
         
         if not feature_cols:
@@ -1844,7 +1844,7 @@ def performance_metrics(
         X = df_features[feature_cols].values
         y = df_features['class_binary'].values
 
-        # ✅ ENHANCED: Calculate baseline accuracy (majority class)
+        # Calculate baseline accuracy (majority class)
         if len(y) > 0:
             baseline_accuracy = max(np.bincount(y)) / len(y)
         else:
@@ -1861,7 +1861,7 @@ def performance_metrics(
             )
 
         # Decide if grid search should be used
-        allow_grid = use_grid_search and len(X_train) <= 2000  # ✅ only small datasets
+        allow_grid = use_grid_search and len(X_train) <= 2000
         if allow_grid:
             param_grid = {
                 "n_estimators": [int(v) for v in grid_n_estimators.split(",")],
@@ -1880,23 +1880,23 @@ def performance_metrics(
                 param_grid=param_grid,
                 scoring="accuracy",
                 cv=cv_folds,
-                n_jobs=1,   # ✅ safer for low memory
+                n_jobs=1,
                 verbose=1
             )
             grid_search.fit(X_train, y_train)
             model = grid_search.best_estimator_
             best_params = grid_search.best_params_
         else:
-            # ✅ ENHANCED: Better default parameters based on data size
+            # Better default parameters based on data size
             if len(X_train) < 1000:
                 model = xgb.XGBClassifier(
                     n_estimators=100,
-                    max_depth=3,  # Shallower trees to prevent overfitting
+                    max_depth=3,
                     learning_rate=0.05,
                     subsample=0.8,
                     colsample_bytree=0.8,
-                    reg_alpha=0.1,  # L1 regularization
-                    reg_lambda=0.1,  # L2 regularization
+                    reg_alpha=0.1,
+                    reg_lambda=0.1,
                     use_label_encoder=False,
                     eval_metric="logloss",
                     random_state=42
@@ -1920,7 +1920,7 @@ def performance_metrics(
         recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
         f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
 
-        # ✅ ENHANCED: Calculate feature importance
+        # Calculate feature importance
         feature_importance = []
         if hasattr(model, 'feature_importances_'):
             for i, importance in enumerate(model.feature_importances_):
@@ -1931,10 +1931,11 @@ def performance_metrics(
             # Sort by importance
             feature_importance.sort(key=lambda x: x['importance'], reverse=True)
 
-        # ✅ ENHANCED: Get class distribution
+        # Get class distribution
         class_distribution = dict(pd.Series(y).value_counts())
         class_percentages = dict(pd.Series(y).value_counts(normalize=True))
 
+        # ✅ CORRECTED: Properly structured response dictionary
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
@@ -1946,21 +1947,21 @@ def performance_metrics(
                 "precision": precision,
                 "recall": recall,
                 "f1_score": f1,
-                "baseline_accuracy": float(baseline_accuracy),  # ✅ NEW
-                "improvement_over_baseline": float(accuracy - baseline_accuracy),  # ✅ NEW
+                "baseline_accuracy": float(baseline_accuracy),
+                "improvement_over_baseline": float(accuracy - baseline_accuracy),
                 "test_samples": int(len(y_test))
             },
             "data_info": {
                 "total_samples": int(len(df_features)),
                 "training_samples": int(len(X_train)),
                 "test_samples": int(len(y_test)),
-                "class_distribution": class_distribution,  # ✅ ENHANCED
-                "class_percentages": class_percentages,    # ✅ NEW
+                "class_distribution": class_distribution,
+                "class_percentages": class_percentages,
                 "features_used": feature_cols,
                 "feature_count": len(feature_cols)
             },
-            "feature_importance": feature_importance[:10],  # ✅ NEW: Top 10 features
-            "diagnostics": {  # ✅ NEW: Additional diagnostics
+            "feature_importance": feature_importance[:10],
+            "diagnostics": {
                 "baseline_interpretation": "Accuracy if always predicting majority class",
                 "model_interpretation": "Positive improvement means model is learning patterns",
                 "feature_quality": "High importance > 0.1 suggests good features"
@@ -1975,7 +1976,7 @@ def performance_metrics(
         
         log_memory_usage("After performance metrics")
         
-        return response
+        return response  # ✅ This return statement should be properly aligned
 
     except Exception as e:
         logger.exception("PERFORMANCE ENDPOINT CRASH")
@@ -1999,25 +2000,25 @@ def create_enhanced_features(df_binary, sensor_col='value'):
     df['lag_2'] = df[sensor_col].shift(2)
     df['lag_3'] = df[sensor_col].shift(3)
     
-    # ✅ ENHANCED: Rolling statistics (trend features)
+    # Enhanced: Rolling statistics
     df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
     df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
     df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
     df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
     
-    # ✅ ENHANCED: Rate of change and momentum
+    # Enhanced: Rate of change and momentum
     df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
     df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
     
-    # ✅ ENHANCED: Percent changes
+    # Enhanced: Percent changes
     df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
     df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
     
-    # ✅ ENHANCED: Volatility features
+    # Enhanced: Volatility features
     df['volatility_5'] = df[sensor_col].rolling(window=5).std()
     df['volatility_10'] = df[sensor_col].rolling(window=10).std()
     
-    # ✅ ENHANCED: Statistical features
+    # Enhanced: Statistical features
     overall_mean = df[sensor_col].mean()
     overall_std = df[sensor_col].std()
     if overall_std > 0:
@@ -2025,11 +2026,11 @@ def create_enhanced_features(df_binary, sensor_col='value'):
     else:
         df['z_score'] = 0
     
-    # ✅ ENHANCED: Binary features for spikes/drops
+    # Enhanced: Binary features for spikes/drops
     df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
     df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
     
-    # ✅ ENHANCED: Time-based features (if timestamp available)
+    # Enhanced: Time-based features
     if 'timestamp' in df.columns:
         try:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -2038,13 +2039,14 @@ def create_enhanced_features(df_binary, sensor_col='value'):
             df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
             df['month'] = df['timestamp'].dt.month
         except:
-            # If timestamp parsing fails, continue without time features
             pass
     
-    # Remove rows with NaN values created by rolling windows and shifts
+    # Remove rows with NaN values
     df = df.dropna()
     
     return df
+    
+    
 # from fastapi import Query
 # from sklearn.model_selection import train_test_split, RandomizedSearchCV
 # from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
