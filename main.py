@@ -776,7 +776,7 @@ def explain(
         
         log_memory_usage("After SHAP explanation")
         
-      return {
+        return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
