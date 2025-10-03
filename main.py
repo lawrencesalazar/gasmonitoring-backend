@@ -1,5 +1,3 @@
-ask before update, check for duplicate:
-# --- main.py ---
 import json
 import gc
 import psutil
