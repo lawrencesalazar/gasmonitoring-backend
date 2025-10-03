@@ -32,6 +32,7 @@ import base64
 import logging
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec  
+  
 
 
 # Configure logging
@@ -1493,6 +1494,7 @@ def create_simple_lag_features(df, lags=2):
         logger.error(f"Lag features error: {e}")
         return pd.DataFrame()
 
+
 def get_accuracy_assessment(accuracy):
     """Get accuracy assessment"""
     if accuracy >= 0.9:
@@ -1517,6 +1519,65 @@ def get_accuracy_assessment(accuracy):
         "interpretation": f"XGBoost shows {level.lower()} performance with {confidence.lower()} confidence"
     }
 
+
+def create_enhanced_features(df_binary, sensor_col='value'):
+    """Create more predictive features for sensor data"""
+    if df_binary is None or len(df_binary) < 10:
+        return df_binary
+    
+    df = df_binary.copy()
+    
+    # Basic lag features
+    df['lag_1'] = df[sensor_col].shift(1)
+    df['lag_2'] = df[sensor_col].shift(2)
+    df['lag_3'] = df[sensor_col].shift(3)
+    
+    # Enhanced: Rolling statistics
+    df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
+    df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
+    df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
+    df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
+    
+    # Enhanced: Rate of change and momentum
+    df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
+    df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
+    
+    # Enhanced: Percent changes
+    df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
+    df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
+    
+    # Enhanced: Volatility features
+    df['volatility_5'] = df[sensor_col].rolling(window=5).std()
+    df['volatility_10'] = df[sensor_col].rolling(window=10).std()
+    
+    # Enhanced: Statistical features
+    overall_mean = df[sensor_col].mean()
+    overall_std = df[sensor_col].std()
+    if overall_std > 0:
+        df['z_score'] = (df[sensor_col] - overall_mean) / overall_std
+    else:
+        df['z_score'] = 0
+    
+    # Enhanced: Binary features for spikes/drops
+    df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    
+    # Enhanced: Time-based features
+    if 'timestamp' in df.columns:
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['hour'] = df['timestamp'].dt.hour
+            df['day_of_week'] = df['timestamp'].dt.dayofweek
+            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+            df['month'] = df['timestamp'].dt.month
+        except:
+            pass
+    
+    # Remove rows with NaN values
+    df = df.dropna()
+    
+    return df
+    
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
