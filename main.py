@@ -1553,32 +1553,56 @@ def performance_metrics(
         
         records = fetch_sensor_history(sensor_id)
         if not records:
-            return {
-                "error": f"No data found for sensor {sensor_id}",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": f"No data found for sensor {sensor_id}",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=404,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         # Use the simple preprocessing
         df = preprocess_dataframe_simple(records, sensor)
         if df is None or df.empty:
-            return {
-                "error": "No valid data after preprocessing",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": "No valid data after preprocessing",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=400,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         # Use simple date filtering
         df_filtered = filter_by_date_range_simple(df, date_range)
         if df_filtered is None or len(df_filtered) < 10:
-            return {
-                "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=400,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         # Sample data if too large
         if len(df_filtered) > max_training_samples:
@@ -1588,40 +1612,66 @@ def performance_metrics(
         # Create binary labels
         df_binary = create_simple_binary_labels(df_filtered)
         if df_binary is None or df_binary.empty:
-            return {
-                "error": "Could not create binary labels (possibly single-class).",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": "Could not create binary labels (possibly single-class).",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=400,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         # Enhanced feature creation
         df_features = create_enhanced_features(df_binary, sensor_col='value')
         if df_features is None or df_features.empty:
-            return {
-                "error": "Could not create features (likely because of insufficient rows for feature engineering).",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": "Could not create features (likely because of insufficient rows for feature engineering).",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=400,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         # Get ALL feature columns (not just lag)
         feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
         
         if not feature_cols:
-            return {
-                "error": "No features generated for training",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            }
+            return JSONResponse(
+                content={
+                    "error": "No features generated for training",
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "status": "error"
+                },
+                status_code=400,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                }
+            )
 
         X = df_features[feature_cols].values
         y = df_features['class_binary'].values
 
         # Calculate baseline accuracy (majority class)
         if len(y) > 0:
-            baseline_accuracy = max(np.bincount(y)) / len(y)
+            # FIX: Handle numpy types properly
+            unique_classes, class_counts = np.unique(y, return_counts=True)
+            baseline_accuracy = float(max(class_counts) / len(y))
         else:
             baseline_accuracy = 0.5
 
@@ -1695,23 +1745,34 @@ def performance_metrics(
         recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
         f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
 
-        # Calculate feature importance
+        # Calculate feature importance - FIXED: Handle numpy types
         feature_importance = []
         if hasattr(model, 'feature_importances_'):
             for i, importance in enumerate(model.feature_importances_):
                 feature_importance.append({
                     "feature": feature_cols[i] if i < len(feature_cols) else f"feature_{i}",
-                    "importance": float(importance)
+                    "importance": float(importance)  # Convert numpy float to Python float
                 })
             # Sort by importance
             feature_importance.sort(key=lambda x: x['importance'], reverse=True)
 
-        # Get class distribution
-        class_distribution = dict(pd.Series(y).value_counts())
-        class_percentages = dict(pd.Series(y).value_counts(normalize=True))
+        # Get class distribution - FIXED: Handle numpy types properly
+        try:
+            class_counts = pd.Series(y).value_counts()
+            class_distribution = {}
+            class_percentages = {}
+            
+            for class_val, count in class_counts.items():
+                class_distribution[str(int(class_val))] = int(count)  # Convert numpy to native types
+                class_percentages[str(int(class_val))] = float(count / len(y))
+                
+        except Exception as e:
+            logger.warning(f"Error processing class distribution: {e}")
+            class_distribution = {"0": len(y)} if len(y) > 0 else {"0": 0}
+            class_percentages = {"0": 1.0} if len(y) > 0 else {"0": 0.0}
 
-        # ✅ CORRECTED: Proper response structure
-        response = {
+        # ✅ CORRECTED: Proper response structure with CORS headers
+        response_data = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": date_range,
@@ -1751,17 +1812,32 @@ def performance_metrics(
         
         log_memory_usage("After performance metrics")
         
-        return response
+        # Return with explicit CORS headers
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
 
     except Exception as e:
         logger.exception("PERFORMANCE ENDPOINT CRASH")
-        return {
-            "error": f"Internal server error: {str(e)}",
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "status": "error"
-        }
-       
+        return JSONResponse(
+            content={
+                "error": f"Internal server error: {str(e)}",
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "status": "error"
+            },
+            status_code=500,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )    
 
 def create_simple_lag_features(df, lags=2):
     """Create simple lag features"""
@@ -1907,7 +1983,369 @@ def correlation(
     except Exception as e:
         logger.error(f"Correlation analysis error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+# ===========
+#      confusion matrix
+#==============
+@app.get("/confusion_matrix/{sensor_id}")
+def enhanced_confusion_matrix(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type (co2, temperature, etc.)"),
+    output_format: str = Query("image", enum=["image", "json", "both"]),
+    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+    color_scheme: str = Query("viridis", enum=["viridis", "plasma", "magma", "inferno", "cividis"]),
+    show_predictions: bool = Query(True, description="Show next day prediction probabilities"),
+    test_size: float = Query(0.2, description="Test set size ratio")
+):
+    """
+    Enhanced Confusion Matrix with Next-Day Prediction Probabilities
+    - Modern color schemes for professional visualization
+    - Precision, Recall, F1-score metrics
+    - Next-day prediction confidence scores
+    - Multiple output formats (Image, JSON, Both)
+    """
+    try:
+        # Fetch and preprocess data
+        records = fetch_sensor_history(sensor_id)
+        if not records:
+            return JSONResponse(
+                content={"error": f"No data found for sensor {sensor_id}"},
+                status_code=404
+            )
+
+        df = preprocess_dataframe(records, sensor)
+        if df.empty or len(df) < 10:
+            return JSONResponse(
+                content={"error": "Insufficient data for analysis"},
+                status_code=400
+            )
+
+        # Filter by date range
+        df_filtered = filter_by_date_range(df, date_range)
+        if len(df_filtered) < 5:
+            return JSONResponse(
+                content={"error": f"Not enough data after {date_range} filter"},
+                status_code=400
+            )
+
+        # Create binary classification labels (high/low based on median)
+        df_binary = create_simple_binary_labels(df_filtered)
+        if df_binary.empty:
+            return JSONResponse(
+                content={"error": "Could not create classification labels"},
+                status_code=400
+            )
+
+        # Create enhanced features for better prediction
+        df_features = create_enhanced_features(df_binary, sensor_col='value')
+        if df_features.empty:
+            return JSONResponse(
+                content={"error": "Feature engineering failed"},
+                status_code=400
+            )
+
+        # Prepare features and target
+        feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y
+        )
+
+        # Train XGBoost model with probability calibration
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+
+        # Get predictions and probabilities
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)
+
+        # Calculate comprehensive metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+        # Confusion matrix
+        conf_matrix = confusion_matrix(y_test, y_pred)
+        class_names = ['Low', 'High']  # Based on binary classification
+
+        # Calculate next-day prediction probabilities
+        next_day_prediction = None
+        if show_predictions and len(df_features) > 0:
+            # Use the most recent data point for next-day prediction
+            latest_features = df_features[feature_cols].iloc[-1:].values
+            next_day_proba = model.predict_proba(latest_features)[0]
+            next_day_pred = model.predict(latest_features)[0]
+            
+            next_day_prediction = {
+                "predicted_class": "High" if next_day_pred == 1 else "Low",
+                "confidence_scores": {
+                    "low_probability": float(next_day_proba[0]),
+                    "high_probability": float(next_day_proba[1])
+                },
+                "prediction_confidence": float(max(next_day_proba)),
+                "prediction_date": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            }
+
+        # Class-wise metrics
+        class_report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
         
+        # Prepare response data
+        response_data = {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "model_performance": {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4),
+                "test_samples": len(y_test),
+                "training_samples": len(y_train)
+            },
+            "confusion_matrix": {
+                "matrix": conf_matrix.tolist(),
+                "classes": class_names,
+                "normalized_matrix": (conf_matrix.astype('float') / conf_matrix.sum(axis=1)[:, np.newaxis]).tolist()
+            },
+            "class_metrics": class_report,
+            "next_day_prediction": next_day_prediction,
+            "feature_importance": [
+                {"feature": feature_cols[i], "importance": float(imp)}
+                for i, imp in enumerate(model.feature_importances_)
+            ][:5]  # Top 5 features
+        }
+
+        # Return based on output format
+        if output_format == "json":
+            return JSONResponse(content=response_data)
+
+        elif output_format == "image":
+            return generate_confusion_matrix_image(
+                conf_matrix, class_names, response_data, sensor, color_scheme
+            )
+
+        else:  # "both"
+            image_response = generate_confusion_matrix_image(
+                conf_matrix, class_names, response_data, sensor, color_scheme
+            )
+            
+            # For both format, we need to handle this differently
+            # Since we can't return two responses, we'll return JSON with image as base64
+            buf = io.BytesIO()
+            plt.figure(figsize=(14, 10))
+            create_enhanced_confusion_matrix_plot(
+                conf_matrix, class_names, response_data, sensor, color_scheme
+            )
+            plt.tight_layout()
+            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            plt.close()
+            buf.seek(0)
+            image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+            
+            response_data["confusion_matrix_image"] = f"data:image/png;base64,{image_base64}"
+            return JSONResponse(content=response_data)
+
+    except Exception as e:
+        logger.error(f"Enhanced confusion matrix error: {e}")
+        return JSONResponse(
+            content={"error": f"Analysis failed: {str(e)}"},
+            status_code=500
+        )
+
+
+def generate_confusion_matrix_image(conf_matrix, class_names, response_data, sensor, color_scheme):
+    """Generate enhanced confusion matrix visualization"""
+    try:
+        buf = io.BytesIO()
+        plt.figure(figsize=(14, 10))
+        
+        # Create the main plot
+        create_enhanced_confusion_matrix_plot(conf_matrix, class_names, response_data, sensor, color_scheme)
+        
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close()
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        logger.error(f"Image generation error: {e}")
+        return error_image(f"Error generating visualization: {str(e)}")
+
+
+def create_enhanced_confusion_matrix_plot(conf_matrix, class_names, response_data, sensor, color_scheme):
+    """Create modern confusion matrix visualization with metrics"""
+    
+    # Create subplot grid
+    fig = plt.figure(figsize=(16, 12))
+    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[3, 1])
+    
+    # Main confusion matrix
+    ax1 = plt.subplot(gs[0, 0])
+    
+    # Use modern color scheme
+    cmap = plt.get_cmap(color_scheme)
+    
+    # Plot confusion matrix
+    im = ax1.imshow(conf_matrix, interpolation='nearest', cmap=cmap, alpha=0.8)
+    
+    # Add text annotations
+    thresh = conf_matrix.max() / 2.
+    for i in range(conf_matrix.shape[0]):
+        for j in range(conf_matrix.shape[1]):
+            ax1.text(j, i, f"{conf_matrix[i, j]}\n({conf_matrix[i, j]/conf_matrix.sum():.1%})",
+                    ha="center", va="center",
+                    color="white" if conf_matrix[i, j] > thresh else "black",
+                    fontsize=14, fontweight='bold')
+    
+    # Customize the plot
+    ax1.set_xticks(np.arange(len(class_names)))
+    ax1.set_yticks(np.arange(len(class_names)))
+    ax1.set_xticklabels([f'Predicted\n{name}' for name in class_names], fontsize=12)
+    ax1.set_yticklabels([f'Actual\n{name}' for name in class_names], fontsize=12)
+    ax1.set_ylabel('True Label', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Predicted Label', fontsize=14, fontweight='bold')
+    
+    # Add colorbar
+    plt.colorbar(im, ax=ax1, shrink=0.8)
+    
+    # Metrics panel
+    ax2 = plt.subplot(gs[0, 1])
+    ax2.axis('off')
+    
+    # Display metrics
+    metrics = response_data["model_performance"]
+    next_pred = response_data.get("next_day_prediction")
+    
+    metrics_text = [
+        "MODEL PERFORMANCE METRICS",
+        "=" * 25,
+        f"Accuracy:  {metrics['accuracy']:.1%}",
+        f"Precision: {metrics['precision']:.1%}",
+        f"Recall:    {metrics['recall']:.1%}",
+        f"F1-Score:  {metrics['f1_score']:.1%}",
+        "",
+        f"Test Samples: {metrics['test_samples']}",
+        f"Train Samples: {metrics['training_samples']}",
+        "",
+        f"Sensor: {sensor.upper()}",
+        f"Date Range: {response_data['date_range']}"
+    ]
+    
+    if next_pred:
+        metrics_text.extend([
+            "",
+            "NEXT DAY PREDICTION",
+            "=" * 20,
+            f"Class: {next_pred['predicted_class']}",
+            f"Confidence: {next_pred['prediction_confidence']:.1%}",
+            f"Date: {next_pred['prediction_date']}",
+            "",
+            "Probability Breakdown:",
+            f"  High: {next_pred['confidence_scores']['high_probability']:.1%}",
+            f"  Low:  {next_pred['confidence_scores']['low_probability']:.1%}"
+        ])
+    
+    ax2.text(0.1, 0.95, "\n".join(metrics_text), transform=ax2.transAxes,
+            fontsize=11, fontfamily='monospace', va='top',
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.7))
+    
+    # Feature importance (bottom left)
+    ax3 = plt.subplot(gs[1, 0])
+    features = response_data["feature_importance"]
+    feature_names = [f['feature'] for f in features]
+    importance_scores = [f['importance'] for f in features]
+    
+    y_pos = np.arange(len(feature_names))
+    ax3.barh(y_pos, importance_scores, align='center', color=cmap(0.6), alpha=0.8)
+    ax3.set_yticks(y_pos)
+    ax3.set_yticklabels(feature_names)
+    ax3.invert_yaxis()
+    ax3.set_xlabel('Feature Importance', fontweight='bold')
+    ax3.set_title('Top Predictive Features', fontweight='bold')
+    ax3.grid(True, axis='x', alpha=0.3)
+    
+    # Class distribution (bottom right)
+    ax4 = plt.subplot(gs[1, 1])
+    class_totals = conf_matrix.sum(axis=1)
+    colors = [cmap(0.3), cmap(0.7)]
+    wedges, texts, autotexts = ax4.pie(class_totals, labels=class_names, autopct='%1.1f%%',
+                                      colors=colors, startangle=90)
+    
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_fontweight('bold')
+    
+    ax4.set_title('Class Distribution', fontweight='bold')
+    
+    # Main title
+    plt.suptitle(
+        f'Enhanced Confusion Matrix - {sensor.upper()} Sensor\n'
+        f'XGBoost Classification with Next-Day Predictions',
+        fontsize=16, fontweight='bold', y=0.98
+    )
+
+
+# Helper function to create enhanced features for better prediction
+def create_enhanced_prediction_features(df, sensor_col='value'):
+    """Create features specifically optimized for next-day prediction"""
+    if df is None or len(df) < 10:
+        return df
+    
+    df_enhanced = df.copy()
+    
+    # Time-based features
+    if 'timestamp' in df_enhanced.columns:
+        try:
+            df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
+            df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
+            df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
+            df_enhanced['is_weekend'] = df_enhanced['day_of_week'].isin([5, 6]).astype(int)
+            df_enhanced['day_of_month'] = df_enhanced['timestamp'].dt.day
+            df_enhanced['month'] = df_enhanced['timestamp'].dt.month
+        except:
+            pass
+    
+    # Enhanced lag features with different windows
+    for lag in [1, 2, 3, 5, 7]:  # Multiple time windows
+        df_enhanced[f'lag_{lag}'] = df_enhanced[sensor_col].shift(lag)
+    
+    # Rolling statistics with multiple windows
+    for window in [3, 5, 7]:
+        df_enhanced[f'rolling_mean_{window}'] = df_enhanced[sensor_col].rolling(window=window).mean()
+        df_enhanced[f'rolling_std_{window}'] = df_enhanced[sensor_col].rolling(window=window).std()
+        df_enhanced[f'rolling_min_{window}'] = df_enhanced[sensor_col].rolling(window=window).min()
+        df_enhanced[f'rolling_max_{window}'] = df_enhanced[sensor_col].rolling(window=window).max()
+    
+    # Rate of change features
+    df_enhanced['momentum_1'] = df_enhanced[sensor_col].diff(1)
+    df_enhanced['momentum_3'] = df_enhanced[sensor_col].diff(3)
+    df_enhanced['acceleration'] = df_enhanced['momentum_1'].diff(1)
+    
+    # Volatility and trend features
+    df_enhanced['volatility_5'] = df_enhanced[sensor_col].rolling(window=5).std()
+    df_enhanced['trend_5'] = df_enhanced[sensor_col].rolling(window=5).apply(
+        lambda x: np.polyfit(range(len(x)), x, 1)[0], raw=True
+    )
+    
+    # Remove rows with NaN values
+    df_enhanced = df_enhanced.dropna()
+    
+    return df_enhanced
+    
 # Run the application
 if __name__ == "__main__":
     import uvicorn
