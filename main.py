@@ -31,7 +31,7 @@ import io
 import base64
 import logging
 from typing import Dict, Any, Optional, List
-  
+import matplotlib.gridspec as gridspec  
 
 
 # Configure logging
@@ -1472,373 +1472,6 @@ def create_simple_binary_labels(df):
         logger.error(f"Binary labels error: {e}")
         return pd.DataFrame()
 
-def create_enhanced_features(df_binary, sensor_col='value'):
-    """Create more predictive features for sensor data"""
-    if df_binary is None or len(df_binary) < 10:
-        return df_binary
-    
-    df = df_binary.copy()
-    
-    # Basic lag features
-    df['lag_1'] = df[sensor_col].shift(1)
-    df['lag_2'] = df[sensor_col].shift(2)
-    df['lag_3'] = df[sensor_col].shift(3)
-    
-    # Enhanced: Rolling statistics
-    df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
-    df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
-    df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
-    df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
-    
-    # Enhanced: Rate of change and momentum
-    df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
-    df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
-    
-    # Enhanced: Percent changes
-    df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
-    df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
-    
-    # Enhanced: Volatility features
-    df['volatility_5'] = df[sensor_col].rolling(window=5).std()
-    df['volatility_10'] = df[sensor_col].rolling(window=10).std()
-    
-    # Enhanced: Statistical features
-    overall_mean = df[sensor_col].mean()
-    overall_std = df[sensor_col].std()
-    if overall_std > 0:
-        df['z_score'] = (df[sensor_col] - overall_mean) / overall_std
-    else:
-        df['z_score'] = 0
-    
-    # Enhanced: Binary features for spikes/drops
-    df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
-    df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
-    
-    # Enhanced: Time-based features
-    if 'timestamp' in df.columns:
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df['hour'] = df['timestamp'].dt.hour
-            df['day_of_week'] = df['timestamp'].dt.dayofweek
-            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-            df['month'] = df['timestamp'].dt.month
-        except:
-            pass
-    
-    # Remove rows with NaN values
-    df = df.dropna()
-    
-    return df
-    
-@app.get("/performance/{sensor_id}")
-def performance_metrics(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type"),
-    test_size: float = Query(0.2, description="Test set size ratio"),
-    cv_folds: int = Query(3, description="Cross-validation folds"),
-    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
-    use_grid_search: bool = Query(False, description="Enable Grid Search for hyperparameters (slower)"),
-    grid_n_estimators: str = Query("50,100", description="Comma-separated values for n_estimators"),
-    grid_max_depth: str = Query("3,5", description="Comma-separated values for max_depth"),
-    grid_learning_rate: str = Query("0.1,0.05", description="Comma-separated values for learning_rate"),
-    grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
-    grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
-):
-    """Get XGBoost performance metrics with enhanced features and diagnostics"""
-    try:
-        log_memory_usage("Before performance metrics")
-        
-        # Limit data size for performance analysis
-        max_training_samples = 5000
-        
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return JSONResponse(
-                content={
-                    "error": f"No data found for sensor {sensor_id}",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=404,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        # Use the simple preprocessing
-        df = preprocess_dataframe_simple(records, sensor)
-        if df is None or df.empty:
-            return JSONResponse(
-                content={
-                    "error": "No valid data after preprocessing",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=400,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        # Use simple date filtering
-        df_filtered = filter_by_date_range_simple(df, date_range)
-        if df_filtered is None or len(df_filtered) < 10:
-            return JSONResponse(
-                content={
-                    "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=400,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        # Sample data if too large
-        if len(df_filtered) > max_training_samples:
-            df_filtered = df_filtered.sample(max_training_samples, random_state=42)
-            logger.info(f"Sampled {max_training_samples} records for performance analysis")
-
-        # Create binary labels
-        df_binary = create_simple_binary_labels(df_filtered)
-        if df_binary is None or df_binary.empty:
-            return JSONResponse(
-                content={
-                    "error": "Could not create binary labels (possibly single-class).",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=400,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        # Enhanced feature creation
-        df_features = create_enhanced_features(df_binary, sensor_col='value')
-        if df_features is None or df_features.empty:
-            return JSONResponse(
-                content={
-                    "error": "Could not create features (likely because of insufficient rows for feature engineering).",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=400,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        # Get ALL feature columns (not just lag)
-        feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
-        
-        if not feature_cols:
-            return JSONResponse(
-                content={
-                    "error": "No features generated for training",
-                    "sensor_id": sensor_id,
-                    "sensor_type": sensor,
-                    "status": "error"
-                },
-                status_code=400,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
-                }
-            )
-
-        X = df_features[feature_cols].values
-        y = df_features['class_binary'].values
-
-        # Calculate baseline accuracy (majority class)
-        if len(y) > 0:
-            # FIX: Handle numpy types properly
-            unique_classes, class_counts = np.unique(y, return_counts=True)
-            baseline_accuracy = float(max(class_counts) / len(y))
-        else:
-            baseline_accuracy = 0.5
-
-        # Use smaller test size for large datasets
-        actual_test_size = min(test_size, 0.2)
-        if len(X) < 10:
-            X_train, X_test, y_train, y_test = X, X, y, y
-        else:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=actual_test_size, random_state=42,
-                stratify=y if len(np.unique(y)) > 1 else None
-            )
-
-        # Decide if grid search should be used
-        allow_grid = use_grid_search and len(X_train) <= 2000
-        if allow_grid:
-            param_grid = {
-                "n_estimators": [int(v) for v in grid_n_estimators.split(",")],
-                "max_depth": [int(v) for v in grid_max_depth.split(",")],
-                "learning_rate": [float(v) for v in grid_learning_rate.split(",")],
-                "subsample": [float(v) for v in grid_subsample.split(",")],
-                "colsample_bytree": [float(v) for v in grid_colsample_bytree.split(",")],
-            }
-            base_model = xgb.XGBClassifier(
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-            grid_search = GridSearchCV(
-                estimator=base_model,
-                param_grid=param_grid,
-                scoring="accuracy",
-                cv=cv_folds,
-                n_jobs=1,
-                verbose=1
-            )
-            grid_search.fit(X_train, y_train)
-            model = grid_search.best_estimator_
-            best_params = grid_search.best_params_
-        else:
-            # Better default parameters based on data size
-            if len(X_train) < 1000:
-                model = xgb.XGBClassifier(
-                    n_estimators=100,
-                    max_depth=3,
-                    learning_rate=0.05,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    reg_alpha=0.1,
-                    reg_lambda=0.1,
-                    use_label_encoder=False,
-                    eval_metric="logloss",
-                    random_state=42
-                )
-            else:
-                model = xgb.XGBClassifier(
-                    n_estimators=200,
-                    max_depth=6,
-                    learning_rate=0.1,
-                    use_label_encoder=False,
-                    eval_metric="logloss", 
-                    random_state=42
-                )
-            model.fit(X_train, y_train)
-            best_params = None
-
-        y_pred = model.predict(X_test)
-
-        accuracy = float(accuracy_score(y_test, y_pred))
-        precision = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
-        recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
-        f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
-
-        # Calculate feature importance - FIXED: Handle numpy types
-        feature_importance = []
-        if hasattr(model, 'feature_importances_'):
-            for i, importance in enumerate(model.feature_importances_):
-                feature_importance.append({
-                    "feature": feature_cols[i] if i < len(feature_cols) else f"feature_{i}",
-                    "importance": float(importance)  # Convert numpy float to Python float
-                })
-            # Sort by importance
-            feature_importance.sort(key=lambda x: x['importance'], reverse=True)
-
-        # Get class distribution - FIXED: Handle numpy types properly
-        try:
-            class_counts = pd.Series(y).value_counts()
-            class_distribution = {}
-            class_percentages = {}
-            
-            for class_val, count in class_counts.items():
-                class_distribution[str(int(class_val))] = int(count)  # Convert numpy to native types
-                class_percentages[str(int(class_val))] = float(count / len(y))
-                
-        except Exception as e:
-            logger.warning(f"Error processing class distribution: {e}")
-            class_distribution = {"0": len(y)} if len(y) > 0 else {"0": 0}
-            class_percentages = {"0": 1.0} if len(y) > 0 else {"0": 0.0}
-
-        # ✅ CORRECTED: Proper response structure with CORS headers
-        response_data = {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "date_range": date_range,
-            "algorithm": "XGBoost (GridSearch)" if allow_grid else "XGBoost (Enhanced)",
-            "best_params": best_params,
-            "performance_metrics": {
-                "accuracy": accuracy,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1,
-                "baseline_accuracy": float(baseline_accuracy),
-                "improvement_over_baseline": float(accuracy - baseline_accuracy),
-                "test_samples": int(len(y_test))
-            },
-            "data_info": {
-                "total_samples": int(len(df_features)),
-                "training_samples": int(len(X_train)),
-                "test_samples": int(len(y_test)),
-                "class_distribution": class_distribution,
-                "class_percentages": class_percentages,
-                "features_used": feature_cols,
-                "feature_count": len(feature_cols)
-            },
-            "feature_importance": feature_importance[:10],
-            "diagnostics": {
-                "baseline_interpretation": "Accuracy if always predicting majority class",
-                "model_interpretation": "Positive improvement means model is learning patterns",
-                "feature_quality": "High importance > 0.1 suggests good features"
-            },
-            "status": "success"
-        }
-
-        # Clean up memory
-        del records, df, df_filtered, df_binary, df_features, model
-        del X, y, X_train, X_test, y_train, y_test, y_pred
-        gc.collect()
-        
-        log_memory_usage("After performance metrics")
-        
-        # Return with explicit CORS headers
-        return JSONResponse(
-            content=response_data,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "*"
-            }
-        )
-
-    except Exception as e:
-        logger.exception("PERFORMANCE ENDPOINT CRASH")
-        return JSONResponse(
-            content={
-                "error": f"Internal server error: {str(e)}",
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "status": "error"
-            },
-            status_code=500,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "*"
-            }
-        )    
-
 def create_simple_lag_features(df, lags=2):
     """Create simple lag features"""
     try:
@@ -1859,7 +1492,6 @@ def create_simple_lag_features(df, lags=2):
     except Exception as e:
         logger.error(f"Lag features error: {e}")
         return pd.DataFrame()
-
 
 def get_accuracy_assessment(accuracy):
     """Get accuracy assessment"""
@@ -1885,6 +1517,359 @@ def get_accuracy_assessment(accuracy):
         "interpretation": f"XGBoost shows {level.lower()} performance with {confidence.lower()} confidence"
     }
 
+@app.get("/performance/{sensor_id}")
+def performance_metrics(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type"),
+    test_size: float = Query(0.2, description="Test set size ratio"),
+    cv_folds: int = Query(3, description="Cross-validation folds"),
+    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+    use_grid_search: bool = Query(False, description="Enable Grid Search for hyperparameters (slower)"),
+    grid_n_estimators: str = Query("50,100", description="Comma-separated values for n_estimators"),
+    grid_max_depth: str = Query("3,5", description="Comma-separated values for max_depth"),
+    grid_learning_rate: str = Query("0.1,0.05", description="Comma-separated values for learning_rate"),
+    grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
+    grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
+):
+    """Get XGBoost performance metrics with validation checks to prevent 100% results"""
+    try:
+        logger.info(f"Starting performance analysis for {sensor_id}, sensor: {sensor}")
+        
+        # Fetch and preprocess data
+        records = fetch_sensor_history(sensor_id)
+        if not records:
+            return JSONResponse(
+                content={"error": f"No data found for sensor {sensor_id}", "status": "error"},
+                status_code=404
+            )
+
+        df = preprocess_dataframe(records, sensor)
+        if df.empty or len(df) < 10:
+            return JSONResponse(
+                content={"error": "Not enough data for analysis", "status": "error"},
+                status_code=400
+            )
+
+        df_filtered = filter_by_date_range(df, date_range)
+        if df_filtered.empty or len(df_filtered) < 10:
+            return JSONResponse(
+                content={"error": f"Not enough data after {date_range} filter", "status": "error"},
+                status_code=400
+            )
+
+        # Create binary labels with validation
+        df_binary = create_simple_binary_labels(df_filtered)
+        if df_binary.empty:
+            return JSONResponse(
+                content={"error": "Could not create valid binary labels", "status": "error"},
+                status_code=400
+            )
+
+        # DEBUG: Check class distribution
+        class_counts = df_binary['class_binary'].value_counts()
+        logger.info(f"Class distribution: {dict(class_counts)}")
+        
+        # Check if we have sufficient class diversity
+        if len(class_counts) < 2:
+            return JSONResponse(
+                content={
+                    "error": "Only one class found in data - cannot perform classification",
+                    "class_distribution": dict(class_counts),
+                    "status": "error"
+                },
+                status_code=400
+            )
+
+        # Check if classes are too imbalanced
+        min_class_ratio = min(class_counts) / len(df_binary)
+        if min_class_ratio < 0.1:  # Less than 10% in minority class
+            logger.warning(f"Highly imbalanced data: {dict(class_counts)}")
+
+        # Create features with data leakage prevention
+        df_features = create_safe_features(df_binary, sensor_col='value')
+        if df_features.empty or len(df_features) < 5:
+            return JSONResponse(
+                content={"error": "Feature engineering failed", "status": "error"},
+                status_code=400
+            )
+
+        # Get features excluding target and timestamp
+        feature_cols = [col for col in df_features.columns 
+                       if col not in ['class_binary', 'timestamp', 'value', sensor]]
+        
+        if not feature_cols:
+            return JSONResponse(
+                content={"error": "No valid features generated", "status": "error"},
+                status_code=400
+            )
+
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
+
+        # DEBUG: Data validation
+        logger.info(f"Feature matrix shape: {X.shape}")
+        logger.info(f"Target distribution: {np.unique(y, return_counts=True)}")
+        
+        # Check for data leakage
+        if check_data_leakage(df_features, feature_cols, 'class_binary'):
+            return JSONResponse(
+                content={"error": "Potential data leakage detected", "status": "error"},
+                status_code=400
+            )
+
+        # Calculate baseline accuracy (majority class)
+        baseline_accuracy = max(np.bincount(y)) / len(y)
+        logger.info(f"Baseline accuracy: {baseline_accuracy:.3f}")
+
+        # Proper time-series split to prevent data leakage
+        if len(X) > 20:
+            # Use time-series split for temporal data
+            split_point = int(len(X) * (1 - test_size))
+            X_train, X_test = X[:split_point], X[split_point:]
+            y_train, y_test = y[:split_point], y[split_point:]
+        else:
+            # For very small datasets, use regular split with shuffle
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=42, stratify=y
+            )
+
+        logger.info(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
+
+        # Validate split
+        if len(X_test) == 0 or len(np.unique(y_test)) < 2:
+            return JSONResponse(
+                content={
+                    "error": "Test set too small or only one class in test set",
+                    "train_samples": len(X_train),
+                    "test_samples": len(X_test),
+                    "test_class_distribution": dict(zip(*np.unique(y_test, return_counts=True))) if len(y_test) > 0 else {}
+                },
+                status_code=400
+            )
+
+        # Train model with regularization to prevent overfitting
+        if use_grid_search and len(X_train) > 50:
+            param_grid = {
+                "n_estimators": [int(v) for v in grid_n_estimators.split(",")],
+                "max_depth": [int(v) for v in grid_max_depth.split(",")],
+                "learning_rate": [float(v) for v in grid_learning_rate.split(",")],
+                "subsample": [float(v) for v in grid_subsample.split(",")],
+                "colsample_bytree": [float(v) for v in grid_colsample_bytree.split(",")],
+            }
+            model = xgb.XGBClassifier(
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+            grid_search = GridSearchCV(
+                estimator=model,
+                param_grid=param_grid,
+                scoring="accuracy",
+                cv=min(cv_folds, 5),  # Limit CV folds for small datasets
+                n_jobs=1
+            )
+            grid_search.fit(X_train, y_train)
+            best_model = grid_search.best_estimator_
+            best_params = grid_search.best_params_
+        else:
+            # Use conservative parameters to prevent overfitting
+            best_model = xgb.XGBClassifier(
+                n_estimators=min(100, len(X_train)),
+                max_depth=3,  # Smaller trees to prevent overfitting
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=1.0,  # Add regularization
+                reg_lambda=1.0,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+            best_model.fit(X_train, y_train)
+            best_params = None
+
+        # Make predictions
+        y_pred = best_model.predict(X_test)
+        y_pred_proba = best_model.predict_proba(X_test)
+
+        # Calculate metrics with validation
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+        # DEBUG: Check if metrics are suspicious
+        logger.info(f"Calculated metrics - Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, "
+                   f"Recall: {recall:.3f}, F1: {f1:.3f}")
+
+        # Validate metrics aren't perfect
+        if accuracy > 0.95:  # Suspiciously high accuracy
+            logger.warning(f"Suspiciously high accuracy detected: {accuracy}")
+            
+            # Check if model is just predicting majority class
+            majority_class = np.bincount(y_test).argmax()
+            majority_accuracy = np.mean(y_test == majority_class)
+            
+            if abs(accuracy - majority_accuracy) < 0.05:
+                return JSONResponse(
+                    content={
+                        "error": "Model is likely just predicting majority class",
+                        "metrics": {
+                            "accuracy": accuracy,
+                            "precision": precision,
+                            "recall": recall,
+                            "f1_score": f1,
+                            "majority_class_accuracy": majority_accuracy,
+                            "test_class_distribution": dict(zip(*np.unique(y_test, return_counts=True)))
+                        },
+                        "status": "suspicious"
+                    },
+                    status_code=400
+                )
+
+        # Feature importance
+        feature_importance = []
+        if hasattr(best_model, 'feature_importances_'):
+            for i, importance in enumerate(best_model.feature_importances_):
+                feature_importance.append({
+                    "feature": feature_cols[i] if i < len(feature_cols) else f"feature_{i}",
+                    "importance": float(importance)
+                })
+            feature_importance.sort(key=lambda x: x['importance'], reverse=True)
+
+        # Class distribution
+        class_distribution = dict(zip(*np.unique(y, return_counts=True)))
+        class_percentages = {str(k): v/len(y) for k, v in class_distribution.items()}
+
+        response = {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "algorithm": "XGBoost (GridSearch)" if use_grid_search else "XGBoost (Regularized)",
+            "best_params": best_params,
+            "performance_metrics": {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4),
+                "baseline_accuracy": round(baseline_accuracy, 4),
+                "improvement_over_baseline": round(accuracy - baseline_accuracy, 4),
+                "test_samples": len(y_test),
+                "train_samples": len(X_train)
+            },
+            "data_info": {
+                "total_samples": len(df_features),
+                "training_samples": len(X_train),
+                "test_samples": len(y_test),
+                "class_distribution": class_distribution,
+                "class_percentages": class_percentages,
+                "features_used": feature_cols,
+                "feature_count": len(feature_cols),
+                "data_quality_check": "passed"
+            },
+            "feature_importance": feature_importance[:10],
+            "debug_info": {
+                "class_balance_ratio": min_class_ratio,
+                "suspicious_metrics": accuracy > 0.95,
+                "majority_class_accuracy": round(baseline_accuracy, 4)
+            },
+            "status": "success"
+        }
+
+        return JSONResponse(content=response)
+
+    except Exception as e:
+        logger.exception("Performance metrics error")
+        return JSONResponse(
+            content={"error": f"Analysis failed: {str(e)}", "status": "error"},
+            status_code=500
+        )
+
+
+def create_safe_features(df_binary, sensor_col='value'):
+    """Create features without data leakage"""
+    if df_binary is None or len(df_binary) < 10:
+        return pd.DataFrame()
+    
+    df = df_binary.copy()
+    
+    # Safe lag features (only past data)
+    df['lag_1'] = df[sensor_col].shift(1)
+    df['lag_2'] = df[sensor_col].shift(2)
+    df['lag_3'] = df[sensor_col].shift(3)
+    
+    # Safe rolling statistics (using only past data)
+    df['rolling_mean_3'] = df[sensor_col].shift(1).rolling(window=3).mean()
+    df['rolling_std_3'] = df[sensor_col].shift(1).rolling(window=3).std()
+    
+    # Remove rows with NaN values (from shifting)
+    df = df.dropna()
+    
+    # Remove any features that might leak future information
+    safe_cols = [col for col in df.columns if not any(x in str(col) for x in ['future', 'target', 'class'])]
+    df = df[safe_cols]
+    
+    return df
+
+
+def check_data_leakage(df, feature_cols, target_col):
+    """Check for potential data leakage"""
+    try:
+        # Check if target is in features
+        if target_col in feature_cols:
+            return True
+        
+        # Check for perfect correlation with target
+        for col in feature_cols:
+            if col != target_col:
+                correlation = abs(df[col].corr(df[target_col]))
+                if correlation > 0.95:  # Nearly perfect correlation
+                    logger.warning(f"High correlation between {col} and target: {correlation}")
+                    return True
+        
+        return False
+    except:
+        return False
+        
+@app.get("/debug/performance/{sensor_id}")
+def debug_performance_metrics(
+    sensor_id: str,
+    sensor: str = Query(...)
+):
+    """Debug endpoint to check data quality before running analysis"""
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+    
+    if df.empty:
+        return {"error": "No data after preprocessing"}
+    
+    df_binary = create_simple_binary_labels(df)
+    
+    analysis = {
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "total_records": len(records),
+        "after_preprocessing": len(df),
+        "after_binary_labels": len(df_binary) if df_binary is not None else 0,
+        "data_quality_checks": {}
+    }
+    
+    if df_binary is not None and not df_binary.empty:
+        # Class distribution analysis
+        class_counts = df_binary['class_binary'].value_counts()
+        analysis["class_distribution"] = dict(class_counts)
+        analysis["data_quality_checks"]["class_balance"] = len(class_counts) >= 2
+        analysis["data_quality_checks"]["minority_class_ratio"] = min(class_counts) / len(df_binary)
+        
+        # Value range analysis
+        analysis["value_statistics"] = {
+            "min": float(df['value'].min()),
+            "max": float(df['value'].max()),
+            "mean": float(df['value'].mean()),
+            "std": float(df['value'].std())
+        }
+    
+    return analysis
 # ---------------------------------------------------
 # Correlation Plots (Single or Multiple Sensors)
 # ---------------------------------------------------
