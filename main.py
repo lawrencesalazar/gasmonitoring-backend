@@ -448,6 +448,23 @@ def calculate_risk_index(data: Dict[str, Any]) -> float:
         logger.error(f"Error calculating risk index: {e}")
         return 0.0
 
+def convert_numpy_types(obj):
+    """Recursively convert numpy types to native Python types for JSON serialization"""
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        return {str(key): convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    else:
+        return obj
+        
 # =============================================================================
 # SENSOR ANALYTICS ENDPOINTS
 # =============================================================================
@@ -917,6 +934,7 @@ def plot_sensor_data(
     except Exception as e:
         logger.error(f"Plot generation error: {e}")
         return error_image(f"Error generating plot: {str(e)}")
+        
 @app.get("/shap_hour_minimal/{sensor_id}")
 def shap_hour_minimal(
     sensor_id: str, 
@@ -940,17 +958,15 @@ def shap_hour_minimal(
             logger.warning(f"No valid data after preprocessing for {sensor_id}, sensor: {sensor}")
             return {"error": "No valid sensor data after preprocessing", "status": "error"}
         
-        logger.info(f"After preprocessing: {len(df)} records, date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        logger.info(f"After preprocessing: {len(df)} records")
         
         df_filtered = filter_by_date_range(df, range)
         if df_filtered.empty:
             logger.warning(f"No data after {range} filter. Original had {len(df)} records")
-            # Return more detailed error with suggestions
             return {
                 "error": f"No data available for the selected date range '{range}'. Try 'all' or a longer range.",
                 "available_data": {
                     "total_records": len(df),
-                    "date_range_available": f"{df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}",
                     "suggested_ranges": ["all", "3months", "6months", "1year"]
                 },
                 "status": "error"
@@ -958,70 +974,64 @@ def shap_hour_minimal(
         
         logger.info(f"After date filtering: {len(df_filtered)} records")
         
-        # Ensure timestamp is in proper datetime format
+        # Ensure timestamp is in proper datetime format - FIXED VERSION
+        if 'timestamp' not in df_filtered.columns:
+            return {"error": "Timestamp column missing", "status": "error"}
+        
+        # Convert timestamp to datetime if it's not already
         if not pd.api.types.is_datetime64_any_dtype(df_filtered["timestamp"]):
-            df_filtered["timestamp"] = pd.to_datetime(df_filtered["timestamp"])
+            try:
+                df_filtered.loc[:, "timestamp"] = pd.to_datetime(df_filtered["timestamp"])
+            except Exception as e:
+                logger.error(f"Failed to parse timestamps: {e}")
+                return {"error": f"Failed to parse timestamps: {str(e)}", "status": "error"}
         
-        # Extract hour and aggregate
-        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
-        agg = df_filtered.groupby("hour")["value"].agg(['mean', 'count', 'std']).reset_index()
+        # Extract hour - FIXED: Use .loc to avoid chained assignment
+        df_filtered.loc[:, "hour"] = df_filtered["timestamp"].dt.hour
         
-        # Filter out hours with insufficient data
-        agg = agg[agg['count'] >= 1]  # At least 1 data point per hour
-        agg = agg.rename(columns={'mean': 'value', 'count': 'data_points', 'std': 'std_dev'})
+        # Simple aggregation - FIXED: Use proper aggregation syntax
+        try:
+            agg = df_filtered.groupby("hour", as_index=False).agg({
+                "value": ["mean", "count"]
+            })
+            # Flatten column names
+            agg.columns = ['hour', 'value', 'data_points']
+        except Exception as e:
+            logger.error(f"Groupby failed: {e}")
+            # Fallback to simple groupby
+            agg = df_filtered.groupby("hour")["value"].mean().reset_index()
+            agg['data_points'] = df_filtered.groupby("hour")["value"].count().values
         
         if agg.empty:
-            logger.warning(f"No hourly aggregation possible - insufficient data distribution")
+            logger.warning(f"No hourly aggregation possible")
             return {
-                "error": "Insufficient data for hourly analysis. Data may not cover multiple hours.",
-                "data_info": {
-                    "total_records": len(df_filtered),
-                    "hours_covered": df_filtered["hour"].nunique(),
-                    "hourly_distribution": df_filtered["hour"].value_counts().to_dict()
-                },
+                "error": "Insufficient data for hourly analysis",
                 "status": "error"
             }
         
         logger.info(f"Hourly aggregation: {len(agg)} hours with data")
         
-        # Create enhanced Seaborn plot
-        fig, ax = plt.subplots(figsize=(12, 6))
+        # Create plot
+        fig, ax = plt.subplots(figsize=(10, 6))
         
-        # Plot with error bars if we have multiple data points
-        if agg['data_points'].max() > 1:
-            # Use line plot with error bands
-            sns.lineplot(
-                data=df_filtered, 
-                x="hour", 
-                y="value", 
-                ax=ax, 
-                marker="o", 
-                linewidth=2.5, 
-                markersize=6,
-                errorbar='sd',  # Show standard deviation
-                err_style='band',  # Error as band around line
-                alpha=0.3
-            )
-        else:
-            # Simple line plot for limited data
-            sns.lineplot(data=agg, x="hour", y="value", ax=ax, marker="o", linewidth=2.5, markersize=8)
+        # Simple line plot - FIXED: Use proper data references
+        try:
+            # Convert to native Python types for plotting
+            hours = agg['hour'].astype(int).tolist()
+            values = agg['value'].astype(float).tolist()
+            
+            plt.plot(hours, values, marker='o', linewidth=2, markersize=6)
+            plt.scatter(hours, values, s=50, alpha=0.7)
+        except Exception as e:
+            logger.error(f"Plotting failed: {e}")
+            # Fallback plotting
+            plt.plot(agg['hour'], agg['value'], 'o-')
         
-        # Customize the plot
-        ax.set_xlabel("Hour of Day", fontsize=12, fontweight='bold')
-        ax.set_ylabel(f"{sensor.upper()} Value", fontsize=12, fontweight='bold')
-        ax.set_title(f"Hourly {sensor.upper()} Pattern - Sensor {sensor_id}\nDate Range: {range}", fontsize=14, pad=20, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Set x-axis to show all 24 hours
-        ax.set_xlim(-0.5, 23.5)
-        ax.set_xticks(range(0, 24))
-        
-        # Add data quality info to plot
-        total_points = len(df_filtered)
-        hours_covered = len(agg)
-        ax.text(0.02, 0.98, f"Data: {total_points} points, {hours_covered}/24 hours", 
-                transform=ax.transAxes, fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        plt.xlabel("Hour of Day", fontsize=12)
+        plt.ylabel(f"{sensor.upper()} Value", fontsize=12)
+        plt.title(f"Hourly {sensor.upper()} Pattern - Sensor {sensor_id}", fontsize=14)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(range(0, 24))
         
         buf = io.BytesIO()
         plt.tight_layout()
@@ -1031,17 +1041,27 @@ def shap_hour_minimal(
         
         image_data = base64.b64encode(buf.read()).decode('utf-8')
         
-        # Prepare response with detailed information
+        # Convert numpy types to JSON-serializable types - FIXED
+        hourly_data = []
+        for _, row in agg.iterrows():
+            hourly_data.append({
+                "hour": int(row['hour']),
+                "value": float(row['value']),
+                "data_points": int(row.get('data_points', 1))
+            })
+        
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
-            "hourly_data": agg.to_dict("records"),
+            "hourly_data": hourly_data,
             "data_summary": {
                 "total_records": len(df_filtered),
                 "hours_covered": len(agg),
-                "data_points_per_hour": agg[['hour', 'data_points']].to_dict('records'),
-                "date_range_used": f"{df_filtered['timestamp'].min().strftime('%Y-%m-%d')} to {df_filtered['timestamp'].max().strftime('%Y-%m-%d')}"
+                "date_range_used": {
+                    "start": df_filtered['timestamp'].min().strftime('%Y-%m-%d'),
+                    "end": df_filtered['timestamp'].max().strftime('%Y-%m-%d')
+                }
             },
             "image_data": image_data,
             "status": "success"
@@ -1054,13 +1074,9 @@ def shap_hour_minimal(
         logger.error(f"SHAP hourly analysis error for {sensor_id}: {str(e)}", exc_info=True)
         return {
             "error": f"Analysis failed: {str(e)}", 
-            "status": "error",
-            "debug_info": {
-                "sensor_id": sensor_id,
-                "sensor_type": sensor,
-                "range": range
-            }
+            "status": "error"
         }
+        
 @app.get("/debug/hourly-data/{sensor_id}")
 def debug_hourly_data(
     sensor_id: str,
@@ -1845,37 +1861,44 @@ def performance_metrics(
 
         logger.info(f"Metrics - Accuracy: {accuracy:.3f}")
 
-        # Feature importance
+        # Feature importance - CONVERT NUMPY TYPES TO NATIVE PYTHON TYPES
         feature_importance = []
         if hasattr(model, 'feature_importances_'):
             for i, importance in enumerate(model.feature_importances_):
                 feature_importance.append({
                     "feature": feature_cols[i] if i < len(feature_cols) else f"feature_{i}",
-                    "importance": float(importance)
+                    "importance": float(importance)  # Convert numpy float to Python float
                 })
             feature_importance.sort(key=lambda x: x['importance'], reverse=True)
 
-        # Prepare response
+        # CONVERT NUMPY INT TYPES TO NATIVE PYTHON TYPES FOR JSON SERIALIZATION
+        y_unique, y_counts = np.unique(y, return_counts=True)
+        class_distribution = {
+            str(int(key)): int(value)  # Convert numpy.int64 to Python int
+            for key, value in zip(y_unique, y_counts)
+        }
+
+        # Prepare response - ENSURE ALL VALUES ARE JSON SERIALIZABLE
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "date_range": date_range,
+            "date_range": range,
             "algorithm": "XGBoost (Simplified)",
             "performance_metrics": {
-                "accuracy": round(accuracy, 4),
-                "precision": round(precision, 4),
-                "recall": round(recall, 4),
-                "f1_score": round(f1, 4),
-                "baseline_accuracy": round(baseline_accuracy, 4),
-                "improvement_over_baseline": round(accuracy - baseline_accuracy, 4),
-                "test_samples": len(y_test),
-                "train_samples": len(X_train)
+                "accuracy": float(accuracy),  # Ensure float
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1_score": float(f1),
+                "baseline_accuracy": float(baseline_accuracy),
+                "improvement_over_baseline": float(accuracy - baseline_accuracy),
+                "test_samples": int(len(y_test)),  # Ensure int
+                "train_samples": int(len(X_train))
             },
             "data_info": {
-                "total_samples": len(df_features),
-                "training_samples": len(X_train),
-                "test_samples": len(y_test),
-                "class_distribution": dict(zip(*np.unique(y, return_counts=True))),
+                "total_samples": int(len(df_features)),
+                "training_samples": int(len(X_train)),
+                "test_samples": int(len(y_test)),
+                "class_distribution": class_distribution,  # Use converted distribution
                 "features_used": feature_cols,
                 "data_quality": "good"
             },
@@ -1886,12 +1909,12 @@ def performance_metrics(
         return JSONResponse(content=response)
 
     except Exception as e:
-        logger.exception("Performance metrics error")
+        logger.exception(f"Performance metrics error: {str(e)}")
         return JSONResponse(
             content={"error": f"Analysis failed: {str(e)}", "status": "error"},
             status_code=500
         )
-
+        
 def create_safe_features(df_binary, sensor_col='value'):
     """Create features without data leakage"""
     if df_binary is None or len(df_binary) < 10:
