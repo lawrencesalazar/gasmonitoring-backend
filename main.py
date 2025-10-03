@@ -1587,177 +1587,93 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+  def preprocess_dataframe_simple(records, sensor):
+    """Simplified dataframe preprocessing for performance metrics"""
+    try:
+        if not records:
+            return pd.DataFrame()
+        
+        # Create DataFrame with only necessary columns
+        data = []
+        for record in records:
+            if sensor in record and 'timestamp' in record:
+                try:
+                    value = float(record[sensor])
+                    timestamp = pd.to_datetime(record['timestamp'])
+                    data.append({'timestamp': timestamp, 'value': value})
+                except (ValueError, TypeError):
+                    continue
+        
+        if not data:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(data)
+        df = df.sort_values('timestamp')
+        df = df.dropna()
+        
+        logger.info(f"Preprocessed {len(df)} records for sensor {sensor}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Preprocessing error: {e}")
+        return pd.DataFrame()
+
+def filter_by_date_range_simple(df, date_range):
+    """Simplified date filtering for performance metrics"""
+    try:
+        if df.empty:
+            return df
+            
+        now = pd.Timestamp.now()
+        
+        date_filters = {
+            "1week": now - pd.Timedelta(weeks=1),
+            "1month": now - pd.Timedelta(days=30),
+            "3months": now - pd.Timedelta(days=90),
+            "6months": now - pd.Timedelta(days=180),
+            "1year": now - pd.Timedelta(days=365),
+            "all": pd.Timestamp.min
+        }
+        
+        cutoff = date_filters.get(date_range, date_filters["1month"])
+        
+        if cutoff != pd.Timestamp.min:
+            filtered_df = df[df['timestamp'] >= cutoff]
+            logger.info(f"Filtered from {len(df)} to {len(filtered_df)} records for range {date_range}")
+            return filtered_df
+            
+        return df
+        
+    except Exception as e:
+        logger.error(f"Date filtering error: {e}")
+        return df
+
+def create_simple_binary_labels(df):
+    """Create simple binary labels for classification"""
+    try:
+        if df.empty or len(df) < 5:
+            return pd.DataFrame()
+            
+        df_copy = df.copy()
+        
+        # Use median for binary classification
+        median_val = df_copy['value'].median()
+        df_copy['class_binary'] = (df_copy['value'] > median_val).astype(int)
+        
+        # Check if we have both classes
+        class_counts = df_copy['class_binary'].value_counts()
+        logger.info(f"Class distribution: {dict(class_counts)}")
+        
+        if len(class_counts) < 2:
+            logger.warning(f"Only one class found: {class_counts.index[0]}")
+            return pd.DataFrame()
+            
+        return df_copy
+        
+    except Exception as e:
+        logger.error(f"Binary labels error: {e}")
+        return pd.DataFrame()
  
-# @app.get("/performance/{sensor_id}")
-# def performance_metrics(
-    # sensor_id: str,
-    # sensor: str = Query(..., description="Sensor type"),
-    # test_size: float = Query(0.2, description="Test set size ratio"),
-    # cv_folds: int = Query(3, description="Cross-validation folds"),
-    # date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
-    # use_grid_search: bool = Query(False, description="Enable Grid Search for hyperparameters (slower)"),
-    # grid_n_estimators: str = Query("50,100", description="Comma-separated values for n_estimators"),
-    # grid_max_depth: str = Query("3,5", description="Comma-separated values for max_depth"),
-    # grid_learning_rate: str = Query("0.1,0.05", description="Comma-separated values for learning_rate"),
-    # grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
-    # grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
-# ):
-    # """Get XGBoost performance metrics with memory optimization"""
-    # try:
-        # log_memory_usage("Before performance metrics")
-        
-        Limit data size for performance analysis
-        # max_training_samples = 5000
-        
-        # records = fetch_sensor_history(sensor_id)
-        # if not records:
-            # return {
-                # "error": f"No data found for sensor {sensor_id}",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df = preprocess_dataframe_simple(records, sensor)
-        # if df is None or df.empty:
-            # return {
-                # "error": "No valid data after preprocessing",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df_filtered = filter_by_date_range_simple(df, date_range)
-        # if df_filtered is None or len(df_filtered) < 5:
-            # return {
-                # "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        Sample data if too large
-        # if len(df_filtered) > max_training_samples:
-            # df_filtered = df_filtered.sample(max_training_samples, random_state=42)
-            # logger.info(f"Sampled {max_training_samples} records for performance analysis")
-
-        # df_binary = create_simple_binary_labels(df_filtered)
-        # if df_binary is None or df_binary.empty:
-            # return {
-                # "error": "Could not create binary labels (possibly single-class).",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df_features = create_simple_lag_features(df_binary)
-        # if df_features is None or df_features.empty:
-            # return {
-                # "error": "Could not create features (likely because of insufficient rows for lags).",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # feature_cols = [col for col in df_features.columns if col.startswith('lag')]
-        # X = df_features[feature_cols].values
-        # y = df_features['class_binary'].values
-
-        Use smaller test size for large datasets
-        # actual_test_size = min(test_size, 0.2)
-        # if len(X) < 10:
-            # X_train, X_test, y_train, y_test = X, X, y, y
-        # else:
-            # X_train, X_test, y_train, y_test = train_test_split(
-                # X, y, test_size=actual_test_size, random_state=42,
-                # stratify=y if len(np.unique(y)) > 1 else None
-            # )
-
-        Decide if grid search should be used
-        # allow_grid = use_grid_search and len(X_train) <= 2000  # ✅ only small datasets
-        # if allow_grid:
-            # param_grid = {
-                # "n_estimators": [int(v) for v in grid_n_estimators.split(",")],
-                # "max_depth": [int(v) for v in grid_max_depth.split(",")],
-                # "learning_rate": [float(v) for v in grid_learning_rate.split(",")],
-                # "subsample": [float(v) for v in grid_subsample.split(",")],
-                # "colsample_bytree": [float(v) for v in grid_colsample_bytree.split(",")],
-            # }
-            # base_model = xgb.XGBClassifier(
-                # use_label_encoder=False,
-                # eval_metric="logloss",
-                # random_state=42
-            # )
-            # grid_search = GridSearchCV(
-                # estimator=base_model,
-                # param_grid=param_grid,
-                # scoring="accuracy",
-                # cv=cv_folds,
-                # n_jobs=1,   # ✅ safer for low memory
-                # verbose=1
-            # )
-            # grid_search.fit(X_train, y_train)
-            # model = grid_search.best_estimator_
-            # best_params = grid_search.best_params_
-        # else:
-            Fallback: simple model
-            # model = xgb.XGBClassifier(
-                # n_estimators=50,
-                # max_depth=4,
-                # learning_rate=0.1,
-                # use_label_encoder=False,
-                # eval_metric="logloss",
-                # random_state=42
-            # )
-            # model.fit(X_train, y_train)
-            # best_params = None
-
-        # y_pred = model.predict(X_test)
-
-        # accuracy = float(accuracy_score(y_test, y_pred))
-        # precision = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
-        # recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
-        # f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
-
-        # response = {
-            # "sensor_id": sensor_id,
-            # "sensor_type": sensor,
-            # "date_range": date_range,
-            # "algorithm": "XGBoost (GridSearch)" if allow_grid else "XGBoost (Simple)",
-            # "best_params": best_params,
-            # "performance_metrics": {
-                # "accuracy": accuracy,
-                # "precision": precision,
-                # "recall": recall,
-                # "f1_score": f1,
-                # "test_samples": int(len(y_test))
-            # },
-            # "data_info": {
-                # "total_samples": int(len(df_features)),
-                # "training_samples": int(len(X_train)),
-                # "test_samples": int(len(X_test)),
-                # "features_used": feature_cols
-            # },
-            # "status": "success"
-        # }
-
-        Clean up memory
-        # del records, df, df_filtered, df_binary, df_features, model
-        # del X, y, X_train, X_test, y_train, y_test, y_pred
-        # gc.collect()
-        
-        # log_memory_usage("After performance metrics")
-        
-        # return response
-
-    # except Exception as e:
-        # logger.exception("PERFORMANCE ENDPOINT CRASH")
-        # return {
-            # "error": f"Internal server error: {str(e)}",
-            # "sensor_id": sensor_id,
-            # "sensor_type": sensor,
-            # "status": "error"
-        # } 
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
@@ -1788,6 +1704,7 @@ def performance_metrics(
                 "status": "error"
             }
 
+        # ✅ FIXED: Use the correct function name
         df = preprocess_dataframe_simple(records, sensor)
         if df is None or df.empty:
             return {
@@ -1797,6 +1714,7 @@ def performance_metrics(
                 "status": "error"
             }
 
+        # ✅ FIXED: Use the correct function name  
         df_filtered = filter_by_date_range_simple(df, date_range)
         if df_filtered is None or len(df_filtered) < 10:
             return {
@@ -1811,6 +1729,7 @@ def performance_metrics(
             df_filtered = df_filtered.sample(max_training_samples, random_state=42)
             logger.info(f"Sampled {max_training_samples} records for performance analysis")
 
+        # ✅ FIXED: Use the correct function name
         df_binary = create_simple_binary_labels(df_filtered)
         if df_binary is None or df_binary.empty:
             return {
@@ -1976,7 +1895,7 @@ def performance_metrics(
         
         log_memory_usage("After performance metrics")
         
-        return response  # ✅ This return statement should be properly aligned
+        return response
 
     except Exception as e:
         logger.exception("PERFORMANCE ENDPOINT CRASH")
@@ -1986,7 +1905,6 @@ def performance_metrics(
             "sensor_type": sensor,
             "status": "error"
         }
-
 
 def create_enhanced_features(df_binary, sensor_col='value'):
     """Create more predictive features for sensor data"""
@@ -2045,176 +1963,6 @@ def create_enhanced_features(df_binary, sensor_col='value'):
     df = df.dropna()
     
     return df
-    
-    
-# from fastapi import Query
-# from sklearn.model_selection import train_test_split, RandomizedSearchCV
-# from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-# import xgboost as xgb
-# import numpy as np
-# import gc
-
-# @app.get("/performance/{sensor_id}")
-# def performance_metrics(
-    # sensor_id: str,
-    # sensor: str = Query(..., description="Sensor type"),
-    # test_size: float = Query(0.2, description="Test set size ratio"),
-    # cv_folds: int = Query(3, description="Cross-validation folds"),
-    # date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
-    # use_search: bool = Query(False, description="Enable RandomizedSearchCV for hyperparameters"),
-    # n_iter: int = Query(20, description="Number of random search iterations (only if use_search=True)")
-# ):
-    # """Get XGBoost performance metrics with safe RandomizedSearchCV (memory-friendly)."""
-    # try:
-        # log_memory_usage("Before performance metrics")
-
-        # max_training_samples = 5000  # safety cap
-
-        # records = fetch_sensor_history(sensor_id)
-        # if not records:
-            # return {
-                # "error": f"No data found for sensor {sensor_id}",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df = preprocess_dataframe_simple(records, sensor)
-        # if df is None or df.empty:
-            # return {
-                # "error": "No valid data after preprocessing",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df_filtered = filter_by_date_range_simple(df, date_range)
-        # if df_filtered is None or len(df_filtered) < 5:
-            # return {
-                # "error": f"Not enough data after filtering: {0 if df_filtered is None else len(df_filtered)} records",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # if len(df_filtered) > max_training_samples:
-            # df_filtered = df_filtered.sample(max_training_samples, random_state=42)
-            # logger.info(f"Sampled {max_training_samples} records for performance analysis")
-
-        # df_binary = create_simple_binary_labels(df_filtered)
-        # if df_binary is None or df_binary.empty:
-            # return {
-                # "error": "Could not create binary labels (possibly single-class).",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # df_features = create_simple_lag_features(df_binary)
-        # if df_features is None or df_features.empty:
-            # return {
-                # "error": "Could not create features (likely insufficient rows for lags).",
-                # "sensor_id": sensor_id,
-                # "sensor_type": sensor,
-                # "status": "error"
-            # }
-
-        # feature_cols = [col for col in df_features.columns if col.startswith('lag')]
-        # X = df_features[feature_cols].values
-        # y = df_features['class_binary'].values
-
-        # actual_test_size = min(test_size, 0.2)
-        # if len(X) < 10:
-            # X_train, X_test, y_train, y_test = X, X, y, y
-        # else:
-            # X_train, X_test, y_train, y_test = train_test_split(
-                # X, y, test_size=actual_test_size, random_state=42,
-                # stratify=y if len(np.unique(y)) > 1 else None
-            # )
-
-        Default model (small and safe)
-        # model = xgb.XGBClassifier(
-            # n_estimators=50,
-            # max_depth=4,
-            # learning_rate=0.1,
-            # subsample=0.8,
-            # colsample_bytree=0.8,
-            # use_label_encoder=False,
-            # eval_metric="logloss",
-            # random_state=42
-        # )
-
-        # best_params = model.get_params()
-
-        If search enabled and dataset is small enough
-        # if use_search and len(X_train) < 3000:
-            # param_dist = {
-                # "n_estimators": [50, 100, 150],
-                # "max_depth": [3, 4, 5, 6],
-                # "learning_rate": [0.1, 0.05, 0.01],
-                # "subsample": [0.7, 0.8, 1.0],
-                # "colsample_bytree": [0.7, 0.8, 1.0]
-            # }
-            # search = RandomizedSearchCV(
-                # model,
-                # param_distributions=param_dist,
-                # n_iter=n_iter,
-                # cv=cv_folds,
-                # scoring="f1_weighted",
-                # random_state=42,
-                # n_jobs=1  # avoid memory spike
-            # )
-            # search.fit(X_train, y_train)
-            # model = search.best_estimator_
-            # best_params = search.best_params_
-        # else:
-            # model.fit(X_train, y_train)
-
-        # y_pred = model.predict(X_test)
-
-        # accuracy = float(accuracy_score(y_test, y_pred))
-        # precision = float(precision_score(y_test, y_pred, average="weighted", zero_division=0))
-        # recall = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
-        # f1 = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
-
-        # response = {
-            # "sensor_id": sensor_id,
-            # "sensor_type": sensor,
-            # "date_range": date_range,
-            # "algorithm": "XGBoost",
-            # "performance_metrics": {
-                # "accuracy": accuracy,
-                # "precision": precision,
-                # "recall": recall,
-                # "f1_score": f1,
-                # "test_samples": int(len(y_test))
-            # },
-            # "data_info": {
-                # "total_samples": int(len(df_features)),
-                # "training_samples": int(len(X_train)),
-                # "test_samples": int(len(X_test)),
-                # "features_used": feature_cols
-            # },
-            # "best_params": best_params,
-            # "status": "success"
-        # }
-
-        # del records, df, df_filtered, df_binary, df_features, model
-        # del X, y, X_train, X_test, y_train, y_test, y_pred
-        # gc.collect()
-        # log_memory_usage("After performance metrics")
-
-        # return response
-
-    # except Exception as e:
-        # logger.exception("PERFORMANCE ENDPOINT CRASH")
-        # return {
-            # "error": f"Internal server error: {str(e)}",
-            # "sensor_id": sensor_id,
-            # "sensor_type": sensor,
-            # "status": "error"
-        # }
-
 def preprocess_dataframe_simple(records, sensor):
     """Simplified dataframe preprocessing"""
     try:
