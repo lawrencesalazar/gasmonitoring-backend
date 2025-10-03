@@ -2009,9 +2009,9 @@ def performance_metrics(
     grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
     grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
 ):
-    """Get XGBoost performance metrics - SIMPLIFIED VERSION"""
+    """Get XGBoost performance metrics - FIXED VERSION"""
     try:
-        logger.info(f"Starting SIMPLIFIED performance analysis for {sensor_id}, sensor: {sensor}")
+        logger.info(f"Starting performance analysis for {sensor_id}, sensor: {sensor}")
         
         # Fetch and preprocess data
         records = fetch_sensor_history(sensor_id)
@@ -2035,29 +2035,30 @@ def performance_metrics(
                 status_code=400
             )
 
-        # SIMPLIFIED: Create binary labels using median
-        median_val = df_filtered['value'].median()
+        # Create binary labels using median
+        median_val = float(df_filtered['value'].median())
         df_binary = df_filtered.copy()
         df_binary['class_binary'] = (df_binary['value'] > median_val).astype(int)
         
-        # Check class distribution
+        # Check class distribution - CONVERT TO NATIVE TYPES
         class_counts = df_binary['class_binary'].value_counts()
-        logger.info(f"Class distribution: {dict(class_counts)}")
+        class_distribution = {
+            str(int(k)): int(v) for k, v in class_counts.items()
+        }
+        logger.info(f"Class distribution: {class_distribution}")
         
         if len(class_counts) < 2:
             return JSONResponse(
                 content={
                     "error": "Only one class found in data - cannot perform classification",
-                    "class_distribution": dict(class_counts),
+                    "class_distribution": class_distribution,
                     "status": "error"
                 },
                 status_code=400
             )
 
-        # SIMPLIFIED: Create basic features only
+        # Create basic features
         df_features = df_binary.copy()
-        
-        # Basic lag features only
         df_features['lag_1'] = df_features['value'].shift(1)
         df_features['lag_2'] = df_features['value'].shift(2)
         
@@ -2070,16 +2071,16 @@ def performance_metrics(
                 status_code=400
             )
 
-        # Prepare features and target
+        # Prepare features and target - CONVERT TO NATIVE TYPES
         feature_cols = ['lag_1', 'lag_2']
         X = df_features[feature_cols].values
         y = df_features['class_binary'].values
 
         logger.info(f"Final dataset - X: {X.shape}, y: {y.shape}")
-        logger.info(f"Class distribution: {np.unique(y, return_counts=True)}")
 
-        # Calculate baseline accuracy
-        baseline_accuracy = max(np.bincount(y)) / len(y)
+        # Calculate baseline accuracy - CONVERT TO NATIVE TYPES
+        y_counts = np.bincount(y)
+        baseline_accuracy = float(max(y_counts) / len(y)) if len(y_counts) > 0 else 0.0
         logger.info(f"Baseline accuracy: {baseline_accuracy:.3f}")
 
         # Simple train-test split
@@ -2100,14 +2101,14 @@ def performance_metrics(
             return JSONResponse(
                 content={
                     "error": "Test set too small or only one class",
-                    "train_samples": len(X_train),
-                    "test_samples": len(X_test),
+                    "train_samples": int(len(X_train)),
+                    "test_samples": int(len(X_test)),
                     "status": "error"
                 },
                 status_code=400
             )
 
-        # SIMPLIFIED: Use basic XGBoost without grid search for reliability
+        # Use basic XGBoost
         model = xgb.XGBClassifier(
             n_estimators=50,
             max_depth=3,
@@ -2121,60 +2122,78 @@ def performance_metrics(
         # Make predictions
         y_pred = model.predict(X_test)
 
-        # Calculate metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        # Calculate metrics - ENSURE ALL ARE NATIVE PYTHON TYPES
+        accuracy = float(accuracy_score(y_test, y_pred))
+        precision = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
+        recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
+        f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
 
-        logger.info(f"Metrics - Accuracy: {accuracy:.3f}")
+        logger.info(f"Metrics - Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
 
-        # Feature importance - CONVERT NUMPY TYPES TO NATIVE PYTHON TYPES
+        # Feature importance - CONVERT ALL TO NATIVE TYPES
         feature_importance = []
         if hasattr(model, 'feature_importances_'):
             for i, importance in enumerate(model.feature_importances_):
                 feature_importance.append({
-                    "feature": feature_cols[i] if i < len(feature_cols) else f"feature_{i}",
-                    "importance": float(importance)  # Convert numpy float to Python float
+                    "feature": str(feature_cols[i]) if i < len(feature_cols) else f"feature_{i}",
+                    "importance": float(importance)
                 })
             feature_importance.sort(key=lambda x: x['importance'], reverse=True)
 
-        # CONVERT NUMPY INT TYPES TO NATIVE PYTHON TYPES FOR JSON SERIALIZATION
-        y_unique, y_counts = np.unique(y, return_counts=True)
-        class_distribution = {
-            str(int(key)): int(value)  # Convert numpy.int64 to Python int
-            for key, value in zip(y_unique, y_counts)
+        # Get unique class counts for distribution
+        unique_classes, class_counts = np.unique(y, return_counts=True)
+        final_class_distribution = {
+            str(int(cls)): int(count) for cls, count in zip(unique_classes, class_counts)
         }
 
         # Prepare response - ENSURE ALL VALUES ARE JSON SERIALIZABLE
-        response = {
-            "sensor_id": sensor_id,
-            "sensor_type": sensor,
-            "date_range": range,
-            "algorithm": "XGBoost (Simplified)",
+        response_data = {
+            "sensor_id": str(sensor_id),
+            "sensor_type": str(sensor),
+            "date_range": str(date_range),
+            "algorithm": "XGBoost",
+            
             "performance_metrics": {
-                "accuracy": float(accuracy),  # Ensure float
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1_score": float(f1),
-                "baseline_accuracy": float(baseline_accuracy),
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "baseline_accuracy": baseline_accuracy,
                 "improvement_over_baseline": float(accuracy - baseline_accuracy),
-                "test_samples": int(len(y_test)),  # Ensure int
+                "test_samples": int(len(y_test)),
                 "train_samples": int(len(X_train))
             },
+            
             "data_info": {
                 "total_samples": int(len(df_features)),
                 "training_samples": int(len(X_train)),
                 "test_samples": int(len(y_test)),
-                "class_distribution": class_distribution,  # Use converted distribution
-                "features_used": feature_cols,
-                "data_quality": "good"
+                "class_distribution": final_class_distribution,
+                "features_used": [str(f) for f in feature_cols],
+                "data_quality": "good",
+                "median_threshold": median_val
             },
+            
             "feature_importance": feature_importance,
             "status": "success"
         }
 
-        return JSONResponse(content=response)
+        # Final validation using json.dumps to catch any serialization issues
+        try:
+            import json
+            json.dumps(response_data)  # This will raise an error if there are non-serializable objects
+            return JSONResponse(content=response_data)
+        except TypeError as e:
+            logger.error(f"JSON serialization error: {e}")
+            # Return a safe error response
+            return JSONResponse(
+                content={
+                    "error": "Data serialization error",
+                    "message": "Could not serialize analysis results",
+                    "status": "error"
+                },
+                status_code=500
+            )
 
     except Exception as e:
         logger.exception(f"Performance metrics error: {str(e)}")
