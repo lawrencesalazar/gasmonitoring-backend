@@ -997,127 +997,6 @@ def get_dataframe(
         return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
 
  
-@app.get("/plot/{sensor_id}")
-def plot_sensor_data(
-    sensor_id: str, 
-    sensor: str = Query(..., description="Sensor type"),
-    chart: str = Query("scatter", description="Chart type: scatter, line, summary, distribution"),
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
-):
-    """Generate visualization plots with memory optimization"""
-    try:
-        log_memory_usage("Before plot generation")
-        
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return error_image("No data found for this sensor")
-        
-        df = preprocess_dataframe(records, sensor)
-        if df.empty or len(df) < 5:
-            return error_image(f"Not enough data for plot. Found {len(df)} records.")
-        
-        df_filtered = filter_by_date_range(df, range)
-        
-        if df_filtered.empty or len(df_filtered) < 3:
-            return error_image(f"Not enough data after applying {range} filter. Found {len(df_filtered)} records.")
-        
-        # Limit data size for plotting
-        max_plot_samples = 2000
-        if len(df_filtered) > max_plot_samples:
-            df_filtered = df_filtered.sample(max_plot_samples, random_state=42)
-            logger.info(f"Sampled {max_plot_samples} records for plotting")
-        
-        buf = io.BytesIO()
-        
-        if chart == "distribution":
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))  # Smaller figure
-            
-            sns.histplot(data=df_filtered, x="value", kde=True, ax=ax1, color='skyblue', alpha=0.7)
-            ax1.set_xlabel(f"{sensor.upper()} Value")
-            ax1.set_ylabel("Frequency")
-            ax1.set_title(f"Distribution - {sensor.upper()}")
-            
-            sns.boxplot(data=df_filtered, y="value", ax=ax2, color='lightcoral')
-            ax2.set_ylabel(f"{sensor.upper()} Value")
-            ax2.set_title(f"Box Plot - {sensor.upper()}")
-            
-        elif chart == "scatter":
-            plt.figure(figsize=(10, 6))  # Smaller figure
-            
-            # Sample data for scatter plot
-            if len(df_filtered) > 500:
-                plot_data = df_filtered.sample(500, random_state=42)
-            else:
-                plot_data = df_filtered
-                
-            plt.scatter(plot_data["timestamp"], plot_data["value"], alpha=0.6, s=10)
-            plt.xlabel("Timestamp")
-            plt.ylabel(f"{sensor.upper()} Value")
-            plt.title(f"Scatter Plot - {sensor.upper()} (Sensor {sensor_id})")
-            plt.xticks(rotation=45)
-            
-        elif chart == "line":
-            plt.figure(figsize=(10, 6))
-            
-            # Resample for line plot to reduce points
-            if len(df_filtered) > 1000:
-                df_resampled = df_filtered.set_index('timestamp').resample('12H').mean().reset_index()
-            else:
-                df_resampled = df_filtered
-                
-            plt.plot(df_resampled["timestamp"], df_resampled["value"], linewidth=1)
-            plt.xlabel("Timestamp")
-            plt.ylabel(f"{sensor.upper()} Value")
-            plt.title(f"Time Series - {sensor.upper()} (Sensor {sensor_id})")
-            plt.xticks(rotation=45)
-            
-        else:  # summary plot - simplified
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
-            
-            # Time series
-            ax1.plot(df_filtered["timestamp"], df_filtered["value"], linewidth=0.5)
-            ax1.set_title("Time Series")
-            ax1.tick_params(axis='x', rotation=45)
-            
-            # Distribution
-            ax2.hist(df_filtered["value"], bins=20, alpha=0.7, color='green')
-            ax2.set_title("Distribution")
-            
-            # Rolling mean with sampling
-            if len(df_filtered) > 100:
-                sample_df = df_filtered.sample(100, random_state=42).sort_values('timestamp')
-                ax3.plot(sample_df["timestamp"], sample_df["value"], alpha=0.7)
-            else:
-                ax3.plot(df_filtered["timestamp"], df_filtered["value"], alpha=0.7)
-            ax3.set_title("Sample Values")
-            ax3.tick_params(axis='x', rotation=45)
-            
-            # Simple stats
-            stats_text = f"Mean: {df_filtered['value'].mean():.2f}\nStd: {df_filtered['value'].std():.2f}\nCount: {len(df_filtered)}"
-            ax4.text(0.1, 0.5, stats_text, fontsize=12, va='center')
-            ax4.set_title("Statistics")
-            ax4.axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
-        plt.close('all')  # Explicitly close all figures
-        
-        # Clean up memory
-        del df, df_filtered, records
-        if 'plot_data' in locals():
-            del plot_data
-        if 'df_resampled' in locals():
-            del df_resampled
-        gc.collect()
-        
-        log_memory_usage("After plot generation")
-        buf.seek(0)
-        
-        return StreamingResponse(buf, media_type="image/png")
-        
-    except Exception as e:
-        logger.error(f"Plot generation error: {e}")
-        return error_image(f"Error generating plot: {str(e)}")
 # =============================================================================
 # AI/ML ENDPOINTS
 # =============================================================================
@@ -1491,90 +1370,7 @@ def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, class
             "confusion_matrix": [],
             "classes": classes
         }
-      
-@app.get("/confusion_matrix/{sensor_id}")
-def confusion_matrix_chart(
-    sensor_id: str,
-    sensor: str = Query(..., description="Sensor type"),
-    test_size: float = Query(0.2, description="Test size"),
-    cv_folds: int = Query(3, description="CV folds"),
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
-):
-    """Generate enhanced confusion matrix chart for best performing algorithm with date range filtering using Seaborn"""
-    try:
-        perf_response = performance_metrics(sensor_id, sensor, test_size, cv_folds, range)
-        
-        if "error" in perf_response:
-            error_msg = perf_response["error"]
-            return error_image(f"Performance metrics error: {error_msg}")
-        
-        if "algorithms" not in perf_response:
-            return error_image("No algorithms data available")
-        
-        best_algo = None
-        for algo_name, algo_data in perf_response["algorithms"].items():
-            if "metrics" in algo_data and "error" not in algo_data:
-                best_algo = algo_name
-                break
-        
-        if not best_algo:
-            return error_image("No valid model with metrics available for confusion matrix")
-        
-        metrics = perf_response["algorithms"][best_algo]["metrics"]
-        
-        if "confusion_matrix" not in metrics or "classes" not in metrics:
-            return error_image("No confusion matrix data available")
-        
-        conf_matrix = np.array(metrics["confusion_matrix"])
-        classes = metrics["classes"]
-        
-        if len(classes) < 2:
-            return error_image(f"Need at least 2 classes for confusion matrix. Found: {classes}")
-        
-        if conf_matrix.size == 0 or conf_matrix.shape[0] != len(classes):
-            return error_image("Invalid confusion matrix dimensions")
-        
-        buf = io.BytesIO()
-        plt.figure(figsize=(10, 8))
-        
-        # Enhanced Seaborn heatmap
-        ax = sns.heatmap(
-            conf_matrix, 
-            annot=True, 
-            fmt="d", 
-            cmap="Blues",
-            cbar_kws={'label': 'Number of Predictions'},
-            xticklabels=classes,
-            yticklabels=classes,
-            annot_kws={"size": 12, "weight": "bold"}
-        )
-        
-        plt.title(f"Confusion Matrix - {best_algo}\nSensor: {sensor.upper()}, Date Range: {range}", 
-                 fontsize=16, pad=20, weight='bold')
-        plt.xlabel("Predicted Label", fontsize=14, weight='bold')
-        plt.ylabel("True Label", fontsize=14, weight='bold')
-        
-        # Improve tick labels
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-        
-        # Add accuracy information
-        accuracy = metrics.get("accuracy", 0)
-        plt.figtext(0.5, 0.01, 
-                   f"Accuracy: {accuracy:.2%} | Test Size: {test_size} | CV Folds: {cv_folds} | Date Range: {range}", 
-                   ha="center", fontsize=11, 
-                   bbox={"facecolor":"lightgreen", "alpha":0.7, "pad":5})
-        
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-        plt.close()
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="image/png")
-
-    except Exception as e:
-        logger.error(f"Confusion matrix error: {e}")
-        return error_image(f"Error generating confusion matrix: {str(e)}")
-
+  
 # =============================================================================
 # TEST ENDPOINT
 # =============================================================================
@@ -1733,6 +1529,7 @@ def create_enhanced_features(df_binary, sensor_col='value'):
     df = df.dropna()
     
     return df
+    
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
