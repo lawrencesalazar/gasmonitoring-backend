@@ -467,6 +467,7 @@ def health():
             "max_age": "3600"
         }
     }
+   
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -1587,7 +1588,8 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
-  def preprocess_dataframe_simple(records, sensor):
+    
+def preprocess_dataframe_simple(records, sensor):
     """Simplified dataframe preprocessing for performance metrics"""
     try:
         if not records:
@@ -1673,8 +1675,65 @@ def create_simple_binary_labels(df):
     except Exception as e:
         logger.error(f"Binary labels error: {e}")
         return pd.DataFrame()
- 
-@app.get("/performance/{sensor_id}")
+
+def create_enhanced_features(df_binary, sensor_col='value'):
+    """Create more predictive features for sensor data"""
+    if df_binary is None or len(df_binary) < 10:
+        return df_binary
+    
+    df = df_binary.copy()
+    
+    # Basic lag features
+    df['lag_1'] = df[sensor_col].shift(1)
+    df['lag_2'] = df[sensor_col].shift(2)
+    df['lag_3'] = df[sensor_col].shift(3)
+    
+    # Enhanced: Rolling statistics
+    df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
+    df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
+    df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
+    df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
+    
+    # Enhanced: Rate of change and momentum
+    df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
+    df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
+    
+    # Enhanced: Percent changes
+    df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
+    df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
+    
+    # Enhanced: Volatility features
+    df['volatility_5'] = df[sensor_col].rolling(window=5).std()
+    df['volatility_10'] = df[sensor_col].rolling(window=10).std()
+    
+    # Enhanced: Statistical features
+    overall_mean = df[sensor_col].mean()
+    overall_std = df[sensor_col].std()
+    if overall_std > 0:
+        df['z_score'] = (df[sensor_col] - overall_mean) / overall_std
+    else:
+        df['z_score'] = 0
+    
+    # Enhanced: Binary features for spikes/drops
+    df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    
+    # Enhanced: Time-based features
+    if 'timestamp' in df.columns:
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['hour'] = df['timestamp'].dt.hour
+            df['day_of_week'] = df['timestamp'].dt.dayofweek
+            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+            df['month'] = df['timestamp'].dt.month
+        except:
+            pass
+    
+    # Remove rows with NaN values
+    df = df.dropna()
+    
+    return df
+ @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
@@ -1704,7 +1763,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # ✅ FIXED: Use the correct function name
+        # Use the simple preprocessing
         df = preprocess_dataframe_simple(records, sensor)
         if df is None or df.empty:
             return {
@@ -1714,7 +1773,7 @@ def performance_metrics(
                 "status": "error"
             }
 
-        # ✅ FIXED: Use the correct function name  
+        # Use simple date filtering
         df_filtered = filter_by_date_range_simple(df, date_range)
         if df_filtered is None or len(df_filtered) < 10:
             return {
@@ -1729,7 +1788,7 @@ def performance_metrics(
             df_filtered = df_filtered.sample(max_training_samples, random_state=42)
             logger.info(f"Sampled {max_training_samples} records for performance analysis")
 
-        # ✅ FIXED: Use the correct function name
+        # Create binary labels
         df_binary = create_simple_binary_labels(df_filtered)
         if df_binary is None or df_binary.empty:
             return {
@@ -1854,7 +1913,7 @@ def performance_metrics(
         class_distribution = dict(pd.Series(y).value_counts())
         class_percentages = dict(pd.Series(y).value_counts(normalize=True))
 
-        # ✅ CORRECTED: Properly structured response dictionary
+        # ✅ CORRECTED: Proper response structure
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
@@ -1905,7 +1964,7 @@ def performance_metrics(
             "sensor_type": sensor,
             "status": "error"
         }
-
+        
 def create_enhanced_features(df_binary, sensor_col='value'):
     """Create more predictive features for sensor data"""
     if df_binary is None or len(df_binary) < 10:
