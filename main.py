@@ -1733,7 +1733,7 @@ def create_enhanced_features(df_binary, sensor_col='value'):
     df = df.dropna()
     
     return df
- @app.get("/performance/{sensor_id}")
+@app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type"),
