@@ -1,3 +1,4 @@
+ask before update, check for duplicate:
 # --- main.py ---
 import json
 import gc
@@ -119,6 +120,17 @@ def log_memory_usage(prefix=""):
     memory_mb = process.memory_info().rss / 1024 / 1024
     logger.info(f"{prefix} Memory usage: {memory_mb:.2f} MB")
     return memory_mb
+
+def standard_error_response(message: str, status_code: int = 500, details: Dict = None):
+    """Return standardized error response"""
+    response = {
+        "status": "error",
+        "message": message,
+        "timestamp": datetime.now().isoformat()
+    }
+    if details:
+        response["details"] = details
+    return JSONResponse(content=response, status_code=status_code)
     
 def fetch_sensor_history(sensor_id: str) -> List[Dict[str, Any]]:
     """Fetch sensor history from Firebase with robust timestamp parsing"""
@@ -303,7 +315,15 @@ def filter_by_date_range(df: pd.DataFrame, date_range: str) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Error filtering by date range: {e}")
         return df
-        
+
+def fetch_and_preprocess_data(sensor_id: str, sensor: str, date_range: str = "1month") -> pd.DataFrame:
+    """Common data fetching and preprocessing workflow"""
+    records = fetch_sensor_history(sensor_id)
+    df = preprocess_dataframe(records, sensor)
+    if not df.empty:
+        df = filter_by_date_range(df, date_range)
+    return df
+
 def make_lag_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     """Create lag features for time series forecasting"""
     if df.empty:
@@ -464,7 +484,233 @@ def convert_numpy_types(obj):
         return [convert_numpy_types(item) for item in obj]
     else:
         return obj
+
+def create_simple_binary_labels(df):
+    """Create simple binary labels for classification with robust error handling"""
+    try:
+        if df is None or df.empty or len(df) < 5:
+            logger.warning("Cannot create binary labels: insufficient data")
+            return pd.DataFrame()
+            
+        df_copy = df.copy()
         
+        # Check if 'value' column exists
+        if 'value' not in df_copy.columns:
+            logger.error("Missing 'value' column for binary classification")
+            return pd.DataFrame()
+        
+        # Use median for binary classification
+        median_val = df_copy['value'].median()
+        logger.info(f"Creating binary labels using median: {median_val}")
+        
+        df_copy['class_binary'] = (df_copy['value'] > median_val).astype(int)
+        
+        # Check if we have both classes
+        class_counts = df_copy['class_binary'].value_counts()
+        logger.info(f"Binary class distribution: {dict(class_counts)}")
+        
+        if len(class_counts) < 2:
+            logger.warning(f"Only one class found: {class_counts.index[0]}")
+            return pd.DataFrame()
+            
+        return df_copy
+        
+    except Exception as e:
+        logger.error(f"Error creating binary labels: {e}")
+        return pd.DataFrame()
+
+def create_simple_lag_features(df, lags=2):
+    """Create simple lag features"""
+    try:
+        if df.empty:
+            return pd.DataFrame()
+            
+        df_copy = df.copy()
+        
+        # Create lag features
+        for i in range(1, lags + 1):
+            df_copy[f'lag{i}'] = df_copy['value'].shift(i)
+        
+        # Drop rows with NaN
+        df_copy = df_copy.dropna()
+        
+        return df_copy
+        
+    except Exception as e:
+        logger.error(f"Lag features error: {e}")
+        return pd.DataFrame()
+
+def get_accuracy_assessment(accuracy):
+    """Get accuracy assessment"""
+    if accuracy >= 0.9:
+        level = "Excellent"
+        confidence = "Very High"
+    elif accuracy >= 0.8:
+        level = "Very Good" 
+        confidence = "High"
+    elif accuracy >= 0.7:
+        level = "Good"
+        confidence = "Medium"
+    elif accuracy >= 0.6:
+        level = "Fair"
+        confidence = "Low-Medium"
+    else:
+        level = "Needs Improvement"
+        confidence = "Low"
+    
+    return {
+        "accuracy_level": level,
+        "confidence": confidence,
+        "interpretation": f"XGBoost shows {level.lower()} performance with {confidence.lower()} confidence"
+    }
+
+def create_enhanced_features(df_binary, sensor_col='value'):
+    """Create more predictive features for sensor data"""
+    if df_binary is None or len(df_binary) < 10:
+        return df_binary
+    
+    df = df_binary.copy()
+    
+    # Basic lag features
+    df['lag_1'] = df[sensor_col].shift(1)
+    df['lag_2'] = df[sensor_col].shift(2)
+    df['lag_3'] = df[sensor_col].shift(3)
+    
+    # Enhanced: Rolling statistics
+    df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
+    df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
+    df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
+    df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
+    
+    # Enhanced: Rate of change and momentum
+    df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
+    df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
+    
+    # Enhanced: Percent changes
+    df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
+    df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
+    
+    # Enhanced: Volatility features
+    df['volatility_5'] = df[sensor_col].rolling(window=5).std()
+    df['volatility_10'] = df[sensor_col].rolling(window=10).std()
+    
+    # Enhanced: Statistical features
+    overall_mean = df[sensor_col].mean()
+    overall_std = df[sensor_col].std()
+    if overall_std > 0:
+        df['z_score'] = (df[sensor_col] - overall_mean) / overall_std
+    else:
+        df['z_score'] = 0
+    
+    # Enhanced: Binary features for spikes/drops
+    df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
+    
+    # Enhanced: Time-based features
+    if 'timestamp' in df.columns:
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['hour'] = df['timestamp'].dt.hour
+            df['day_of_week'] = df['timestamp'].dt.dayofweek
+            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+            df['month'] = df['timestamp'].dt.month
+        except:
+            pass
+    
+    # Remove rows with NaN values
+    df = df.dropna()
+    
+    return df
+
+def create_safe_features(df_binary, sensor_col='value'):
+    """Create features without data leakage"""
+    if df_binary is None or len(df_binary) < 10:
+        return pd.DataFrame()
+    
+    df = df_binary.copy()
+    
+    # Safe lag features (only past data)
+    df['lag_1'] = df[sensor_col].shift(1)
+    df['lag_2'] = df[sensor_col].shift(2)
+    df['lag_3'] = df[sensor_col].shift(3)
+    
+    # Safe rolling statistics (using only past data)
+    df['rolling_mean_3'] = df[sensor_col].shift(1).rolling(window=3).mean()
+    df['rolling_std_3'] = df[sensor_col].shift(1).rolling(window=3).std()
+    
+    # Remove rows with NaN values (from shifting)
+    df = df.dropna()
+    
+    # Remove any features that might leak future information
+    safe_cols = [col for col in df.columns if not any(x in str(col) for x in ['future', 'target', 'class'])]
+    df = df[safe_cols]
+    
+    return df
+
+def check_data_leakage(df, feature_cols, target_col):
+    """Check for potential data leakage"""
+    try:
+        # Check if target is in features
+        if target_col in feature_cols:
+            return True
+        
+        # Check for perfect correlation with target
+        for col in feature_cols:
+            if col != target_col:
+                correlation = abs(df[col].corr(df[target_col]))
+                if correlation > 0.95:  # Nearly perfect correlation
+                    logger.warning(f"High correlation between {col} and target: {correlation}")
+                    return True
+        
+        return False
+    except:
+        return False
+
+def train_and_evaluate_model(X_train, X_test, y_train, y_test, model_type='xgb'):
+    """Standardized model training and evaluation"""
+    try:
+        if model_type == 'xgb':
+            model = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+        elif model_type == 'rf':
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+        else:
+            model = xgb.XGBClassifier(
+                n_estimators=50,
+                max_depth=3,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+        
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        return {
+            'model': model,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'predictions': y_pred
+        }
+    except Exception as e:
+        logger.error(f"Model training error: {e}")
+        raise
+
 # =============================================================================
 # SENSOR ANALYTICS ENDPOINTS
 # =============================================================================
@@ -572,7 +818,6 @@ def home():
 # ESP32 SENSOR ENDPOINTS
 # =============================================================================
 
-# Also update the ESP32 data reception endpoint to validate timestamps
 @app.post("/api/sensor/data")
 async def receive_sensor_data(request: Request):
     """
@@ -585,10 +830,7 @@ async def receive_sensor_data(request: Request):
         required_fields = ['sensorID', 'timestamp', 'co2', 'methane', 'ammonia', 'temperature', 'humidity']
         for field in required_fields:
             if field not in data:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Missing required field: {field}"}
-                )
+                return standard_error_response(f"Missing required field: {field}", 400)
         
         # Validate and parse timestamp
         timestamp_str = str(data['timestamp']).strip()
@@ -644,10 +886,7 @@ async def receive_sensor_data(request: Request):
         
     except Exception as e:
         logger.error(f"Error storing sensor data: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal server error: {str(e)}"}
-        )
+        return standard_error_response(f"Internal server error: {str(e)}", 500)
         
 @app.get("/api/sensor/current/{sensor_id}")
 async def get_current_sensor_data(sensor_id: str):
@@ -658,10 +897,7 @@ async def get_current_sensor_data(sensor_id: str):
         current_reading = get_current_sensor_reading(sensor_id)
         
         if not current_reading:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "message": f"No current reading found for sensor {sensor_id}"}
-            )
+            return standard_error_response(f"No current reading found for sensor {sensor_id}", 404)
         
         return {
             "status": "success",
@@ -672,10 +908,7 @@ async def get_current_sensor_data(sensor_id: str):
         
     except Exception as e:
         logger.error(f"Error fetching current sensor data: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal server error: {str(e)}"}
-        )
+        return standard_error_response(f"Internal server error: {str(e)}", 500)
 
 @app.get("/api/sensor/{sensor_id}/stats")
 async def get_sensor_stats(sensor_id: str):
@@ -686,10 +919,7 @@ async def get_sensor_stats(sensor_id: str):
         records = fetch_sensor_history(sensor_id)
         
         if not records:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "message": f"No data found for sensor {sensor_id}"}
-            )
+            return standard_error_response(f"No data found for sensor {sensor_id}", 404)
         
         df = pd.DataFrame(records)
         
@@ -726,10 +956,7 @@ async def get_sensor_stats(sensor_id: str):
         
     except Exception as e:
         logger.error(f"Error calculating sensor stats: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal server error: {str(e)}"}
-        )
+        return standard_error_response(f"Internal server error: {str(e)}", 500)
 
 # =============================================================================
 # DATA ENDPOINTS
@@ -745,28 +972,22 @@ def explain(
     try:
         log_memory_usage("Before SHAP explanation")
         
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
+        df = fetch_and_preprocess_data(sensor_id, sensor, range)
         
         if df.empty or len(df) < 10:
-            return JSONResponse({"error": "Not enough data"})
-        
-        df_filtered = filter_by_date_range(df, range)
-        
-        if df_filtered.empty or len(df_filtered) < 5:
-            return JSONResponse({"error": f"Not enough data after applying {range} filter"})
+            return standard_error_response("Not enough data for SHAP analysis", 400)
         
         # Limit data size for SHAP analysis
         max_shap_samples = 1000
-        if len(df_filtered) > max_shap_samples:
-            df_filtered = df_filtered.sample(max_shap_samples, random_state=42)
+        if len(df) > max_shap_samples:
+            df = df.sample(max_shap_samples, random_state=42)
             logger.info(f"Sampled {max_shap_samples} records for SHAP analysis")
         
-        df_filtered["hour"] = df_filtered["timestamp"].dt.hour
-        agg = df_filtered.groupby("hour")["value"].mean().reset_index()
+        df["hour"] = df["timestamp"].dt.hour
+        agg = df.groupby("hour")["value"].mean().reset_index()
         
         if len(agg) < 3:
-            return JSONResponse({"error": "Insufficient hourly data after filtering"})
+            return standard_error_response("Insufficient hourly data after filtering", 400)
         
         X = agg[["hour"]]
         y = agg["value"]
@@ -779,16 +1000,16 @@ def explain(
         shap_values = explainer.shap_values(X)
         
         buf = io.BytesIO()
-        plt.figure(figsize=(8, 5))  # Smaller figure size
+        plt.figure(figsize=(8, 5))
         shap.summary_plot(shap_values, X, show=False)
         plt.title(f"SHAP Summary - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")  # Lower DPI
-        plt.close('all')  # Explicitly close plot
+        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close('all')
         buf.seek(0)
         
         # Force garbage collection
-        del model, explainer, shap_values, df, df_filtered, agg
+        del model, explainer, shap_values, df, agg
         gc.collect()
         
         log_memory_usage("After SHAP explanation")
@@ -800,10 +1021,10 @@ def explain(
             "shap_values": shap_values.tolist(),
             "features": X.to_dict(orient="records"),
             "feature_importance": {
-                "hour": float(np.abs(shap_values).mean(axis=0)[0])  # Mean absolute SHAP value
+                "hour": float(np.abs(shap_values).mean(axis=0)[0])
             },
             "summary_stats": {
-                "total_samples": len(df_filtered),
+                "total_samples": len(df),
                 "shap_samples": len(agg),
                 "mean_shap_magnitude": float(np.mean(np.abs(shap_values)))
             }
@@ -811,7 +1032,7 @@ def explain(
         
     except Exception as e:
         logger.error(f"SHAP explanation error: {e}")
-        return JSONResponse({"error": str(e)})
+        return standard_error_response(f"SHAP analysis failed: {str(e)}", 500)
 
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
@@ -824,47 +1045,39 @@ def plot_sensor_data(
     try:
         log_memory_usage("Before plot generation")
         
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return error_image("No data found for this sensor")
+        df = fetch_and_preprocess_data(sensor_id, sensor, range)
         
-        df = preprocess_dataframe(records, sensor)
         if df.empty or len(df) < 5:
             return error_image(f"Not enough data for plot. Found {len(df)} records.")
         
-        df_filtered = filter_by_date_range(df, range)
-        
-        if df_filtered.empty or len(df_filtered) < 3:
-            return error_image(f"Not enough data after applying {range} filter. Found {len(df_filtered)} records.")
-        
         # Limit data size for plotting
         max_plot_samples = 2000
-        if len(df_filtered) > max_plot_samples:
-            df_filtered = df_filtered.sample(max_plot_samples, random_state=42)
+        if len(df) > max_plot_samples:
+            df = df.sample(max_plot_samples, random_state=42)
             logger.info(f"Sampled {max_plot_samples} records for plotting")
         
         buf = io.BytesIO()
         
         if chart == "distribution":
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))  # Smaller figure
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
             
-            sns.histplot(data=df_filtered, x="value", kde=True, ax=ax1, color='skyblue', alpha=0.7)
+            sns.histplot(data=df, x="value", kde=True, ax=ax1, color='skyblue', alpha=0.7)
             ax1.set_xlabel(f"{sensor.upper()} Value")
             ax1.set_ylabel("Frequency")
             ax1.set_title(f"Distribution - {sensor.upper()}")
             
-            sns.boxplot(data=df_filtered, y="value", ax=ax2, color='lightcoral')
+            sns.boxplot(data=df, y="value", ax=ax2, color='lightcoral')
             ax2.set_ylabel(f"{sensor.upper()} Value")
             ax2.set_title(f"Box Plot - {sensor.upper()}")
             
         elif chart == "scatter":
-            plt.figure(figsize=(10, 6))  # Smaller figure
+            plt.figure(figsize=(10, 6))
             
             # Sample data for scatter plot
-            if len(df_filtered) > 500:
-                plot_data = df_filtered.sample(500, random_state=42)
+            if len(df) > 500:
+                plot_data = df.sample(500, random_state=42)
             else:
-                plot_data = df_filtered
+                plot_data = df
                 
             plt.scatter(plot_data["timestamp"], plot_data["value"], alpha=0.6, s=10)
             plt.xlabel("Timestamp")
@@ -876,10 +1089,10 @@ def plot_sensor_data(
             plt.figure(figsize=(10, 6))
             
             # Resample for line plot to reduce points
-            if len(df_filtered) > 1000:
-                df_resampled = df_filtered.set_index('timestamp').resample('12H').mean().reset_index()
+            if len(df) > 1000:
+                df_resampled = df.set_index('timestamp').resample('12H').mean().reset_index()
             else:
-                df_resampled = df_filtered
+                df_resampled = df
                 
             plt.plot(df_resampled["timestamp"], df_resampled["value"], linewidth=1)
             plt.xlabel("Timestamp")
@@ -891,35 +1104,35 @@ def plot_sensor_data(
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
             
             # Time series
-            ax1.plot(df_filtered["timestamp"], df_filtered["value"], linewidth=0.5)
+            ax1.plot(df["timestamp"], df["value"], linewidth=0.5)
             ax1.set_title("Time Series")
             ax1.tick_params(axis='x', rotation=45)
             
             # Distribution
-            ax2.hist(df_filtered["value"], bins=20, alpha=0.7, color='green')
+            ax2.hist(df["value"], bins=20, alpha=0.7, color='green')
             ax2.set_title("Distribution")
             
             # Rolling mean with sampling
-            if len(df_filtered) > 100:
-                sample_df = df_filtered.sample(100, random_state=42).sort_values('timestamp')
+            if len(df) > 100:
+                sample_df = df.sample(100, random_state=42).sort_values('timestamp')
                 ax3.plot(sample_df["timestamp"], sample_df["value"], alpha=0.7)
             else:
-                ax3.plot(df_filtered["timestamp"], df_filtered["value"], alpha=0.7)
+                ax3.plot(df["timestamp"], df["value"], alpha=0.7)
             ax3.set_title("Sample Values")
             ax3.tick_params(axis='x', rotation=45)
             
             # Simple stats
-            stats_text = f"Mean: {df_filtered['value'].mean():.2f}\nStd: {df_filtered['value'].std():.2f}\nCount: {len(df_filtered)}"
+            stats_text = f"Mean: {df['value'].mean():.2f}\nStd: {df['value'].std():.2f}\nCount: {len(df)}"
             ax4.text(0.1, 0.5, stats_text, fontsize=12, va='center')
             ax4.set_title("Statistics")
             ax4.axis('off')
         
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
-        plt.close('all')  # Explicitly close all figures
+        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")
+        plt.close('all')
         
         # Clean up memory
-        del df, df_filtered, records
+        del df
         if 'plot_data' in locals():
             del plot_data
         if 'df_resampled' in locals():
@@ -950,27 +1163,13 @@ def shap_hourly_analysis(
     try:
         logger.info(f"Starting enhanced SHAP analysis for {sensor_id}, sensor: {sensor}")
         
-        # =============================================================================
-        # 1. DATA COLLECTION & PREPROCESSING
-        # =============================================================================
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return {"error": "No historical data found", "status": "error"}
-        
-        df = preprocess_dataframe(records, sensor)
+        # Data collection & preprocessing
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
         if df.empty:
-            return {"error": "No valid sensor data", "status": "error"}
+            return standard_error_response("No valid sensor data", 400)
         
-        df_filtered = filter_by_date_range(df, date_range)
-        if df_filtered.empty:
-            return {"error": f"No data after {date_range} filter", "status": "error"}
-        
-        # =============================================================================
-        # 2. FEATURE ENGINEERING FOR TEMPORAL ANALYSIS
-        # =============================================================================
-        df_enhanced = df_filtered.copy()
-        
-        # Time-based features
+        # Feature engineering for temporal analysis
+        df_enhanced = df.copy()
         df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
         df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
         df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
@@ -987,11 +1186,9 @@ def shap_hourly_analysis(
         df_enhanced = df_enhanced.dropna()
         
         if df_enhanced.empty:
-            return {"error": "Insufficient data for analysis after feature engineering", "status": "error"}
+            return standard_error_response("Insufficient data for analysis after feature engineering", 400)
         
-        # =============================================================================
-        # 3. STATISTICAL SIGNIFICANCE OF HOURLY PATTERNS
-        # =============================================================================
+        # Statistical significance of hourly patterns
         hourly_stats = []
         hourly_groups = df_enhanced.groupby('hour')['value']
         
@@ -1038,9 +1235,7 @@ def shap_hourly_analysis(
                     'error': 'Insufficient data'
                 })
         
-        # =============================================================================
-        # 4. ANOMALY DETECTION IN HOURLY BEHAVIOR
-        # =============================================================================
+        # Anomaly detection in hourly behavior
         anomalies = []
         hourly_anomaly_analysis = []
         
@@ -1048,7 +1243,7 @@ def shap_hourly_analysis(
         for hour in range(24):
             if hour in hourly_groups.groups:
                 hour_data = hourly_groups.get_group(hour)
-                if len(hour_data) > 5:  # Need minimum data for meaningful z-scores
+                if len(hour_data) > 5:
                     z_scores = np.abs(stats.zscore(hour_data))
                     hour_anomalies = hour_data[z_scores > anomaly_threshold]
                     
@@ -1073,10 +1268,7 @@ def shap_hourly_analysis(
                         'std_value': float(hour_data.std())
                     })
         
-        # =============================================================================
-        # 5. SHAP ANALYSIS FOR PREDICTIVE INSIGHTS
-        # =============================================================================
-        # Prepare features for SHAP analysis
+        # SHAP analysis for predictive insights
         feature_columns = ['hour', 'day_of_week', 'is_weekend', 'rolling_mean_6h', 'rolling_std_6h', 'prev_hour_value']
         X = df_enhanced[feature_columns]
         y = df_enhanced['value']
@@ -1110,7 +1302,7 @@ def shap_hourly_analysis(
         for hour in range(24):
             hour_mask = X['hour'] == hour
             if hour_mask.sum() > 0:
-                hour_shap = shap_values[hour_mask, 0]  # SHAP values for 'hour' feature (index 0)
+                hour_shap = shap_values[hour_mask, 0]
                 hourly_impact.append({
                     'hour': hour,
                     'mean_impact': float(np.mean(hour_shap)),
@@ -1118,24 +1310,18 @@ def shap_hourly_analysis(
                     'impact_samples': int(hour_mask.sum())
                 })
         
-        # =============================================================================
-        # 6. ACTIONABLE RECOMMENDATIONS
-        # =============================================================================
+        # Actionable recommendations
         recommendations = generate_shap_based_recommendations(
             hourly_stats, feature_importance, anomalies, sensor
         )
         
-        # =============================================================================
-        # 7. VISUAL EXPLANATIONS - THREE SECTIONS
-        # =============================================================================
+        # Visual explanations
         visualization_data = create_three_section_visualizations(
             df_enhanced, hourly_stats, shap_values, X, feature_columns, 
             anomalies, sensor, sensor_id, date_range
         )
         
-        # =============================================================================
-        # 8. FINAL RESPONSE
-        # =============================================================================
+        # Final response
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
@@ -1153,7 +1339,7 @@ def shap_hourly_analysis(
                 "anomalies_found": len(anomalies),
                 "anomaly_threshold": f"{anomaly_threshold}σ",
                 "hourly_anomaly_analysis": hourly_anomaly_analysis,
-                "anomaly_details": anomalies[:10]  # Limit details for response size
+                "anomaly_details": anomalies[:10]
             },
             
             "predictive_insights": {
@@ -1177,7 +1363,7 @@ def shap_hourly_analysis(
         
     except Exception as e:
         logger.error(f"Enhanced SHAP analysis failed: {str(e)}", exc_info=True)
-        return {"error": f"Analysis failed: {str(e)}", "status": "error"}
+        return standard_error_response(f"Analysis failed: {str(e)}", 500)
 
 
 def generate_shap_based_recommendations(hourly_stats, feature_importance, anomalies, sensor_type):
@@ -1352,31 +1538,27 @@ def debug_hourly_data(
     range: str = Query("1month")
 ):
     """Debug endpoint to check hourly data availability"""
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
+    df = fetch_and_preprocess_data(sensor_id, sensor, range)
     
     response = {
         "sensor_id": sensor_id,
         "sensor_type": sensor,
         "range": range,
         "data_availability": {
-            "raw_records": len(records),
             "after_preprocessing": len(df),
             "preview": df.head(3).to_dict('records') if not df.empty else []
         }
     }
     
     if not df.empty:
-        df_filtered = filter_by_date_range(df, range)
-        response["data_availability"]["after_filtering"] = len(df_filtered)
         response["data_availability"]["date_range_original"] = {
             "start": df['timestamp'].min().isoformat(),
             "end": df['timestamp'].max().isoformat()
         }
         
-        if not df_filtered.empty:
-            df_filtered["hour"] = df_filtered["timestamp"].dt.hour
-            hourly_stats = df_filtered.groupby("hour").size().reset_index(name='count')
+        if not df.empty:
+            df["hour"] = df["timestamp"].dt.hour
+            hourly_stats = df.groupby("hour").size().reset_index(name='count')
             response["hourly_distribution"] = hourly_stats.to_dict('records')
     
     return response
@@ -1389,22 +1571,19 @@ def get_dataframe(
 ):
     """Get raw sensor data as JSON with date range filtering"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
-        
-        df_filtered = filter_by_date_range(df, range)
+        df = fetch_and_preprocess_data(sensor_id, sensor, range)
         
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
             "date_range": range,
-            "records": df_filtered.to_dict(orient="records"),
-            "count": len(df_filtered),
+            "records": df.to_dict(orient="records"),
+            "count": len(df),
             "date_range_applied": True
         }
     except Exception as e:
         logger.error(f"Dataframe error: {e}")
-        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
+        return standard_error_response(f"Data retrieval failed: {str(e)}", 500)
 
  
 # =============================================================================
@@ -1419,20 +1598,14 @@ def compare_algorithms(
 ):
     """Compare multiple ML algorithms with date range filtering"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
+        df = fetch_and_preprocess_data(sensor_id, sensor, range)
         
         if df.empty or len(df) < 5:
-            return {"error": "Not enough data for analysis", "sensor_id": sensor_id, "sensor_type": sensor}
+            return standard_error_response("Not enough data for analysis", 400)
         
-        df_filtered = filter_by_date_range(df, range)
-        
-        if df_filtered.empty or len(df_filtered) < 5:
-            return {"error": f"Not enough data after applying {range} filter", "sensor_id": sensor_id, "sensor_type": sensor}
-        
-        df_lags = make_lag_features(df_filtered, lags=2)
+        df_lags = make_lag_features(df, lags=2)
         if df_lags.empty:
-            return {"error": "Insufficient data after feature engineering", "sensor_id": sensor_id, "sensor_type": sensor}
+            return standard_error_response("Insufficient data after feature engineering", 400)
         
         X, y = df_lags[["lag1", "lag2"]], df_lags["value"]
         
@@ -1481,7 +1654,7 @@ def compare_algorithms(
         
     except Exception as e:
         logger.error(f"Algorithm comparison error: {e}")
-        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
+        return standard_error_response(f"Algorithm comparison failed: {str(e)}", 500)
 
 @app.get("/xgboost_compute/{sensor_id}")
 async def xgboost_analysis(
@@ -1490,20 +1663,16 @@ async def xgboost_analysis(
 ):
     """XGBoost analysis with detailed metrics"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return {"error": "No data found for sensor", "status": "error"}
-            
-        df = preprocess_dataframe(records, sensor)
+        df = fetch_and_preprocess_data(sensor_id, sensor, "1month")
         if df.empty:
-            return {"error": "No valid data after preprocessing", "status": "error"}
+            return standard_error_response("No valid data for analysis", 400)
         
         if len(df) < 3:
-            return {"error": "Insufficient clean data for training", "status": "error"}
+            return standard_error_response("Insufficient clean data for training", 400)
 
         df_lags = make_lag_features(df, lags=2)
         if len(df_lags) < 2:
-            return {"error": "Insufficient data after feature engineering", "status": "error"}
+            return standard_error_response("Insufficient data after feature engineering", 400)
 
         X = df_lags[["lag1", "lag2"]]
         y = df_lags["value"]
@@ -1545,7 +1714,7 @@ async def xgboost_analysis(
         
     except Exception as e:
         logger.error(f"XGBoost analysis error: {e}")
-        return {"error": str(e), "status": "error"}
+        return standard_error_response(f"XGBoost analysis failed: {str(e)}", 500)
 
 # =============================================================================
 # FORECASTING ENDPOINTS
@@ -1559,15 +1728,14 @@ def predict_future(
 ):
     """Generate multi-day forecasts"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
+        df = fetch_and_preprocess_data(sensor_id, sensor, "3months")
         
         if df.empty or len(df) < 3:
-            return {"error": "Not enough historical data", "sensor_id": sensor_id, "sensor_type": sensor}
+            return standard_error_response("Not enough historical data", 400)
         
         df_lags = make_lag_features(df, lags=2)
         if df_lags.empty:
-            return {"error": "Insufficient data for forecasting", "sensor_id": sensor_id, "sensor_type": sensor}
+            return standard_error_response("Insufficient data for forecasting", 400)
         
         X = df_lags[["lag1", "lag2"]].values
         y = df_lags["value"].values
@@ -1603,7 +1771,7 @@ def predict_future(
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        return {"error": str(e), "sensor_id": sensor_id, "sensor_type": sensor}
+        return standard_error_response(f"Prediction failed: {str(e)}", 500)
 
 @app.get("/recommendation/{sensor_id}")
 def get_recommendation(
@@ -1612,8 +1780,7 @@ def get_recommendation(
 ):
     """Generate 1-day ahead forecast with OSH recommendation"""
     try:
-        records = fetch_sensor_history(sensor_id)
-        df = preprocess_dataframe(records, sensor)
+        df = fetch_and_preprocess_data(sensor_id, sensor, "1month")
 
         if df.empty:
             return {
@@ -1653,7 +1820,7 @@ def get_recommendation(
         X = df_lags[["lag1", "lag2"]].values
         y = df_lags["value"].values
 
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
+        model = xgb.XGBoostRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
         model.fit(X, y)
 
         last_lags = X[-1].copy()
@@ -1688,313 +1855,6 @@ def get_recommendation(
 # ANALYTICS ENDPOINTS
 # =============================================================================
 
-def create_classification_labels(df: pd.DataFrame, sensor_type: str) -> pd.DataFrame:
-    """Create classification labels based on sensor thresholds with better class distribution"""
-    if df.empty or len(df) < 5:
-        return pd.DataFrame()
-    
-    try:
-        df_class = df.copy()
-        
-        # Use quantile-based approach to ensure we have multiple classes
-        if len(df_class) >= 10:
-            q1 = df_class['value'].quantile(0.25)
-            q2 = df_class['value'].quantile(0.5)
-            q3 = df_class['value'].quantile(0.75)
-            
-            conditions = [
-                df_class['value'] < q1,
-                (df_class['value'] >= q1) & (df_class['value'] < q2),
-                (df_class['value'] >= q2) & (df_class['value'] < q3),
-                df_class['value'] >= q3
-            ]
-            choices = ['low', 'medium_low', 'medium_high', 'high']
-        else:
-            median_val = df_class['value'].median()
-            conditions = [
-                df_class['value'] <= median_val,
-                df_class['value'] > median_val
-            ]
-            choices = ['below_median', 'above_median']
-        
-        df_class['class'] = np.select(conditions, choices, default='unknown')
-        df_class = df_class[df_class['class'] != 'unknown']
-        
-        class_counts = df_class['class'].value_counts()
-        valid_classes = class_counts[class_counts >= 1].index.tolist()
-        
-        if len(valid_classes) < 2:
-            median_val = df_class['value'].median()
-            df_class['class'] = np.where(df_class['value'] > median_val, 'high', 'low')
-            class_counts = df_class['class'].value_counts()
-            valid_classes = class_counts[class_counts >= 1].index.tolist()
-            
-            if len(valid_classes) < 2:
-                return pd.DataFrame()
-        
-        df_class = df_class[df_class['class'].isin(valid_classes)]
-        return df_class
-    except Exception as e:
-        logger.error(f"Error creating classification labels: {e}")
-        return pd.DataFrame()
-
-def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, classes: List[str]) -> Dict[str, Any]:
-    """Compute comprehensive classification metrics"""
-    try:
-        if len(y_true) == 0 or len(y_pred) == 0:
-            return {
-                "accuracy": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "f1_score": 0.0,
-                "class_report": {},
-                "confusion_matrix": [],
-                "classes": classes
-            }
-        
-        accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-        
-        class_report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
-        conf_matrix = confusion_matrix(y_true, y_pred)
-        
-        return {
-            "accuracy": float(accuracy),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1_score": float(f1),
-            "class_report": class_report,
-            "confusion_matrix": conf_matrix.tolist(),
-            "classes": classes
-        }
-    except Exception as e:
-        logger.error(f"Error computing classification metrics: {e}")
-        return {
-            "accuracy": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1_score": 0.0,
-            "class_report": {},
-            "confusion_matrix": [],
-            "classes": classes
-        }
-  
-# =============================================================================
-# TEST ENDPOINT
-# =============================================================================
-
-@app.get("/test/{sensor_id}")
-def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
-    """Test endpoint to verify basic functionality"""
-    return {
-        "message": "API is working",
-        "sensor_id": sensor_id,
-        "sensor_type": sensor,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-def preprocess_dataframe_simple(records, sensor):
-    """Simplified dataframe preprocessing for performance metrics"""
-    try:
-        if not records:
-            return pd.DataFrame()
-        
-        # Create DataFrame with only necessary columns
-        data = []
-        for record in records:
-            if sensor in record and 'timestamp' in record:
-                try:
-                    value = float(record[sensor])
-                    timestamp = pd.to_datetime(record['timestamp'])
-                    data.append({'timestamp': timestamp, 'value': value})
-                except (ValueError, TypeError):
-                    continue
-        
-        if not data:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(data)
-        df = df.sort_values('timestamp')
-        df = df.dropna()
-        
-        logger.info(f"Preprocessed {len(df)} records for sensor {sensor}")
-        return df
-        
-    except Exception as e:
-        logger.error(f"Preprocessing error: {e}")
-        return pd.DataFrame()
-
-def filter_by_date_range_simple(df, date_range):
-    """Simplified date filtering for performance metrics"""
-    try:
-        if df.empty:
-            return df
-            
-        now = pd.Timestamp.now()
-        
-        date_filters = {
-            "1week": now - pd.Timedelta(weeks=1),
-            "1month": now - pd.Timedelta(days=30),
-            "3months": now - pd.Timedelta(days=90),
-            "6months": now - pd.Timedelta(days=180),
-            "1year": now - pd.Timedelta(days=365),
-            "all": pd.Timestamp.min
-        }
-        
-        cutoff = date_filters.get(date_range, date_filters["1month"])
-        
-        if cutoff != pd.Timestamp.min:
-            filtered_df = df[df['timestamp'] >= cutoff]
-            logger.info(f"Filtered from {len(df)} to {len(filtered_df)} records for range {date_range}")
-            return filtered_df
-            
-        return df
-        
-    except Exception as e:
-        logger.error(f"Date filtering error: {e}")
-        return df
-
-def create_simple_binary_labels(df):
-    """Create simple binary labels for classification with robust error handling"""
-    try:
-        if df is None or df.empty or len(df) < 5:
-            logger.warning("Cannot create binary labels: insufficient data")
-            return pd.DataFrame()
-            
-        df_copy = df.copy()
-        
-        # Check if 'value' column exists
-        if 'value' not in df_copy.columns:
-            logger.error("Missing 'value' column for binary classification")
-            return pd.DataFrame()
-        
-        # Use median for binary classification
-        median_val = df_copy['value'].median()
-        logger.info(f"Creating binary labels using median: {median_val}")
-        
-        df_copy['class_binary'] = (df_copy['value'] > median_val).astype(int)
-        
-        # Check if we have both classes
-        class_counts = df_copy['class_binary'].value_counts()
-        logger.info(f"Binary class distribution: {dict(class_counts)}")
-        
-        if len(class_counts) < 2:
-            logger.warning(f"Only one class found: {class_counts.index[0]}")
-            return pd.DataFrame()
-            
-        return df_copy
-        
-    except Exception as e:
-        logger.error(f"Error creating binary labels: {e}")
-        return pd.DataFrame()
-        
-def create_simple_lag_features(df, lags=2):
-    """Create simple lag features"""
-    try:
-        if df.empty:
-            return pd.DataFrame()
-            
-        df_copy = df.copy()
-        
-        # Create lag features
-        for i in range(1, lags + 1):
-            df_copy[f'lag{i}'] = df_copy['value'].shift(i)
-        
-        # Drop rows with NaN
-        df_copy = df_copy.dropna()
-        
-        return df_copy
-        
-    except Exception as e:
-        logger.error(f"Lag features error: {e}")
-        return pd.DataFrame()
-
-
-def get_accuracy_assessment(accuracy):
-    """Get accuracy assessment"""
-    if accuracy >= 0.9:
-        level = "Excellent"
-        confidence = "Very High"
-    elif accuracy >= 0.8:
-        level = "Very Good" 
-        confidence = "High"
-    elif accuracy >= 0.7:
-        level = "Good"
-        confidence = "Medium"
-    elif accuracy >= 0.6:
-        level = "Fair"
-        confidence = "Low-Medium"
-    else:
-        level = "Needs Improvement"
-        confidence = "Low"
-    
-    return {
-        "accuracy_level": level,
-        "confidence": confidence,
-        "interpretation": f"XGBoost shows {level.lower()} performance with {confidence.lower()} confidence"
-    }
-
-
-def create_enhanced_features(df_binary, sensor_col='value'):
-    """Create more predictive features for sensor data"""
-    if df_binary is None or len(df_binary) < 10:
-        return df_binary
-    
-    df = df_binary.copy()
-    
-    # Basic lag features
-    df['lag_1'] = df[sensor_col].shift(1)
-    df['lag_2'] = df[sensor_col].shift(2)
-    df['lag_3'] = df[sensor_col].shift(3)
-    
-    # Enhanced: Rolling statistics
-    df['rolling_mean_3'] = df[sensor_col].rolling(window=3).mean()
-    df['rolling_std_3'] = df[sensor_col].rolling(window=3).std()
-    df['rolling_mean_5'] = df[sensor_col].rolling(window=5).mean()
-    df['rolling_std_5'] = df[sensor_col].rolling(window=5).std()
-    
-    # Enhanced: Rate of change and momentum
-    df['momentum_3'] = df[sensor_col] - df[sensor_col].shift(3)
-    df['momentum_5'] = df[sensor_col] - df[sensor_col].shift(5)
-    
-    # Enhanced: Percent changes
-    df['pct_change_1'] = df[sensor_col].pct_change(periods=1)
-    df['pct_change_3'] = df[sensor_col].pct_change(periods=3)
-    
-    # Enhanced: Volatility features
-    df['volatility_5'] = df[sensor_col].rolling(window=5).std()
-    df['volatility_10'] = df[sensor_col].rolling(window=10).std()
-    
-    # Enhanced: Statistical features
-    overall_mean = df[sensor_col].mean()
-    overall_std = df[sensor_col].std()
-    if overall_std > 0:
-        df['z_score'] = (df[sensor_col] - overall_mean) / overall_std
-    else:
-        df['z_score'] = 0
-    
-    # Enhanced: Binary features for spikes/drops
-    df['is_spike'] = ((df[sensor_col] - df[sensor_col].shift(1)) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
-    df['is_drop'] = ((df[sensor_col].shift(1) - df[sensor_col]) > (2 * overall_std)).astype(int) if overall_std > 0 else 0
-    
-    # Enhanced: Time-based features
-    if 'timestamp' in df.columns:
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df['hour'] = df['timestamp'].dt.hour
-            df['day_of_week'] = df['timestamp'].dt.dayofweek
-            df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-            df['month'] = df['timestamp'].dt.month
-        except:
-            pass
-    
-    # Remove rows with NaN values
-    df = df.dropna()
-    
-    return df
-    
 @app.get("/performance/{sensor_id}")
 def performance_metrics(
     sensor_id: str,
@@ -2009,38 +1869,21 @@ def performance_metrics(
     grid_subsample: str = Query("0.8,1.0", description="Comma-separated values for subsample"),
     grid_colsample_bytree: str = Query("0.8,1.0", description="Comma-separated values for colsample_bytree")
 ):
-    """Get XGBoost performance metrics - FIXED VERSION"""
+    """Get XGBoost performance metrics - OPTIMIZED VERSION"""
     try:
         logger.info(f"Starting performance analysis for {sensor_id}, sensor: {sensor}")
         
-        # Fetch and preprocess data
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return JSONResponse(
-                content={"error": f"No data found for sensor {sensor_id}", "status": "error"},
-                status_code=404
-            )
-
-        df = preprocess_dataframe(records, sensor)
+        # Fetch and preprocess data using common utility
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
         if df.empty or len(df) < 5:
-            return JSONResponse(
-                content={"error": "Not enough data for analysis", "status": "error"},
-                status_code=400
-            )
-
-        df_filtered = filter_by_date_range(df, date_range)
-        if df_filtered.empty or len(df_filtered) < 5:
-            return JSONResponse(
-                content={"error": f"Not enough data after {date_range} filter", "status": "error"},
-                status_code=400
-            )
+            return standard_error_response("Not enough data for analysis", 400)
 
         # Create binary labels using median
-        median_val = float(df_filtered['value'].median())
-        df_binary = df_filtered.copy()
+        median_val = float(df['value'].median())
+        df_binary = df.copy()
         df_binary['class_binary'] = (df_binary['value'] > median_val).astype(int)
         
-        # Check class distribution - CONVERT TO NATIVE TYPES
+        # Check class distribution
         class_counts = df_binary['class_binary'].value_counts()
         class_distribution = {
             str(int(k)): int(v) for k, v in class_counts.items()
@@ -2048,13 +1891,10 @@ def performance_metrics(
         logger.info(f"Class distribution: {class_distribution}")
         
         if len(class_counts) < 2:
-            return JSONResponse(
-                content={
-                    "error": "Only one class found in data - cannot perform classification",
-                    "class_distribution": class_distribution,
-                    "status": "error"
-                },
-                status_code=400
+            return standard_error_response(
+                "Only one class found in data - cannot perform classification", 
+                400,
+                {"class_distribution": class_distribution}
             )
 
         # Create basic features
@@ -2066,19 +1906,16 @@ def performance_metrics(
         df_features = df_features.dropna()
         
         if df_features.empty or len(df_features) < 5:
-            return JSONResponse(
-                content={"error": "Not enough data after feature engineering", "status": "error"},
-                status_code=400
-            )
+            return standard_error_response("Not enough data after feature engineering", 400)
 
-        # Prepare features and target - CONVERT TO NATIVE TYPES
+        # Prepare features and target
         feature_cols = ['lag_1', 'lag_2']
         X = df_features[feature_cols].values
         y = df_features['class_binary'].values
 
         logger.info(f"Final dataset - X: {X.shape}, y: {y.shape}")
 
-        # Calculate baseline accuracy - CONVERT TO NATIVE TYPES
+        # Calculate baseline accuracy
         y_counts = np.bincount(y)
         baseline_accuracy = float(max(y_counts) / len(y)) if len(y_counts) > 0 else 0.0
         logger.info(f"Baseline accuracy: {baseline_accuracy:.3f}")
@@ -2098,42 +1935,29 @@ def performance_metrics(
 
         # Validate test set
         if len(X_test) == 0 or len(np.unique(y_test)) < 2:
-            return JSONResponse(
-                content={
-                    "error": "Test set too small or only one class",
+            return standard_error_response(
+                "Test set too small or only one class",
+                400,
+                {
                     "train_samples": int(len(X_train)),
-                    "test_samples": int(len(X_test)),
-                    "status": "error"
-                },
-                status_code=400
+                    "test_samples": int(len(X_test))
+                }
             )
 
-        # Use basic XGBoost
-        model = xgb.XGBClassifier(
-            n_estimators=50,
-            max_depth=3,
-            learning_rate=0.1,
-            use_label_encoder=False,
-            eval_metric="logloss",
-            random_state=42
-        )
-        model.fit(X_train, y_train)
-
-        # Make predictions
-        y_pred = model.predict(X_test)
-
-        # Calculate metrics - ENSURE ALL ARE NATIVE PYTHON TYPES
-        accuracy = float(accuracy_score(y_test, y_pred))
-        precision = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
-        recall = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
-        f1 = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
+        # Use standardized model training
+        model_result = train_and_evaluate_model(X_train, X_test, y_train, y_test, 'xgb')
+        
+        accuracy = model_result['accuracy']
+        precision = model_result['precision']
+        recall = model_result['recall']
+        f1 = model_result['f1']
 
         logger.info(f"Metrics - Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
 
-        # Feature importance - CONVERT ALL TO NATIVE TYPES
+        # Feature importance
         feature_importance = []
-        if hasattr(model, 'feature_importances_'):
-            for i, importance in enumerate(model.feature_importances_):
+        if hasattr(model_result['model'], 'feature_importances_'):
+            for i, importance in enumerate(model_result['model'].feature_importances_):
                 feature_importance.append({
                     "feature": str(feature_cols[i]) if i < len(feature_cols) else f"feature_{i}",
                     "importance": float(importance)
@@ -2146,7 +1970,7 @@ def performance_metrics(
             str(int(cls)): int(count) for cls, count in zip(unique_classes, class_counts)
         }
 
-        # Prepare response - ENSURE ALL VALUES ARE JSON SERIALIZABLE
+        # Prepare response
         response_data = {
             "sensor_id": str(sensor_id),
             "sensor_type": str(sensor),
@@ -2180,72 +2004,15 @@ def performance_metrics(
 
         # Final validation using json.dumps to catch any serialization issues
         try:
-            import json
-            json.dumps(response_data)  # This will raise an error if there are non-serializable objects
+            json.dumps(response_data)
             return JSONResponse(content=response_data)
         except TypeError as e:
             logger.error(f"JSON serialization error: {e}")
-            # Return a safe error response
-            return JSONResponse(
-                content={
-                    "error": "Data serialization error",
-                    "message": "Could not serialize analysis results",
-                    "status": "error"
-                },
-                status_code=500
-            )
+            return standard_error_response("Data serialization error", 500)
 
     except Exception as e:
         logger.exception(f"Performance metrics error: {str(e)}")
-        return JSONResponse(
-            content={"error": f"Analysis failed: {str(e)}", "status": "error"},
-            status_code=500
-        )
-        
-def create_safe_features(df_binary, sensor_col='value'):
-    """Create features without data leakage"""
-    if df_binary is None or len(df_binary) < 10:
-        return pd.DataFrame()
-    
-    df = df_binary.copy()
-    
-    # Safe lag features (only past data)
-    df['lag_1'] = df[sensor_col].shift(1)
-    df['lag_2'] = df[sensor_col].shift(2)
-    df['lag_3'] = df[sensor_col].shift(3)
-    
-    # Safe rolling statistics (using only past data)
-    df['rolling_mean_3'] = df[sensor_col].shift(1).rolling(window=3).mean()
-    df['rolling_std_3'] = df[sensor_col].shift(1).rolling(window=3).std()
-    
-    # Remove rows with NaN values (from shifting)
-    df = df.dropna()
-    
-    # Remove any features that might leak future information
-    safe_cols = [col for col in df.columns if not any(x in str(col) for x in ['future', 'target', 'class'])]
-    df = df[safe_cols]
-    
-    return df
-
-
-def check_data_leakage(df, feature_cols, target_col):
-    """Check for potential data leakage"""
-    try:
-        # Check if target is in features
-        if target_col in feature_cols:
-            return True
-        
-        # Check for perfect correlation with target
-        for col in feature_cols:
-            if col != target_col:
-                correlation = abs(df[col].corr(df[target_col]))
-                if correlation > 0.95:  # Nearly perfect correlation
-                    logger.warning(f"High correlation between {col} and target: {correlation}")
-                    return True
-        
-        return False
-    except:
-        return False
+        return standard_error_response(f"Analysis failed: {str(e)}", 500)
         
 @app.get("/debug/performance/{sensor_id}")
 def debug_performance_metrics(
@@ -2253,18 +2020,16 @@ def debug_performance_metrics(
     sensor: str = Query(...)
 ):
     """Debug endpoint to check data quality before running analysis"""
-    records = fetch_sensor_history(sensor_id)
-    df = preprocess_dataframe(records, sensor)
+    df = fetch_and_preprocess_data(sensor_id, sensor, "1month")
     
     if df.empty:
-        return {"error": "No data after preprocessing"}
+        return standard_error_response("No data after preprocessing", 400)
     
     df_binary = create_simple_binary_labels(df)
     
     analysis = {
         "sensor_id": sensor_id,
         "sensor_type": sensor,
-        "total_records": len(records),
         "after_preprocessing": len(df),
         "after_binary_labels": len(df_binary) if df_binary is not None else 0,
         "data_quality_checks": {}
@@ -2286,6 +2051,7 @@ def debug_performance_metrics(
         }
     
     return analysis
+
 # ---------------------------------------------------
 # Correlation Plots (Single or Multiple Sensors)
 # ---------------------------------------------------
@@ -2295,7 +2061,7 @@ def correlation(
     sensor_ids: str = Query(..., description="Comma-separated sensor IDs"),
     plot_type: str = Query("heatmap", enum=["heatmap", "scatter", "pairplot"]),
     output: str = Query("img", enum=["img", "json"]),
-    limit: int = Query(500, description="Maximum number of records"),  # Reduced default limit
+    limit: int = Query(500, description="Maximum number of records"),
 ):
     """Correlation analysis with memory optimization"""
     try:
@@ -2303,7 +2069,7 @@ def correlation(
         
         sensor_list = [s.strip() for s in sensor_ids.split(",") if s.strip()]
         if not sensor_list:
-            return JSONResponse({"error": "No sensor IDs provided"}, status_code=400)
+            return standard_error_response("No sensor IDs provided", 400)
 
         all_data = []
         for sid in sensor_list:
@@ -2314,7 +2080,7 @@ def correlation(
                 all_data.append(df)
 
         if not all_data:
-            return JSONResponse({"error": "No data found for given sensors"}, status_code=404)
+            return standard_error_response("No data found for given sensors", 404)
 
         df = pd.concat(all_data, ignore_index=True)
 
@@ -2342,7 +2108,7 @@ def correlation(
             }
 
         # IMG output with memory optimization
-        plt.figure(figsize=(8, 6))  # Smaller figure
+        plt.figure(figsize=(8, 6))
         
         if plot_type == "heatmap":
             sns.heatmap(df.corr(), annot=True, cmap="coolwarm", fmt=".2f", 
@@ -2367,7 +2133,7 @@ def correlation(
 
         buf = io.BytesIO()
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")  # Lower DPI
+        plt.savefig(buf, format="png", dpi=80, bbox_inches="tight")
         plt.close('all')
         buf.seek(0)
         
@@ -2383,10 +2149,12 @@ def correlation(
 
     except Exception as e:
         logger.error(f"Correlation analysis error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return standard_error_response(f"Correlation analysis failed: {str(e)}", 500)
+
 # ===========
-#      confusion matrix
-#==============
+# Confusion Matrix
+# ===========
+
 @app.get("/confusion_matrix/{sensor_id}")
 def enhanced_confusion_matrix(
     sensor_id: str,
@@ -2399,50 +2167,22 @@ def enhanced_confusion_matrix(
 ):
     """
     Enhanced Confusion Matrix with Next-Day Prediction Probabilities
-    - Modern color schemes for professional visualization
-    - Precision, Recall, F1-score metrics
-    - Next-day prediction confidence scores
-    - Multiple output formats (Image, JSON, Both)
     """
     try:
-        # Fetch and preprocess data
-        records = fetch_sensor_history(sensor_id)
-        if not records:
-            return JSONResponse(
-                content={"error": f"No data found for sensor {sensor_id}"},
-                status_code=404
-            )
-
-        df = preprocess_dataframe(records, sensor)
+        # Fetch and preprocess data using common utility
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
         if df.empty or len(df) < 10:
-            return JSONResponse(
-                content={"error": "Insufficient data for analysis"},
-                status_code=400
-            )
+            return standard_error_response("Insufficient data for analysis", 400)
 
-        # Filter by date range
-        df_filtered = filter_by_date_range(df, date_range)
-        if len(df_filtered) < 5:
-            return JSONResponse(
-                content={"error": f"Not enough data after {date_range} filter"},
-                status_code=400
-            )
-
-        # Create binary classification labels (high/low based on median)
-        df_binary = create_simple_binary_labels(df_filtered)
+        # Create binary classification labels
+        df_binary = create_simple_binary_labels(df)
         if df_binary.empty:
-            return JSONResponse(
-                content={"error": "Could not create classification labels"},
-                status_code=400
-            )
+            return standard_error_response("Could not create classification labels", 400)
 
         # Create enhanced features for better prediction
         df_features = create_enhanced_features(df_binary, sensor_col='value')
         if df_features.empty:
-            return JSONResponse(
-                content={"error": "Feature engineering failed"},
-                status_code=400
-            )
+            return standard_error_response("Feature engineering failed", 400)
 
         # Prepare features and target
         feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
@@ -2479,7 +2219,7 @@ def enhanced_confusion_matrix(
 
         # Confusion matrix
         conf_matrix = confusion_matrix(y_test, y_pred)
-        class_names = ['Low', 'High']  # Based on binary classification
+        class_names = ['Low', 'High']
 
         # Calculate next-day prediction probabilities
         next_day_prediction = None
@@ -2560,10 +2300,7 @@ def enhanced_confusion_matrix(
 
     except Exception as e:
         logger.error(f"Enhanced confusion matrix error: {e}")
-        return JSONResponse(
-            content={"error": f"Analysis failed: {str(e)}"},
-            status_code=500
-        )
+        return standard_error_response(f"Confusion matrix analysis failed: {str(e)}", 500)
 
 
 def generate_confusion_matrix_image(conf_matrix, class_names, response_data, sensor, color_scheme):
@@ -2700,7 +2437,6 @@ def create_enhanced_confusion_matrix_plot(conf_matrix, class_names, response_dat
     )
 
 
-# Helper function to create enhanced features for better prediction
 def create_enhanced_prediction_features(df, sensor_col='value'):
     """Create features specifically optimized for next-day prediction"""
     if df is None or len(df) < 10:
@@ -2721,7 +2457,7 @@ def create_enhanced_prediction_features(df, sensor_col='value'):
             pass
     
     # Enhanced lag features with different windows
-    for lag in [1, 2, 3, 5, 7]:  # Multiple time windows
+    for lag in [1, 2, 3, 5, 7]:
         df_enhanced[f'lag_{lag}'] = df_enhanced[sensor_col].shift(lag)
     
     # Rolling statistics with multiple windows
@@ -2746,6 +2482,20 @@ def create_enhanced_prediction_features(df, sensor_col='value'):
     df_enhanced = df_enhanced.dropna()
     
     return df_enhanced
+
+# =============================================================================
+# TEST ENDPOINT
+# =============================================================================
+
+@app.get("/test/{sensor_id}")
+def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
+    """Test endpoint to verify basic functionality"""
+    return {
+        "message": "API is working",
+        "sensor_id": sensor_id,
+        "sensor_type": sensor,
+        "timestamp": datetime.now().isoformat()
+    }
     
 # Run the application
 if __name__ == "__main__":
