@@ -935,148 +935,416 @@ def plot_sensor_data(
         logger.error(f"Plot generation error: {e}")
         return error_image(f"Error generating plot: {str(e)}")
         
-@app.get("/shap_hour_minimal/{sensor_id}")
-def shap_hour_minimal(
-    sensor_id: str, 
-    sensor: str = Query(...),
-    range: str = Query("1month")
+@app.get("/shap_hourly_analysis/{sensor_id}")
+def shap_hourly_analysis(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type (co2, methane, temperature, humidity, ammonia)"),
+    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+    confidence_level: float = Query(0.95, description="Confidence level for intervals (0.90, 0.95, 0.99)"),
+    anomaly_threshold: float = Query(2.0, description="Z-score threshold for anomaly detection")
 ):
-    """Minimal version of SHAP hourly analysis with enhanced error handling"""
+    """
+    Enhanced SHAP-based hourly analysis with statistical significance testing,
+    anomaly detection, and actionable recommendations for gas monitoring.
+    """
     try:
-        logger.info(f"Starting SHAP hourly analysis for {sensor_id}, sensor: {sensor}, range: {range}")
+        logger.info(f"Starting enhanced SHAP analysis for {sensor_id}, sensor: {sensor}")
         
-        # Fetch and process data
+        # =============================================================================
+        # 1. DATA COLLECTION & PREPROCESSING
+        # =============================================================================
         records = fetch_sensor_history(sensor_id)
         if not records:
-            logger.warning(f"No records found for sensor {sensor_id}")
-            return {"error": "No historical data found for this sensor", "status": "error"}
-        
-        logger.info(f"Fetched {len(records)} raw records")
+            return {"error": "No historical data found", "status": "error"}
         
         df = preprocess_dataframe(records, sensor)
         if df.empty:
-            logger.warning(f"No valid data after preprocessing for {sensor_id}, sensor: {sensor}")
-            return {"error": "No valid sensor data after preprocessing", "status": "error"}
+            return {"error": "No valid sensor data", "status": "error"}
         
-        logger.info(f"After preprocessing: {len(df)} records")
-        
-        df_filtered = filter_by_date_range(df, range)
+        df_filtered = filter_by_date_range(df, date_range)
         if df_filtered.empty:
-            logger.warning(f"No data after {range} filter. Original had {len(df)} records")
-            return {
-                "error": f"No data available for the selected date range '{range}'. Try 'all' or a longer range.",
-                "available_data": {
-                    "total_records": len(df),
-                    "suggested_ranges": ["all", "3months", "6months", "1year"]
-                },
-                "status": "error"
-            }
+            return {"error": f"No data after {date_range} filter", "status": "error"}
         
-        logger.info(f"After date filtering: {len(df_filtered)} records")
+        # =============================================================================
+        # 2. FEATURE ENGINEERING FOR TEMPORAL ANALYSIS
+        # =============================================================================
+        df_enhanced = df_filtered.copy()
         
-        # Ensure timestamp is in proper datetime format - FIXED VERSION
-        if 'timestamp' not in df_filtered.columns:
-            return {"error": "Timestamp column missing", "status": "error"}
+        # Time-based features
+        df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
+        df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
+        df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
+        df_enhanced['is_weekend'] = df_enhanced['day_of_week'].isin([5, 6]).astype(int)
+        df_enhanced['day_of_month'] = df_enhanced['timestamp'].dt.day
+        df_enhanced['month'] = df_enhanced['timestamp'].dt.month
         
-        # Convert timestamp to datetime if it's not already
-        if not pd.api.types.is_datetime64_any_dtype(df_filtered["timestamp"]):
-            try:
-                df_filtered.loc[:, "timestamp"] = pd.to_datetime(df_filtered["timestamp"])
-            except Exception as e:
-                logger.error(f"Failed to parse timestamps: {e}")
-                return {"error": f"Failed to parse timestamps: {str(e)}", "status": "error"}
+        # Rolling statistics
+        df_enhanced['rolling_mean_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).mean()
+        df_enhanced['rolling_std_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).std()
+        df_enhanced['prev_hour_value'] = df_enhanced['value'].shift(1)
         
-        # Extract hour - FIXED: Use .loc to avoid chained assignment
-        df_filtered.loc[:, "hour"] = df_filtered["timestamp"].dt.hour
+        # Remove rows with NaN values
+        df_enhanced = df_enhanced.dropna()
         
-        # Simple aggregation - FIXED: Use proper aggregation syntax
-        try:
-            agg = df_filtered.groupby("hour", as_index=False).agg({
-                "value": ["mean", "count"]
+        if df_enhanced.empty:
+            return {"error": "Insufficient data for analysis after feature engineering", "status": "error"}
+        
+        # =============================================================================
+        # 3. STATISTICAL SIGNIFICANCE OF HOURLY PATTERNS
+        # =============================================================================
+        hourly_stats = []
+        hourly_groups = df_enhanced.groupby('hour')['value']
+        
+        for hour in range(24):
+            hour_data = hourly_groups.get_group(hour) if hour in hourly_groups.groups else []
+            if len(hour_data) > 1:
+                # Basic statistics
+                mean_val = np.mean(hour_data)
+                std_val = np.std(hour_data)
+                n = len(hour_data)
+                
+                # Confidence interval
+                from scipy import stats
+                t_critical = stats.t.ppf((1 + confidence_level) / 2, n-1)
+                margin_error = t_critical * (std_val / np.sqrt(n))
+                ci_lower = mean_val - margin_error
+                ci_upper = mean_val + margin_error
+                
+                # Compare with overall mean (t-test)
+                overall_mean = df_enhanced['value'].mean()
+                t_stat, p_value = stats.ttest_1samp(hour_data, overall_mean)
+                
+                # Effect size (Cohen's d)
+                cohen_d = (mean_val - overall_mean) / (df_enhanced['value'].std() + 1e-8)
+                
+                hourly_stats.append({
+                    'hour': hour,
+                    'mean': float(mean_val),
+                    'std': float(std_val),
+                    'sample_size': n,
+                    'confidence_interval': [float(ci_lower), float(ci_upper)],
+                    't_statistic': float(t_stat),
+                    'p_value': float(p_value),
+                    'cohen_d': float(cohen_d),
+                    'significant': p_value < 0.05,
+                    'effect_size': 'large' if abs(cohen_d) > 0.8 else 'medium' if abs(cohen_d) > 0.5 else 'small'
+                })
+            else:
+                hourly_stats.append({
+                    'hour': hour,
+                    'mean': None,
+                    'sample_size': len(hour_data),
+                    'significant': False,
+                    'error': 'Insufficient data'
+                })
+        
+        # =============================================================================
+        # 4. ANOMALY DETECTION IN HOURLY BEHAVIOR
+        # =============================================================================
+        anomalies = []
+        hourly_anomaly_analysis = []
+        
+        # Z-score based anomaly detection per hour
+        for hour in range(24):
+            if hour in hourly_groups.groups:
+                hour_data = hourly_groups.get_group(hour)
+                if len(hour_data) > 5:  # Need minimum data for meaningful z-scores
+                    z_scores = np.abs(stats.zscore(hour_data))
+                    hour_anomalies = hour_data[z_scores > anomaly_threshold]
+                    
+                    for idx, value in hour_anomalies.items():
+                        original_idx = df_enhanced.index[df_enhanced['hour'] == hour][list(hour_anomalies.index).index(idx)]
+                        timestamp = df_enhanced.loc[original_idx, 'timestamp']
+                        
+                        anomalies.append({
+                            'hour': hour,
+                            'timestamp': timestamp.isoformat(),
+                            'value': float(value),
+                            'z_score': float(z_scores[hour_anomalies.index.get_loc(idx)]),
+                            'deviation': f"{(value - hour_data.mean()) / hour_data.std():.1f}σ"
+                        })
+                    
+                    hourly_anomaly_analysis.append({
+                        'hour': hour,
+                        'total_readings': len(hour_data),
+                        'anomalies_detected': len(hour_anomalies),
+                        'anomaly_rate': len(hour_anomalies) / len(hour_data),
+                        'mean_value': float(hour_data.mean()),
+                        'std_value': float(hour_data.std())
+                    })
+        
+        # =============================================================================
+        # 5. SHAP ANALYSIS FOR PREDICTIVE INSIGHTS
+        # =============================================================================
+        # Prepare features for SHAP analysis
+        feature_columns = ['hour', 'day_of_week', 'is_weekend', 'rolling_mean_6h', 'rolling_std_6h', 'prev_hour_value']
+        X = df_enhanced[feature_columns]
+        y = df_enhanced['value']
+        
+        # Train model for SHAP analysis
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42
+        )
+        model.fit(X, y)
+        
+        # Compute SHAP values
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        
+        # Feature importance from SHAP
+        feature_importance = []
+        for i, feature in enumerate(feature_columns):
+            feature_importance.append({
+                'feature': feature,
+                'importance': float(np.mean(np.abs(shap_values[:, i]))),
+                'direction': 'positive' if np.mean(shap_values[:, i]) > 0 else 'negative'
             })
-            # Flatten column names
-            agg.columns = ['hour', 'value', 'data_points']
-        except Exception as e:
-            logger.error(f"Groupby failed: {e}")
-            # Fallback to simple groupby
-            agg = df_filtered.groupby("hour")["value"].mean().reset_index()
-            agg['data_points'] = df_filtered.groupby("hour")["value"].count().values
         
-        if agg.empty:
-            logger.warning(f"No hourly aggregation possible")
-            return {
-                "error": "Insufficient data for hourly analysis",
-                "status": "error"
-            }
+        feature_importance.sort(key=lambda x: x['importance'], reverse=True)
         
-        logger.info(f"Hourly aggregation: {len(agg)} hours with data")
+        # Hourly impact from SHAP
+        hourly_impact = []
+        for hour in range(24):
+            hour_mask = X['hour'] == hour
+            if hour_mask.sum() > 0:
+                hour_shap = shap_values[hour_mask, 0]  # SHAP values for 'hour' feature (index 0)
+                hourly_impact.append({
+                    'hour': hour,
+                    'mean_impact': float(np.mean(hour_shap)),
+                    'impact_std': float(np.std(hour_shap)),
+                    'impact_samples': int(hour_mask.sum())
+                })
         
-        # Create plot
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # =============================================================================
+        # 6. ACTIONABLE RECOMMENDATIONS
+        # =============================================================================
+        recommendations = generate_shap_based_recommendations(
+            hourly_stats, feature_importance, anomalies, sensor
+        )
         
-        # Simple line plot - FIXED: Use proper data references
-        try:
-            # Convert to native Python types for plotting
-            hours = agg['hour'].astype(int).tolist()
-            values = agg['value'].astype(float).tolist()
-            
-            plt.plot(hours, values, marker='o', linewidth=2, markersize=6)
-            plt.scatter(hours, values, s=50, alpha=0.7)
-        except Exception as e:
-            logger.error(f"Plotting failed: {e}")
-            # Fallback plotting
-            plt.plot(agg['hour'], agg['value'], 'o-')
+        # =============================================================================
+        # 7. VISUAL EXPLANATIONS - THREE SECTIONS
+        # =============================================================================
+        visualization_data = create_three_section_visualizations(
+            df_enhanced, hourly_stats, shap_values, X, feature_columns, 
+            anomalies, sensor, sensor_id, date_range
+        )
         
-        plt.xlabel("Hour of Day", fontsize=12)
-        plt.ylabel(f"{sensor.upper()} Value", fontsize=12)
-        plt.title(f"Hourly {sensor.upper()} Pattern - Sensor {sensor_id}", fontsize=14)
-        plt.grid(True, alpha=0.3)
-        plt.xticks(range(0, 24))
-        
-        buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close()
-        buf.seek(0)
-        
-        image_data = base64.b64encode(buf.read()).decode('utf-8')
-        
-        # Convert numpy types to JSON-serializable types - FIXED
-        hourly_data = []
-        for _, row in agg.iterrows():
-            hourly_data.append({
-                "hour": int(row['hour']),
-                "value": float(row['value']),
-                "data_points": int(row.get('data_points', 1))
-            })
-        
+        # =============================================================================
+        # 8. FINAL RESPONSE
+        # =============================================================================
         response = {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "date_range": range,
-            "hourly_data": hourly_data,
-            "data_summary": {
-                "total_records": len(df_filtered),
-                "hours_covered": len(agg),
-                "date_range_used": {
-                    "start": df_filtered['timestamp'].min().strftime('%Y-%m-%d'),
-                    "end": df_filtered['timestamp'].max().strftime('%Y-%m-%d')
+            "date_range": date_range,
+            "analysis_timestamp": datetime.now().isoformat(),
+            
+            "statistical_significance": {
+                "hourly_patterns": hourly_stats,
+                "confidence_level": confidence_level,
+                "significant_hours": [h for h in hourly_stats if h.get('significant', False)],
+                "overall_pattern_strength": len([h for h in hourly_stats if h.get('significant', False)]) / 24
+            },
+            
+            "anomaly_detection": {
+                "anomalies_found": len(anomalies),
+                "anomaly_threshold": f"{anomaly_threshold}σ",
+                "hourly_anomaly_analysis": hourly_anomaly_analysis,
+                "anomaly_details": anomalies[:10]  # Limit details for response size
+            },
+            
+            "predictive_insights": {
+                "feature_importance": feature_importance,
+                "hourly_impact_analysis": hourly_impact,
+                "model_performance": {
+                    "r_squared": float(model.score(X, y)),
+                    "features_used": feature_columns,
+                    "samples_analyzed": len(X)
                 }
             },
-            "image_data": image_data,
+            
+            "actionable_recommendations": recommendations,
+            
+            "visual_explanations": visualization_data,
+            
             "status": "success"
         }
         
-        logger.info(f"SHAP hourly analysis completed successfully for {sensor_id}")
         return response
         
     except Exception as e:
-        logger.error(f"SHAP hourly analysis error for {sensor_id}: {str(e)}", exc_info=True)
-        return {
-            "error": f"Analysis failed: {str(e)}", 
-            "status": "error"
-        }
+        logger.error(f"Enhanced SHAP analysis failed: {str(e)}", exc_info=True)
+        return {"error": f"Analysis failed: {str(e)}", "status": "error"}
+
+
+def generate_shap_based_recommendations(hourly_stats, feature_importance, anomalies, sensor_type):
+    """Generate actionable recommendations based on SHAP and statistical analysis"""
+    recommendations = []
+    
+    # Find peak hours with statistical significance
+    significant_hours = [h for h in hourly_stats if h.get('significant', False) and h.get('mean') is not None]
+    if significant_hours:
+        peak_hours = sorted(significant_hours, key=lambda x: x['mean'], reverse=True)[:3]
         
+        recommendations.append({
+            "type": "peak_hours",
+            "priority": "high",
+            "message": f"Statistically significant peaks detected at hours: {[h['hour'] for h in peak_hours]}",
+            "action": f"Increase monitoring and ventilation during hours {[h['hour'] for h in peak_hours]}"
+        })
+    
+    # Feature-based recommendations
+    top_features = feature_importance[:3]
+    if top_features:
+        feature_msg = ", ".join([f"{f['feature']} ({f['importance']:.3f})" for f in top_features])
+        recommendations.append({
+            "type": "key_drivers",
+            "priority": "medium",
+            "message": f"Primary factors affecting {sensor_type}: {feature_msg}",
+            "action": "Focus on controlling these key influencing factors"
+        })
+    
+    # Anomaly-based recommendations
+    if anomalies:
+        recommendations.append({
+            "type": "anomaly_alert",
+            "priority": "high" if len(anomalies) > 5 else "medium",
+            "message": f"Found {len(anomalies)} anomalous readings requiring investigation",
+            "action": "Review sensor calibration and investigate environmental conditions during anomaly periods"
+        })
+    
+    # Safety thresholds based on sensor type
+    safety_info = {
+        "co2": {"warning": 800, "danger": 1000},
+        "methane": {"warning": 500, "danger": 1000},
+        "ammonia": {"warning": 25, "danger": 50},
+        "temperature": {"warning_low": 15, "warning_high": 30, "danger_low": 10, "danger_high": 35},
+        "humidity": {"warning_low": 30, "warning_high": 60, "danger_low": 20, "danger_high": 70}
+    }
+    
+    if sensor_type in safety_info:
+        recommendations.append({
+            "type": "safety_benchmark",
+            "priority": "info",
+            "message": f"Current analysis relative to {sensor_type.upper()} safety thresholds",
+            "action": "Compare hourly patterns with established safety limits"
+        })
+    
+    return recommendations
+
+
+def create_three_section_visualizations(df, hourly_stats, shap_values, X, feature_columns, anomalies, sensor, sensor_id, date_range):
+    """Create three distinct visualization sections"""
+    import base64
+    from io import BytesIO
+    
+    visualizations = {}
+    
+    # SECTION 1: SHAP Summary Plot
+    try:
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 2, 1)
+        shap.summary_plot(shap_values, X, feature_names=feature_columns, show=False)
+        plt.title(f"SHAP Feature Importance - {sensor.upper()}", fontsize=14, fontweight='bold')
+        
+        plt.subplot(2, 2, 2)
+        # SHAP dependence plot for hour feature
+        hour_idx = feature_columns.index('hour')
+        shap.dependence_plot(hour_idx, shap_values, X, feature_names=feature_columns, show=False)
+        plt.title("SHAP Hourly Dependence", fontweight='bold')
+        
+        buf1 = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf1, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        buf1.seek(0)
+        visualizations['shap_analysis'] = base64.b64encode(buf1.read()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"SHAP visualization failed: {e}")
+        visualizations['shap_analysis'] = None
+    
+    # SECTION 2: Hourly Pattern Analysis with Confidence Intervals
+    try:
+        plt.figure(figsize=(14, 10))
+        
+        # Subplot 1: Hourly means with confidence intervals
+        plt.subplot(2, 2, 1)
+        hours = [h['hour'] for h in hourly_stats if h.get('mean') is not None]
+        means = [h['mean'] for h in hourly_stats if h.get('mean') is not None]
+        ci_lower = [h['confidence_interval'][0] for h in hourly_stats if h.get('mean') is not None]
+        ci_upper = [h['confidence_interval'][1] for h in hourly_stats if h.get('mean') is not None]
+        
+        plt.plot(hours, means, 'b-', linewidth=2, label='Hourly Mean')
+        plt.fill_between(hours, ci_lower, ci_upper, alpha=0.2, label='95% CI')
+        plt.xlabel('Hour of Day')
+        plt.ylabel(f'{sensor.upper()} Value')
+        plt.title('Hourly Patterns with Confidence Intervals', fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Subplot 2: Statistical significance
+        plt.subplot(2, 2, 2)
+        significant_hours = [h['hour'] for h in hourly_stats if h.get('significant', False)]
+        p_values = [h['p_value'] for h in hourly_stats if h.get('p_value') is not None]
+        
+        plt.bar(range(len(p_values)), -np.log10(p_values))
+        plt.axhline(y=-np.log10(0.05), color='r', linestyle='--', label='p=0.05 threshold')
+        plt.xlabel('Hour of Day')
+        plt.ylabel('-log10(p-value)')
+        plt.title('Statistical Significance by Hour', fontweight='bold')
+        plt.legend()
+        
+        buf2 = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf2, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        visualizations['hourly_patterns'] = base64.b64encode(buf2.read()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Hourly pattern visualization failed: {e}")
+        visualizations['hourly_patterns'] = None
+    
+    # SECTION 3: Anomaly Detection Visualization
+    try:
+        plt.figure(figsize=(12, 8))
+        
+        # Subplot 1: Anomalies over time
+        plt.subplot(2, 2, 1)
+        plt.plot(df['timestamp'], df['value'], 'b-', alpha=0.7, label='Normal readings')
+        
+        if anomalies:
+            anomaly_times = [pd.to_datetime(a['timestamp']) for a in anomalies]
+            anomaly_values = [a['value'] for a in anomalies]
+            plt.scatter(anomaly_times, anomaly_values, color='red', s=50, label='Anomalies')
+        
+        plt.xlabel('Time')
+        plt.ylabel(f'{sensor.upper()} Value')
+        plt.title('Anomaly Detection Timeline', fontweight='bold')
+        plt.legend()
+        plt.xticks(rotation=45)
+        
+        # Subplot 2: Hourly anomaly distribution
+        plt.subplot(2, 2, 2)
+        if anomalies:
+            anomaly_hours = [a['hour'] for a in anomalies]
+            plt.hist(anomaly_hours, bins=24, range=(0, 24), alpha=0.7, color='red')
+            plt.xlabel('Hour of Day')
+            plt.ylabel('Anomaly Count')
+            plt.title('Anomaly Distribution by Hour', fontweight='bold')
+        
+        buf3 = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf3, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        visualizations['anomaly_detection'] = base64.b64encode(buf3.read()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Anomaly visualization failed: {e}")
+        visualizations['anomaly_detection'] = None
+    
+    return visualizations
+    
 @app.get("/debug/hourly-data/{sensor_id}")
 def debug_hourly_data(
     sensor_id: str,
