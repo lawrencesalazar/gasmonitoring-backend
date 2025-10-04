@@ -3269,6 +3269,164 @@ def safe_isoformat(timestamp):
     except:
         return str(timestamp)
 
+def get_performance_metrics_data(sensor_id: str, sensor: str, date_range: str, df: pd.DataFrame = None):
+    """
+    Get performance metrics data or compute if not available
+    Now accepts pre-fetched dataframe to avoid duplicate fetching
+    """
+    try:
+        # Use provided dataframe or fetch new one
+        if df is None:
+            df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
+        
+        if df.empty or len(df) < 10:  # Reduced minimum for performance metrics
+            return {
+                "error": f"Insufficient data for performance metrics ({len(df)} points available, 10 required)",
+                "available_data": len(df),
+                "model_trained": False
+            }
+        
+        # Create binary labels for classification
+        df_binary = create_simple_binary_labels(df)
+        if df_binary.empty or len(df_binary) < 8:  # Reduced minimum
+            return {
+                "error": "Cannot create reliable classification labels",
+                "available_data": len(df),
+                "model_trained": False
+            }
+        
+        # Create features with simpler approach for small datasets
+        if len(df_binary) < 15:
+            # Use simpler features for small datasets
+            df_features = df_binary.copy()
+            df_features['lag_1'] = df_features['value'].shift(1)
+            df_features['lag_2'] = df_features['value'].shift(2)
+            df_features['rolling_mean_3'] = df_features['value'].rolling(window=3, min_periods=1).mean()
+        else:
+            # Use enhanced features for larger datasets
+            df_features = create_enhanced_features(df_binary, sensor_col='value')
+        
+        if df_features.empty:
+            return {
+                "error": "Feature engineering failed",
+                "available_data": len(df),
+                "model_trained": False
+            }
+        
+        # Remove rows with NaN values
+        df_features = df_features.dropna()
+        
+        if len(df_features) < 5:
+            return {
+                "error": "Not enough data after feature engineering",
+                "available_data": len(df),
+                "model_trained": False
+            }
+        
+        # Prepare features and target
+        feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
+        if len(feature_cols) == 0:
+            return {
+                "error": "No features available for model training",
+                "available_data": len(df),
+                "model_trained": False
+            }
+        
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
+        
+        # For very small datasets, use different split strategy
+        if len(X) < 10:
+            # Use all data for training, no test split
+            X_train, y_train = X, y
+            X_test, y_test = X, y
+        else:
+            # Standard train-test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        
+        # Use simpler model for small datasets
+        if len(X_train) < 20:
+            model = xgb.XGBClassifier(
+                n_estimators=50,  # Reduced for small datasets
+                max_depth=3,      # Reduced for small datasets
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+        else:
+            model = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42
+            )
+        
+        model.fit(X_train, y_train)
+        
+        # Get predictions and metrics
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        # Feature importance
+        feature_importance = []
+        for i, feature in enumerate(feature_cols):
+            feature_importance.append({
+                "feature": feature,
+                "importance": float(model.feature_importances_[i])
+            })
+        feature_importance.sort(key=lambda x: x["importance"], reverse=True)
+        
+        # Determine data quality
+        if accuracy > 0.8 and len(df_features) > 20:
+            data_quality = "excellent"
+        elif accuracy > 0.7:
+            data_quality = "good"
+        elif accuracy > 0.6:
+            data_quality = "fair"
+        else:
+            data_quality = "poor"
+        
+        return {
+            "performance_metrics": {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "test_samples": len(y_test),
+                "training_samples": len(X_train)
+            },
+            "feature_importance": feature_importance,
+            "data_info": {
+                "total_samples": len(df_features),
+                "training_samples": len(X_train),
+                "test_samples": len(y_test),
+                "features_used": feature_cols,
+                "class_distribution": {
+                    str(cls): int(count) for cls, count in zip(*np.unique(y, return_counts=True))
+                },
+                "data_quality": data_quality
+            },
+            "model_trained": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Performance metrics data error: {e}")
+        return {
+            "error": f"Performance analysis failed: {str(e)}",
+            "model_trained": False
+        }
+
 
 @app.get("/final_predict_output/{sensor_id}")
 def final_predict_output(
