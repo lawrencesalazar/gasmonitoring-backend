@@ -2449,7 +2449,7 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "timestamp": datetime.now().isoformat()
     }
     
-    @app.get("/final_predict_output/{sensor_id}")
+@app.get("/final_predict_output/{sensor_id}")
 def final_predict_output(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type (co2, methane, temperature, humidity, ammonia)"),
