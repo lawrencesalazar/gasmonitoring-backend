@@ -2435,52 +2435,6 @@ def create_enhanced_confusion_matrix_plot(conf_matrix, class_names, response_dat
     )
 
 
-def create_enhanced_prediction_features(df, sensor_col='value'):
-    """Create features specifically optimized for next-day prediction"""
-    if df is None or len(df) < 10:
-        return df
-    
-    df_enhanced = df.copy()
-    
-    # Time-based features
-    if 'timestamp' in df_enhanced.columns:
-        try:
-            df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
-            df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
-            df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
-            df_enhanced['is_weekend'] = df_enhanced['day_of_week'].isin([5, 6]).astype(int)
-            df_enhanced['day_of_month'] = df_enhanced['timestamp'].dt.day
-            df_enhanced['month'] = df_enhanced['timestamp'].dt.month
-        except:
-            pass
-    
-    # Enhanced lag features with different windows
-    for lag in [1, 2, 3, 5, 7]:
-        df_enhanced[f'lag_{lag}'] = df_enhanced[sensor_col].shift(lag)
-    
-    # Rolling statistics with multiple windows
-    for window in [3, 5, 7]:
-        df_enhanced[f'rolling_mean_{window}'] = df_enhanced[sensor_col].rolling(window=window).mean()
-        df_enhanced[f'rolling_std_{window}'] = df_enhanced[sensor_col].rolling(window=window).std()
-        df_enhanced[f'rolling_min_{window}'] = df_enhanced[sensor_col].rolling(window=window).min()
-        df_enhanced[f'rolling_max_{window}'] = df_enhanced[sensor_col].rolling(window=window).max()
-    
-    # Rate of change features
-    df_enhanced['momentum_1'] = df_enhanced[sensor_col].diff(1)
-    df_enhanced['momentum_3'] = df_enhanced[sensor_col].diff(3)
-    df_enhanced['acceleration'] = df_enhanced['momentum_1'].diff(1)
-    
-    # Volatility and trend features
-    df_enhanced['volatility_5'] = df_enhanced[sensor_col].rolling(window=5).std()
-    df_enhanced['trend_5'] = df_enhanced[sensor_col].rolling(window=5).apply(
-        lambda x: np.polyfit(range(len(x)), x, 1)[0], raw=True
-    )
-    
-    # Remove rows with NaN values
-    df_enhanced = df_enhanced.dropna()
-    
-    return df_enhanced
-
 # =============================================================================
 # TEST ENDPOINT
 # =============================================================================
@@ -2494,6 +2448,507 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+    
+    @app.get("/final_predict_output/{sensor_id}")
+def final_predict_output(
+    sensor_id: str,
+    sensor: str = Query(..., description="Sensor type (co2, methane, temperature, humidity, ammonia)"),
+    date_range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+    confidence_threshold: float = Query(0.7, description="Minimum confidence threshold for predictions"),
+    include_recommendations: bool = Query(True, description="Include safety recommendations")
+):
+    """
+    Generate final prediction output using performance metrics results
+    Provides next-day predictions with confidence scores and recommendations
+    """
+    try:
+        logger.info(f"Generating final prediction output for {sensor_id}, sensor: {sensor}")
+        
+        # First, get the performance metrics to understand model performance
+        performance_data = get_performance_metrics_data(sensor_id, sensor, date_range)
+        
+        if not performance_data or "error" in performance_data:
+            return standard_error_response(
+                "Cannot generate predictions: Performance metrics not available", 
+                400,
+                {"details": performance_data.get("error", "Performance analysis required first")}
+            )
+        
+        # Fetch current data for prediction
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
+        if df.empty or len(df) < 5:
+            return standard_error_response("Insufficient data for prediction", 400)
+        
+        # Generate predictions based on performance metrics
+        prediction_result = generate_final_prediction(
+            df, performance_data, sensor, confidence_threshold
+        )
+        
+        # Add recommendations if requested
+        if include_recommendations:
+            prediction_result["recommendations"] = generate_prediction_recommendations(
+                prediction_result, performance_data, sensor
+            )
+        
+        # Add performance context
+        prediction_result["performance_context"] = {
+            "model_accuracy": performance_data.get("performance_metrics", {}).get("accuracy", 0),
+            "data_quality": performance_data.get("data_info", {}).get("data_quality", "unknown"),
+            "training_samples": performance_data.get("data_info", {}).get("training_samples", 0),
+            "feature_importance": performance_data.get("feature_importance", [])[:3]  # Top 3 features
+        }
+        
+        prediction_result.update({
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "prediction_timestamp": datetime.now().isoformat(),
+            "status": "success"
+        })
+        
+        return prediction_result
+        
+    except Exception as e:
+        logger.error(f"Final prediction output error: {e}")
+        return standard_error_response(f"Prediction generation failed: {str(e)}", 500)
+
+
+def get_performance_metrics_data(sensor_id: str, sensor: str, date_range: str):
+    """
+    Get performance metrics data or compute if not available
+    """
+    try:
+        # You might want to cache or store performance results
+        # For now, we'll compute them on the fly
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
+        if df.empty:
+            return {"error": "No data available"}
+        
+        # Create binary labels for classification
+        df_binary = create_simple_binary_labels(df)
+        if df_binary.empty:
+            return {"error": "Cannot create classification labels"}
+        
+        # Create features
+        df_features = create_enhanced_features(df_binary, sensor_col='value')
+        if df_features.empty:
+            return {"error": "Feature engineering failed"}
+        
+        # Prepare features and target
+        feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
+        X = df_features[feature_cols].values
+        y = df_features['class_binary'].values
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Train model
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+        # Get predictions and metrics
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        # Feature importance
+        feature_importance = []
+        for i, feature in enumerate(feature_cols):
+            feature_importance.append({
+                "feature": feature,
+                "importance": float(model.feature_importances_[i])
+            })
+        feature_importance.sort(key=lambda x: x["importance"], reverse=True)
+        
+        return {
+            "performance_metrics": {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "test_samples": len(y_test),
+                "training_samples": len(X_train)
+            },
+            "feature_importance": feature_importance,
+            "data_info": {
+                "total_samples": len(df_features),
+                "training_samples": len(X_train),
+                "test_samples": len(y_test),
+                "features_used": feature_cols,
+                "class_distribution": {
+                    str(cls): int(count) for cls, count in zip(*np.unique(y, return_counts=True))
+                }
+            },
+            "model_trained": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Performance metrics data error: {e}")
+        return {"error": f"Performance analysis failed: {str(e)}"}
+
+
+def generate_final_prediction(df, performance_data, sensor, confidence_threshold):
+    """
+    Generate final prediction with confidence scores
+    """
+    try:
+        # Use the latest data point for prediction
+        df_enhanced = create_enhanced_prediction_features(df, sensor_col='value')
+        if df_enhanced.empty:
+            return {"error": "Cannot create prediction features"}
+        
+        # Get feature columns (excluding target columns)
+        feature_cols = [col for col in df_enhanced.columns if col not in ['class_binary', 'timestamp', 'value']]
+        
+        if len(feature_cols) == 0:
+            return {"error": "No features available for prediction"}
+        
+        # Train a new model for prediction (or use cached one in production)
+        df_binary = create_simple_binary_labels(df_enhanced)
+        if df_binary.empty:
+            return {"error": "Cannot create binary labels for prediction"}
+        
+        X = df_binary[feature_cols].values
+        y = df_binary['class_binary'].values
+        
+        # Use all data for final prediction model
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            use_label_encoder=False,
+            eval_metric="logloss",
+            random_state=42
+        )
+        model.fit(X, y)
+        
+        # Use the most recent data point for next-day prediction
+        latest_features = df_binary[feature_cols].iloc[-1:].values
+        prediction_proba = model.predict_proba(latest_features)[0]
+        prediction_class = model.predict(latest_features)[0]
+        
+        # Calculate confidence metrics
+        max_confidence = np.max(prediction_proba)
+        confidence_level = "high" if max_confidence > 0.8 else "medium" if max_confidence > 0.6 else "low"
+        
+        # Get current value for comparison
+        current_value = float(df_binary['value'].iloc[-1])
+        median_value = float(df_binary['value'].median())
+        
+        # Determine trend
+        trend = "increasing" if current_value > median_value else "decreasing" if current_value < median_value else "stable"
+        
+        # Generate prediction date (next day)
+        last_timestamp = df_binary['timestamp'].iloc[-1]
+        if isinstance(last_timestamp, pd.Timestamp):
+            prediction_date = (last_timestamp + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            prediction_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        prediction_result = {
+            "next_day_prediction": {
+                "date": prediction_date,
+                "predicted_class": "HIGH" if prediction_class == 1 else "LOW",
+                "predicted_class_numeric": int(prediction_class),
+                "confidence_scores": {
+                    "low_probability": float(prediction_proba[0]),
+                    "high_probability": float(prediction_proba[1])
+                },
+                "overall_confidence": float(max_confidence),
+                "confidence_level": confidence_level,
+                "meets_confidence_threshold": max_confidence >= confidence_threshold
+            },
+            "current_situation": {
+                "current_value": current_value,
+                "median_value": median_value,
+                "trend": trend,
+                "last_reading_date": last_timestamp.isoformat() if hasattr(last_timestamp, 'isoformat') else str(last_timestamp)
+            },
+            "prediction_quality": {
+                "confidence_threshold": confidence_threshold,
+                "actual_confidence": float(max_confidence),
+                "model_accuracy": performance_data.get("performance_metrics", {}).get("accuracy", 0),
+                "data_points_used": len(df_binary)
+            }
+        }
+        
+        # Add risk assessment
+        prediction_result["risk_assessment"] = generate_risk_assessment(
+            prediction_result, sensor, performance_data
+        )
+        
+        return prediction_result
+        
+    except Exception as e:
+        logger.error(f"Final prediction generation error: {e}")
+        return {"error": f"Prediction generation failed: {str(e)}"}
+
+
+def generate_prediction_recommendations(prediction_result, performance_data, sensor):
+    """
+    Generate actionable recommendations based on prediction
+    """
+    try:
+        recommendations = []
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        risk = prediction_result.get("risk_assessment", {})
+        
+        # Confidence-based recommendations
+        if not prediction["meets_confidence_threshold"]:
+            recommendations.append({
+                "type": "confidence_warning",
+                "priority": "medium",
+                "message": f"Prediction confidence ({prediction['overall_confidence']:.1%}) below threshold ({prediction_result['prediction_quality']['confidence_threshold']:.0%})",
+                "action": "Collect more data or adjust confidence threshold",
+                "icon": "⚠️"
+            })
+        
+        # Risk-based recommendations
+        risk_level = risk.get("level", "unknown")
+        if risk_level in ["high", "very_high"]:
+            recommendations.append({
+                "type": "safety_alert",
+                "priority": "high",
+                "message": f"{risk_level.replace('_', ' ').title()} risk predicted for tomorrow",
+                "action": risk.get("recommended_action", "Increase monitoring and take preventive measures"),
+                "icon": "🚨"
+            })
+        
+        # Trend-based recommendations
+        if current["trend"] == "increasing" and prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "trend_alert",
+                "priority": "medium",
+                "message": "Consistent upward trend detected",
+                "action": "Monitor closely for continuous increases",
+                "icon": "📈"
+            })
+        
+        # Model performance recommendations
+        model_accuracy = performance_data.get("performance_metrics", {}).get("accuracy", 0)
+        if model_accuracy < 0.7:
+            recommendations.append({
+                "type": "model_quality",
+                "priority": "low",
+                "message": f"Model accuracy is relatively low ({model_accuracy:.1%})",
+                "action": "Consider collecting more training data or feature engineering",
+                "icon": "🔧"
+            })
+        
+        # Sensor-specific recommendations
+        sensor_recommendations = generate_sensor_specific_recommendations(sensor, prediction, current)
+        recommendations.extend(sensor_recommendations)
+        
+        return recommendations
+        
+    except Exception as e:
+        logger.error(f"Recommendation generation error: {e}")
+        return [{
+            "type": "error",
+            "priority": "low",
+            "message": "Could not generate recommendations",
+            "action": "Check system logs",
+            "icon": "❌"
+        }]
+
+
+def generate_risk_assessment(prediction_result, sensor, performance_data):
+    """
+    Generate risk assessment based on prediction and sensor type
+    """
+    try:
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        
+        # Base risk on predicted class and confidence
+        base_risk = 0.5 if prediction["predicted_class"] == "HIGH" else 0.1
+        confidence_factor = prediction["overall_confidence"]
+        
+        # Adjust risk based on sensor type and values
+        sensor_risk_factors = {
+            "co2": {"high_threshold": 800, "critical_threshold": 1000},
+            "methane": {"high_threshold": 500, "critical_threshold": 1000},
+            "ammonia": {"high_threshold": 25, "critical_threshold": 50},
+            "temperature": {"high_threshold": 30, "critical_threshold": 35, "low_threshold": 15, "low_critical": 10},
+            "humidity": {"high_threshold": 60, "critical_threshold": 70, "low_threshold": 40, "low_critical": 30}
+        }
+        
+        sensor_config = sensor_risk_factors.get(sensor.lower(), {})
+        current_value = current["current_value"]
+        
+        # Calculate value-based risk
+        value_risk = 0
+        if "high_threshold" in sensor_config and current_value > sensor_config["high_threshold"]:
+            value_risk = 0.7
+        if "critical_threshold" in sensor_config and current_value > sensor_config["critical_threshold"]:
+            value_risk = 0.9
+        if "low_threshold" in sensor_config and current_value < sensor_config["low_threshold"]:
+            value_risk = 0.6
+        if "low_critical" in sensor_config and current_value < sensor_config["low_critical"]:
+            value_risk = 0.8
+        
+        # Combine risks
+        combined_risk = (base_risk * 0.4) + (value_risk * 0.4) + (confidence_factor * 0.2)
+        
+        # Determine risk level
+        if combined_risk >= 0.8:
+            risk_level = "very_high"
+            recommended_action = "Take immediate safety measures and evacuate if necessary"
+        elif combined_risk >= 0.6:
+            risk_level = "high"
+            recommended_action = "Increase monitoring frequency and implement safety protocols"
+        elif combined_risk >= 0.4:
+            risk_level = "medium"
+            recommended_action = "Maintain current monitoring levels"
+        else:
+            risk_level = "low"
+            recommended_action = "Normal operations"
+        
+        return {
+            "level": risk_level,
+            "score": float(combined_risk),
+            "factors": {
+                "prediction_based": float(base_risk),
+                "value_based": float(value_risk),
+                "confidence_based": float(confidence_factor)
+            },
+            "recommended_action": recommended_action,
+            "assessment_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Risk assessment error: {e}")
+        return {
+            "level": "unknown",
+            "score": 0.0,
+            "factors": {},
+            "recommended_action": "Unable to assess risk",
+            "error": str(e)
+        }
+
+
+def generate_sensor_specific_recommendations(sensor, prediction, current_situation):
+    """
+    Generate sensor-specific recommendations
+    """
+    recommendations = []
+    sensor = sensor.lower()
+    
+    if sensor == "co2":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "ventilation",
+                "priority": "high",
+                "message": "High CO2 levels predicted",
+                "action": "Improve ventilation and reduce occupancy",
+                "icon": "💨"
+            })
+    
+    elif sensor == "methane":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "safety_check",
+                "priority": "high",
+                "message": "Elevated methane levels predicted",
+                "action": "Check for gas leaks and ensure proper ventilation",
+                "icon": "🔍"
+            })
+    
+    elif sensor == "ammonia":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "health_safety",
+                "priority": "high",
+                "message": "High ammonia concentration predicted",
+                "action": "Use respiratory protection and increase air circulation",
+                "icon": "😷"
+            })
+    
+    elif sensor == "temperature":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
+            recommendations.append({
+                "type": "cooling",
+                "priority": "medium",
+                "message": "High temperature predicted",
+                "action": "Implement cooling measures and ensure hydration",
+                "icon": "❄️"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
+            recommendations.append({
+                "type": "heating",
+                "priority": "medium",
+                "message": "Low temperature predicted",
+                "action": "Provide heating and warm clothing",
+                "icon": "🔥"
+            })
+    
+    elif sensor == "humidity":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
+            recommendations.append({
+                "type": "moisture_control",
+                "priority": "medium",
+                "message": "High humidity predicted",
+                "action": "Use dehumidifiers and improve ventilation",
+                "icon": "💧"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
+            recommendations.append({
+                "type": "humidity_control",
+                "priority": "medium",
+                "message": "Low humidity predicted",
+                "action": "Use humidifiers to maintain comfort",
+                "icon": "🌫️"
+            })
+    
+    return recommendations
+
+
+def create_enhanced_prediction_features(df, sensor_col='value'):
+    """
+    Create enhanced features specifically for prediction
+    """
+    if df is None or len(df) < 5:
+        return pd.DataFrame()
+    
+    df_enhanced = df.copy()
+    
+    # Basic lag features
+    for lag in [1, 2, 3]:
+        df_enhanced[f'lag_{lag}'] = df_enhanced[sensor_col].shift(lag)
+    
+    # Rolling statistics
+    for window in [3, 5]:
+        df_enhanced[f'rolling_mean_{window}'] = df_enhanced[sensor_col].rolling(window=window).mean()
+        df_enhanced[f'rolling_std_{window}'] = df_enhanced[sensor_col].rolling(window=window).std()
+    
+    # Time-based features
+    if 'timestamp' in df_enhanced.columns:
+        try:
+            df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
+            df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
+            df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
+        except:
+            pass
+    
+    # Remove rows with NaN values
+    df_enhanced = df_enhanced.dropna()
+    
+    return df_enhanced
     
 # Run the application
 if __name__ == "__main__":
