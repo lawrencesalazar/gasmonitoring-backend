@@ -960,7 +960,8 @@ async def get_sensor_stats(sensor_id: str):
 # =============================================================================
 # DATA ENDPOINTS
 # =============================================================================
- @app.get("/explain/{sensor_id}")
+
+@app.get("/explain/{sensor_id}")
 def explain(
     sensor_id: str, 
     sensor: str = Query(...),
