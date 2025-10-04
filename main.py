@@ -32,8 +32,26 @@ import base64
 import logging
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
+   
+from io import BytesIO
 
+# Try to import optional dependencies
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    logger.warning("SHAP not available, falling back to feature importance")
 
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logger.warning("SciPy not available, some statistical tests will be skipped")
+   
+  
+  
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1495,6 +1513,9 @@ def plot_sensor_data(
         logger.error(f"Plot generation error: {e}")
         return error_image(f"Error generating plot: {str(e)}")
         
+#SHAP 
+#+++++++++
+
 @app.get("/shap_hourly_analysis/{sensor_id}")
 def shap_hourly_analysis(
     sensor_id: str,
@@ -1513,160 +1534,266 @@ def shap_hourly_analysis(
         # Data collection & preprocessing
         df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
         if df.empty:
-            return standard_error_response("No valid sensor data", 400)
+            return standard_error_response("No valid sensor data", 400, {
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "date_range": date_range
+            })
+        
+        if len(df) < 10:
+            return standard_error_response("Insufficient data for analysis", 400, {
+                "available_data_points": len(df),
+                "minimum_required": 10
+            })
         
         # Feature engineering for temporal analysis
         df_enhanced = df.copy()
-        df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
-        df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
-        df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
-        df_enhanced['is_weekend'] = df_enhanced['day_of_week'].isin([5, 6]).astype(int)
-        df_enhanced['day_of_month'] = df_enhanced['timestamp'].dt.day
-        df_enhanced['month'] = df_enhanced['timestamp'].dt.month
-        
-        # Rolling statistics
-        df_enhanced['rolling_mean_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).mean()
-        df_enhanced['rolling_std_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).std()
-        df_enhanced['prev_hour_value'] = df_enhanced['value'].shift(1)
+        try:
+            df_enhanced['timestamp'] = pd.to_datetime(df_enhanced['timestamp'])
+            df_enhanced['hour'] = df_enhanced['timestamp'].dt.hour
+            df_enhanced['day_of_week'] = df_enhanced['timestamp'].dt.dayofweek
+            df_enhanced['is_weekend'] = df_enhanced['day_of_week'].isin([5, 6]).astype(int)
+            df_enhanced['day_of_month'] = df_enhanced['timestamp'].dt.day
+            df_enhanced['month'] = df_enhanced['timestamp'].dt.month
+            
+            # Rolling statistics with error handling
+            df_enhanced['rolling_mean_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).mean()
+            df_enhanced['rolling_std_6h'] = df_enhanced['value'].rolling(window=6, min_periods=1).std()
+            df_enhanced['prev_hour_value'] = df_enhanced['value'].shift(1)
+        except Exception as feature_error:
+            logger.error(f"Feature engineering failed: {feature_error}")
+            return standard_error_response("Feature engineering failed", 400, {"error": str(feature_error)})
         
         # Remove rows with NaN values
         df_enhanced = df_enhanced.dropna()
         
         if df_enhanced.empty:
-            return standard_error_response("Insufficient data for analysis after feature engineering", 400)
+            return standard_error_response("Insufficient data for analysis after feature engineering", 400, {
+                "original_data_points": len(df),
+                "after_cleaning": len(df_enhanced)
+            })
         
         # Statistical significance of hourly patterns
         hourly_stats = []
-        hourly_groups = df_enhanced.groupby('hour')['value']
-        
-        for hour in range(24):
-            hour_data = hourly_groups.get_group(hour) if hour in hourly_groups.groups else []
-            if len(hour_data) > 1:
-                # Basic statistics
-                mean_val = np.mean(hour_data)
-                std_val = np.std(hour_data)
-                n = len(hour_data)
-                
-                # Confidence interval
-                from scipy import stats
-                t_critical = stats.t.ppf((1 + confidence_level) / 2, n-1)
-                margin_error = t_critical * (std_val / np.sqrt(n))
-                ci_lower = mean_val - margin_error
-                ci_upper = mean_val + margin_error
-                
-                # Compare with overall mean (t-test)
-                overall_mean = df_enhanced['value'].mean()
-                t_stat, p_value = stats.ttest_1samp(hour_data, overall_mean)
-                
-                # Effect size (Cohen's d)
-                cohen_d = (mean_val - overall_mean) / (df_enhanced['value'].std() + 1e-8)
-                
-                hourly_stats.append({
-                    'hour': hour,
-                    'mean': float(mean_val),
-                    'std': float(std_val),
-                    'sample_size': n,
-                    'confidence_interval': [float(ci_lower), float(ci_upper)],
-                    't_statistic': float(t_stat),
-                    'p_value': float(p_value),
-                    'cohen_d': float(cohen_d),
-                    'significant': p_value < 0.05,
-                    'effect_size': 'large' if abs(cohen_d) > 0.8 else 'medium' if abs(cohen_d) > 0.5 else 'small'
-                })
-            else:
-                hourly_stats.append({
-                    'hour': hour,
-                    'mean': None,
-                    'sample_size': len(hour_data),
-                    'significant': False,
-                    'error': 'Insufficient data'
-                })
+        try:
+            hourly_groups = df_enhanced.groupby('hour')['value']
+            
+            for hour in range(24):
+                hour_data = hourly_groups.get_group(hour) if hour in hourly_groups.groups else pd.Series(dtype=float)
+                if len(hour_data) > 1:
+                    # Basic statistics
+                    mean_val = np.mean(hour_data)
+                    std_val = np.std(hour_data)
+                    n = len(hour_data)
+                    
+                    # Confidence interval
+                    if SCIPY_AVAILABLE and n > 1:
+                        try:
+                            t_critical = stats.t.ppf((1 + confidence_level) / 2, n-1)
+                            margin_error = t_critical * (std_val / np.sqrt(n))
+                            ci_lower = mean_val - margin_error
+                            ci_upper = mean_val + margin_error
+                            
+                            # Compare with overall mean (t-test)
+                            overall_mean = df_enhanced['value'].mean()
+                            t_stat, p_value = stats.ttest_1samp(hour_data, overall_mean)
+                            
+                            # Effect size (Cohen's d)
+                            cohen_d = (mean_val - overall_mean) / (df_enhanced['value'].std() + 1e-8)
+                            
+                            hourly_stats.append({
+                                'hour': hour,
+                                'mean': float(mean_val),
+                                'std': float(std_val),
+                                'sample_size': n,
+                                'confidence_interval': [float(ci_lower), float(ci_upper)],
+                                't_statistic': float(t_stat),
+                                'p_value': float(p_value),
+                                'cohen_d': float(cohen_d),
+                                'significant': p_value < 0.05,
+                                'effect_size': 'large' if abs(cohen_d) > 0.8 else 'medium' if abs(cohen_d) > 0.5 else 'small'
+                            })
+                        except Exception as stats_error:
+                            logger.warning(f"Statistical analysis failed for hour {hour}: {stats_error}")
+                            hourly_stats.append({
+                                'hour': hour,
+                                'mean': float(mean_val),
+                                'std': float(std_val),
+                                'sample_size': n,
+                                'error': f"Statistical computation failed: {str(stats_error)}"
+                            })
+                    else:
+                        # Fallback without scipy
+                        hourly_stats.append({
+                            'hour': hour,
+                            'mean': float(mean_val),
+                            'std': float(std_val),
+                            'sample_size': n,
+                            'note': 'Basic statistics only (SciPy not available)'
+                        })
+                else:
+                    hourly_stats.append({
+                        'hour': hour,
+                        'mean': float(mean_val) if len(hour_data) == 1 else None,
+                        'sample_size': len(hour_data),
+                        'significant': False,
+                        'error': 'Insufficient data for statistical analysis'
+                    })
+        except Exception as hourly_error:
+            logger.error(f"Hourly analysis failed: {hourly_error}")
+            return standard_error_response("Hourly pattern analysis failed", 400, {"error": str(hourly_error)})
         
         # Anomaly detection in hourly behavior
         anomalies = []
         hourly_anomaly_analysis = []
         
-        # Z-score based anomaly detection per hour
-        for hour in range(24):
-            if hour in hourly_groups.groups:
-                hour_data = hourly_groups.get_group(hour)
-                if len(hour_data) > 5:
-                    z_scores = np.abs(stats.zscore(hour_data))
-                    hour_anomalies = hour_data[z_scores > anomaly_threshold]
-                    
-                    for idx, value in hour_anomalies.items():
-                        original_idx = df_enhanced.index[df_enhanced['hour'] == hour][list(hour_anomalies.index).index(idx)]
-                        timestamp = df_enhanced.loc[original_idx, 'timestamp']
+        try:
+            # Z-score based anomaly detection per hour
+            for hour in range(24):
+                if hour in df_enhanced['hour'].values:
+                    hour_data = df_enhanced[df_enhanced['hour'] == hour]['value']
+                    if len(hour_data) > 5:
+                        if SCIPY_AVAILABLE:
+                            z_scores = np.abs(stats.zscore(hour_data))
+                        else:
+                            # Manual z-score calculation
+                            mean_val = hour_data.mean()
+                            std_val = hour_data.std()
+                            if std_val > 0:
+                                z_scores = np.abs((hour_data - mean_val) / std_val)
+                            else:
+                                z_scores = np.zeros(len(hour_data))
                         
-                        anomalies.append({
+                        hour_anomalies = hour_data[z_scores > anomaly_threshold]
+                        
+                        for idx, value in hour_anomalies.items():
+                            original_row = df_enhanced.loc[idx]
+                            timestamp = original_row['timestamp']
+                            
+                            anomalies.append({
+                                'hour': hour,
+                                'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+                                'value': float(value),
+                                'z_score': float(z_scores[hour_data.index.get_loc(idx)]),
+                                'deviation': f"{(value - hour_data.mean()) / (hour_data.std() + 1e-8):.1f}σ"
+                            })
+                        
+                        hourly_anomaly_analysis.append({
                             'hour': hour,
-                            'timestamp': timestamp.isoformat(),
-                            'value': float(value),
-                            'z_score': float(z_scores[hour_anomalies.index.get_loc(idx)]),
-                            'deviation': f"{(value - hour_data.mean()) / hour_data.std():.1f}σ"
+                            'total_readings': len(hour_data),
+                            'anomalies_detected': len(hour_anomalies),
+                            'anomaly_rate': len(hour_anomalies) / len(hour_data) if len(hour_data) > 0 else 0,
+                            'mean_value': float(hour_data.mean()),
+                            'std_value': float(hour_data.std())
                         })
-                    
-                    hourly_anomaly_analysis.append({
-                        'hour': hour,
-                        'total_readings': len(hour_data),
-                        'anomalies_detected': len(hour_anomalies),
-                        'anomaly_rate': len(hour_anomalies) / len(hour_data),
-                        'mean_value': float(hour_data.mean()),
-                        'std_value': float(hour_data.std())
-                    })
+        except Exception as anomaly_error:
+            logger.error(f"Anomaly detection failed: {anomaly_error}")
+            # Continue without anomalies rather than failing completely
         
         # SHAP analysis for predictive insights
-        feature_columns = ['hour', 'day_of_week', 'is_weekend', 'rolling_mean_6h', 'rolling_std_6h', 'prev_hour_value']
-        X = df_enhanced[feature_columns]
-        y = df_enhanced['value']
-        
-        # Train model for SHAP analysis
-        model = xgb.XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42
-        )
-        model.fit(X, y)
-        
-        # Compute SHAP values
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
-        
-        # Feature importance from SHAP
         feature_importance = []
-        for i, feature in enumerate(feature_columns):
-            feature_importance.append({
-                'feature': feature,
-                'importance': float(np.mean(np.abs(shap_values[:, i]))),
-                'direction': 'positive' if np.mean(shap_values[:, i]) > 0 else 'negative'
-            })
-        
-        feature_importance.sort(key=lambda x: x['importance'], reverse=True)
-        
-        # Hourly impact from SHAP
         hourly_impact = []
-        for hour in range(24):
-            hour_mask = X['hour'] == hour
-            if hour_mask.sum() > 0:
-                hour_shap = shap_values[hour_mask, 0]
-                hourly_impact.append({
-                    'hour': hour,
-                    'mean_impact': float(np.mean(hour_shap)),
-                    'impact_std': float(np.std(hour_shap)),
-                    'impact_samples': int(hour_mask.sum())
-                })
+        model_performance = {}
+        
+        try:
+            feature_columns = ['hour', 'day_of_week', 'is_weekend', 'rolling_mean_6h', 'rolling_std_6h', 'prev_hour_value']
+            # Only use columns that exist and have data
+            feature_columns = [col for col in feature_columns if col in df_enhanced.columns]
+            
+            X = df_enhanced[feature_columns]
+            y = df_enhanced['value']
+            
+            if len(X) < 10:
+                raise ValueError(f"Insufficient data for modeling: {len(X)} samples")
+            
+            # Train model for SHAP analysis
+            model = xgb.XGBRegressor(
+                n_estimators=50,  # Reduced for stability
+                max_depth=4,
+                learning_rate=0.1,
+                random_state=42
+            )
+            model.fit(X, y)
+            
+            # Compute feature importance (fallback if SHAP not available)
+            if SHAP_AVAILABLE:
+                try:
+                    # Use a subset for SHAP to avoid memory issues
+                    sample_size = min(1000, len(X))
+                    X_sample = X.sample(n=sample_size, random_state=42) if len(X) > sample_size else X
+                    
+                    explainer = shap.TreeExplainer(model)
+                    shap_values = explainer.shap_values(X_sample)
+                    
+                    # Feature importance from SHAP
+                    for i, feature in enumerate(feature_columns):
+                        feature_importance.append({
+                            'feature': feature,
+                            'importance': float(np.mean(np.abs(shap_values[:, i]))),
+                            'direction': 'positive' if np.mean(shap_values[:, i]) > 0 else 'negative',
+                            'method': 'shap'
+                        })
+                    
+                    # Hourly impact from SHAP
+                    for hour in range(24):
+                        hour_mask = X_sample['hour'] == hour
+                        if hour_mask.sum() > 0:
+                            hour_shap = shap_values[hour_mask, feature_columns.index('hour')]
+                            hourly_impact.append({
+                                'hour': hour,
+                                'mean_impact': float(np.mean(hour_shap)),
+                                'impact_std': float(np.std(hour_shap)),
+                                'impact_samples': int(hour_mask.sum())
+                            })
+                            
+                except Exception as shap_error:
+                    logger.warning(f"SHAP analysis failed, using feature importance: {shap_error}")
+                    SHAP_AVAILABLE = False  # Fallback for this run
+            
+            # Fallback to built-in feature importance
+            if not SHAP_AVAILABLE or not feature_importance:
+                native_importance = model.feature_importances_
+                for i, feature in enumerate(feature_columns):
+                    feature_importance.append({
+                        'feature': feature,
+                        'importance': float(native_importance[i]),
+                        'direction': 'unknown',
+                        'method': 'native'
+                    })
+            
+            feature_importance.sort(key=lambda x: x['importance'], reverse=True)
+            
+            model_performance = {
+                "r_squared": float(model.score(X, y)),
+                "features_used": feature_columns,
+                "samples_analyzed": len(X),
+                "shap_available": SHAP_AVAILABLE
+            }
+            
+        except Exception as model_error:
+            logger.error(f"Model training failed: {model_error}")
+            model_performance = {
+                "error": f"Model training failed: {str(model_error)}",
+                "samples_available": len(df_enhanced)
+            }
         
         # Actionable recommendations
         recommendations = generate_shap_based_recommendations(
             hourly_stats, feature_importance, anomalies, sensor
         )
         
-        # Visual explanations
-        visualization_data = create_three_section_visualizations(
-            df_enhanced, hourly_stats, shap_values, X, feature_columns, 
-            anomalies, sensor, sensor_id, date_range
-        )
+        # Visual explanations (optional - can be disabled if causing issues)
+        visualization_data = {}
+        try:
+            visualization_data = create_three_section_visualizations(
+                df_enhanced, hourly_stats, 
+                shap_values if 'shap_values' in locals() and SHAP_AVAILABLE else None, 
+                X if 'X' in locals() else None, 
+                feature_columns, anomalies, sensor, sensor_id, date_range
+            )
+        except Exception as viz_error:
+            logger.warning(f"Visualization generation failed: {viz_error}")
+            visualization_data = {"error": "Visualization generation failed"}
         
         # Final response
         response = {
@@ -1674,29 +1801,30 @@ def shap_hourly_analysis(
             "sensor_type": sensor,
             "date_range": date_range,
             "analysis_timestamp": datetime.now().isoformat(),
+            "data_summary": {
+                "total_samples": len(df_enhanced),
+                "date_range_start": df_enhanced['timestamp'].min().isoformat() if not df_enhanced.empty else None,
+                "date_range_end": df_enhanced['timestamp'].max().isoformat() if not df_enhanced.empty else None
+            },
             
             "statistical_significance": {
                 "hourly_patterns": hourly_stats,
                 "confidence_level": confidence_level,
                 "significant_hours": [h for h in hourly_stats if h.get('significant', False)],
-                "overall_pattern_strength": len([h for h in hourly_stats if h.get('significant', False)]) / 24
+                "overall_pattern_strength": len([h for h in hourly_stats if h.get('significant', False)]) / 24 if hourly_stats else 0
             },
             
             "anomaly_detection": {
                 "anomalies_found": len(anomalies),
                 "anomaly_threshold": f"{anomaly_threshold}σ",
                 "hourly_anomaly_analysis": hourly_anomaly_analysis,
-                "anomaly_details": anomalies[:10]
+                "anomaly_details": anomalies[:10]  # Limit details to prevent large responses
             },
             
             "predictive_insights": {
                 "feature_importance": feature_importance,
                 "hourly_impact_analysis": hourly_impact,
-                "model_performance": {
-                    "r_squared": float(model.score(X, y)),
-                    "features_used": feature_columns,
-                    "samples_analyzed": len(X)
-                }
+                "model_performance": model_performance
             },
             
             "actionable_recommendations": recommendations,
@@ -1717,199 +1845,253 @@ def generate_shap_based_recommendations(hourly_stats, feature_importance, anomal
     """Generate actionable recommendations based on SHAP and statistical analysis"""
     recommendations = []
     
-    # Find peak hours with statistical significance
-    significant_hours = [h for h in hourly_stats if h.get('significant', False) and h.get('mean') is not None]
-    if significant_hours:
-        peak_hours = sorted(significant_hours, key=lambda x: x['mean'], reverse=True)[:3]
+    try:
+        # Find peak hours with statistical significance
+        significant_hours = [h for h in hourly_stats if h.get('significant', False) and h.get('mean') is not None]
+        if significant_hours:
+            peak_hours = sorted(significant_hours, key=lambda x: x['mean'], reverse=True)[:3]
+            
+            recommendations.append({
+                "type": "peak_hours",
+                "priority": "high",
+                "message": f"Statistically significant peaks detected at hours: {[h['hour'] for h in peak_hours]}",
+                "action": f"Increase monitoring and ventilation during hours {[h['hour'] for h in peak_hours]}",
+                "icon": "📈"
+            })
         
-        recommendations.append({
-            "type": "peak_hours",
-            "priority": "high",
-            "message": f"Statistically significant peaks detected at hours: {[h['hour'] for h in peak_hours]}",
-            "action": f"Increase monitoring and ventilation during hours {[h['hour'] for h in peak_hours]}"
-        })
-    
-    # Feature-based recommendations
-    top_features = feature_importance[:3]
-    if top_features:
-        feature_msg = ", ".join([f"{f['feature']} ({f['importance']:.3f})" for f in top_features])
-        recommendations.append({
-            "type": "key_drivers",
-            "priority": "medium",
-            "message": f"Primary factors affecting {sensor_type}: {feature_msg}",
-            "action": "Focus on controlling these key influencing factors"
-        })
-    
-    # Anomaly-based recommendations
-    if anomalies:
-        recommendations.append({
-            "type": "anomaly_alert",
-            "priority": "high" if len(anomalies) > 5 else "medium",
-            "message": f"Found {len(anomalies)} anomalous readings requiring investigation",
-            "action": "Review sensor calibration and investigate environmental conditions during anomaly periods"
-        })
-    
-    # Safety thresholds based on sensor type
-    safety_info = {
-        "co2": {"warning": 800, "danger": 1000},
-        "methane": {"warning": 500, "danger": 1000},
-        "ammonia": {"warning": 25, "danger": 50},
-        "temperature": {"warning_low": 15, "warning_high": 30, "danger_low": 10, "danger_high": 35},
-        "humidity": {"warning_low": 30, "warning_high": 60, "danger_low": 20, "danger_high": 70}
-    }
-    
-    if sensor_type in safety_info:
-        recommendations.append({
-            "type": "safety_benchmark",
-            "priority": "info",
-            "message": f"Current analysis relative to {sensor_type.upper()} safety thresholds",
-            "action": "Compare hourly patterns with established safety limits"
-        })
+        # Feature-based recommendations
+        if feature_importance:
+            top_features = feature_importance[:3]
+            feature_msg = ", ".join([f"{f['feature']} ({f['importance']:.3f})" for f in top_features])
+            recommendations.append({
+                "type": "key_drivers",
+                "priority": "medium",
+                "message": f"Primary factors affecting {sensor_type}: {feature_msg}",
+                "action": "Focus on controlling these key influencing factors",
+                "icon": "🎯"
+            })
+        
+        # Anomaly-based recommendations
+        if anomalies:
+            recommendations.append({
+                "type": "anomaly_alert",
+                "priority": "high" if len(anomalies) > 5 else "medium",
+                "message": f"Found {len(anomalies)} anomalous readings requiring investigation",
+                "action": "Review sensor calibration and investigate environmental conditions during anomaly periods",
+                "icon": "⚠️"
+            })
+        
+        # Safety thresholds based on sensor type
+        safety_info = {
+            "co2": {"warning": 800, "danger": 1000},
+            "methane": {"warning": 500, "danger": 1000},
+            "ammonia": {"warning": 25, "danger": 50},
+            "temperature": {"warning_low": 15, "warning_high": 30, "danger_low": 10, "danger_high": 35},
+            "humidity": {"warning_low": 30, "warning_high": 60, "danger_low": 20, "danger_high": 70}
+        }
+        
+        if sensor_type.lower() in safety_info:
+            recommendations.append({
+                "type": "safety_benchmark",
+                "priority": "info",
+                "message": f"Current analysis relative to {sensor_type.upper()} safety thresholds",
+                "action": "Compare hourly patterns with established safety limits",
+                "icon": "🛡️"
+            })
+        
+        # If no specific recommendations, provide general guidance
+        if not recommendations:
+            recommendations.append({
+                "type": "general_guidance",
+                "priority": "info",
+                "message": "Continue regular monitoring patterns",
+                "action": "Maintain current monitoring schedule and review data weekly",
+                "icon": "📊"
+            })
+            
+    except Exception as e:
+        logger.error(f"Recommendation generation failed: {e}")
+        recommendations = [{
+            "type": "error",
+            "priority": "low",
+            "message": "Could not generate specific recommendations",
+            "action": "Check system logs for analysis errors",
+            "icon": "❌"
+        }]
     
     return recommendations
 
 
 def create_three_section_visualizations(df, hourly_stats, shap_values, X, feature_columns, anomalies, sensor, sensor_id, date_range):
-    """Create three distinct visualization sections"""
-    import base64
-    from io import BytesIO
-    
+    """Create three distinct visualization sections with robust error handling"""
     visualizations = {}
     
-    # SECTION 1: SHAP Summary Plot
     try:
-        plt.figure(figsize=(12, 8))
-        plt.subplot(2, 2, 1)
-        shap.summary_plot(shap_values, X, feature_names=feature_columns, show=False)
-        plt.title(f"SHAP Feature Importance - {sensor.upper()}", fontsize=14, fontweight='bold')
+        import matplotlib
+        matplotlib.use('Agg')  # Use non-interactive backend
+        import matplotlib.pyplot as plt
         
-        plt.subplot(2, 2, 2)
-        # SHAP dependence plot for hour feature
-        hour_idx = feature_columns.index('hour')
-        shap.dependence_plot(hour_idx, shap_values, X, feature_names=feature_columns, show=False)
-        plt.title("SHAP Hourly Dependence", fontweight='bold')
+        # SECTION 1: SHAP Summary Plot (if available)
+        if SHAP_AVAILABLE and shap_values is not None and X is not None:
+            try:
+                plt.figure(figsize=(12, 8))
+                shap.summary_plot(shap_values, X, feature_names=feature_columns, show=False)
+                plt.title(f"SHAP Feature Importance - {sensor.upper()}", fontsize=14, fontweight='bold')
+                
+                buf1 = BytesIO()
+                plt.tight_layout()
+                plt.savefig(buf1, format='png', dpi=150, bbox_inches='tight')
+                plt.close()
+                buf1.seek(0)
+                visualizations['shap_analysis'] = base64.b64encode(buf1.read()).decode('utf-8')
+            except Exception as e:
+                logger.warning(f"SHAP visualization failed: {e}")
+                visualizations['shap_analysis'] = None
         
-        buf1 = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf1, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        buf1.seek(0)
-        visualizations['shap_analysis'] = base64.b64encode(buf1.read()).decode('utf-8')
+        # SECTION 2: Hourly Pattern Analysis
+        try:
+            plt.figure(figsize=(14, 10))
+            
+            # Subplot 1: Hourly means with confidence intervals
+            plt.subplot(2, 2, 1)
+            valid_stats = [h for h in hourly_stats if h.get('mean') is not None]
+            if valid_stats:
+                hours = [h['hour'] for h in valid_stats]
+                means = [h['mean'] for h in valid_stats]
+                
+                plt.plot(hours, means, 'b-', linewidth=2, label='Hourly Mean')
+                
+                # Add confidence intervals if available
+                if all('confidence_interval' in h for h in valid_stats):
+                    ci_lower = [h['confidence_interval'][0] for h in valid_stats]
+                    ci_upper = [h['confidence_interval'][1] for h in valid_stats]
+                    plt.fill_between(hours, ci_lower, ci_upper, alpha=0.2, label='95% CI')
+                
+                plt.xlabel('Hour of Day')
+                plt.ylabel(f'{sensor.upper()} Value')
+                plt.title('Hourly Patterns with Confidence Intervals', fontweight='bold')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+            
+            # Subplot 2: Statistical significance
+            plt.subplot(2, 2, 2)
+            p_values = [h.get('p_value') for h in hourly_stats if h.get('p_value') is not None]
+            if p_values:
+                plt.bar(range(len(p_values)), -np.log10(p_values))
+                plt.axhline(y=-np.log10(0.05), color='r', linestyle='--', label='p=0.05 threshold')
+                plt.xlabel('Hour of Day')
+                plt.ylabel('-log10(p-value)')
+                plt.title('Statistical Significance by Hour', fontweight='bold')
+                plt.legend()
+            
+            buf2 = BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf2, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            visualizations['hourly_patterns'] = base64.b64encode(buf2.read()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Hourly pattern visualization failed: {e}")
+            visualizations['hourly_patterns'] = None
+        
+        # SECTION 3: Anomaly Detection Visualization
+        try:
+            plt.figure(figsize=(12, 8))
+            
+            # Subplot 1: Anomalies over time
+            plt.subplot(2, 2, 1)
+            if not df.empty and 'timestamp' in df.columns and 'value' in df.columns:
+                plt.plot(df['timestamp'], df['value'], 'b-', alpha=0.7, label='Normal readings')
+                
+                if anomalies:
+                    try:
+                        anomaly_times = [pd.to_datetime(a['timestamp']) for a in anomalies]
+                        anomaly_values = [a['value'] for a in anomalies]
+                        plt.scatter(anomaly_times, anomaly_values, color='red', s=50, label='Anomalies', zorder=5)
+                    except Exception as time_error:
+                        logger.warning(f"Anomaly time processing failed: {time_error}")
+                
+                plt.xlabel('Time')
+                plt.ylabel(f'{sensor.upper()} Value')
+                plt.title('Anomaly Detection Timeline', fontweight='bold')
+                plt.legend()
+                plt.xticks(rotation=45)
+            
+            # Subplot 2: Hourly anomaly distribution
+            plt.subplot(2, 2, 2)
+            if anomalies:
+                anomaly_hours = [a['hour'] for a in anomalies]
+                plt.hist(anomaly_hours, bins=24, range=(0, 24), alpha=0.7, color='red')
+                plt.xlabel('Hour of Day')
+                plt.ylabel('Anomaly Count')
+                plt.title('Anomaly Distribution by Hour', fontweight='bold')
+            
+            buf3 = BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf3, format='png', dpi=150, bbox_inches='tight')
+            plt.close()
+            visualizations['anomaly_detection'] = base64.b64encode(buf3.read()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Anomaly visualization failed: {e}")
+            visualizations['anomaly_detection'] = None
+            
     except Exception as e:
-        logger.error(f"SHAP visualization failed: {e}")
-        visualizations['shap_analysis'] = None
-    
-    # SECTION 2: Hourly Pattern Analysis with Confidence Intervals
-    try:
-        plt.figure(figsize=(14, 10))
-        
-        # Subplot 1: Hourly means with confidence intervals
-        plt.subplot(2, 2, 1)
-        hours = [h['hour'] for h in hourly_stats if h.get('mean') is not None]
-        means = [h['mean'] for h in hourly_stats if h.get('mean') is not None]
-        ci_lower = [h['confidence_interval'][0] for h in hourly_stats if h.get('mean') is not None]
-        ci_upper = [h['confidence_interval'][1] for h in hourly_stats if h.get('mean') is not None]
-        
-        plt.plot(hours, means, 'b-', linewidth=2, label='Hourly Mean')
-        plt.fill_between(hours, ci_lower, ci_upper, alpha=0.2, label='95% CI')
-        plt.xlabel('Hour of Day')
-        plt.ylabel(f'{sensor.upper()} Value')
-        plt.title('Hourly Patterns with Confidence Intervals', fontweight='bold')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Subplot 2: Statistical significance
-        plt.subplot(2, 2, 2)
-        significant_hours = [h['hour'] for h in hourly_stats if h.get('significant', False)]
-        p_values = [h['p_value'] for h in hourly_stats if h.get('p_value') is not None]
-        
-        plt.bar(range(len(p_values)), -np.log10(p_values))
-        plt.axhline(y=-np.log10(0.05), color='r', linestyle='--', label='p=0.05 threshold')
-        plt.xlabel('Hour of Day')
-        plt.ylabel('-log10(p-value)')
-        plt.title('Statistical Significance by Hour', fontweight='bold')
-        plt.legend()
-        
-        buf2 = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf2, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        visualizations['hourly_patterns'] = base64.b64encode(buf2.read()).decode('utf-8')
-    except Exception as e:
-        logger.error(f"Hourly pattern visualization failed: {e}")
-        visualizations['hourly_patterns'] = None
-    
-    # SECTION 3: Anomaly Detection Visualization
-    try:
-        plt.figure(figsize=(12, 8))
-        
-        # Subplot 1: Anomalies over time
-        plt.subplot(2, 2, 1)
-        plt.plot(df['timestamp'], df['value'], 'b-', alpha=0.7, label='Normal readings')
-        
-        if anomalies:
-            anomaly_times = [pd.to_datetime(a['timestamp']) for a in anomalies]
-            anomaly_values = [a['value'] for a in anomalies]
-            plt.scatter(anomaly_times, anomaly_values, color='red', s=50, label='Anomalies')
-        
-        plt.xlabel('Time')
-        plt.ylabel(f'{sensor.upper()} Value')
-        plt.title('Anomaly Detection Timeline', fontweight='bold')
-        plt.legend()
-        plt.xticks(rotation=45)
-        
-        # Subplot 2: Hourly anomaly distribution
-        plt.subplot(2, 2, 2)
-        if anomalies:
-            anomaly_hours = [a['hour'] for a in anomalies]
-            plt.hist(anomaly_hours, bins=24, range=(0, 24), alpha=0.7, color='red')
-            plt.xlabel('Hour of Day')
-            plt.ylabel('Anomaly Count')
-            plt.title('Anomaly Distribution by Hour', fontweight='bold')
-        
-        buf3 = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf3, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        visualizations['anomaly_detection'] = base64.b64encode(buf3.read()).decode('utf-8')
-    except Exception as e:
-        logger.error(f"Anomaly visualization failed: {e}")
-        visualizations['anomaly_detection'] = None
+        logger.error(f"Visualization setup failed: {e}")
+        visualizations = {"error": f"Visualization generation failed: {str(e)}"}
     
     return visualizations
-    
+
+
 @app.get("/debug/hourly-data/{sensor_id}")
 def debug_hourly_data(
     sensor_id: str,
     sensor: str = Query(...),
-    range: str = Query("1month")
+    date_range: str = Query("1month")
 ):
     """Debug endpoint to check hourly data availability"""
-    df = fetch_and_preprocess_data(sensor_id, sensor, range)
-    
-    response = {
-        "sensor_id": sensor_id,
-        "sensor_type": sensor,
-        "range": range,
-        "data_availability": {
-            "after_preprocessing": len(df),
-            "preview": df.head(3).to_dict('records') if not df.empty else []
-        }
-    }
-    
-    if not df.empty:
-        response["data_availability"]["date_range_original"] = {
-            "start": df['timestamp'].min().isoformat(),
-            "end": df['timestamp'].max().isoformat()
+    try:
+        df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
+        
+        response = {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "data_availability": {
+                "total_records": len(df),
+                "after_preprocessing": len(df),
+                "preview": df.head(3).to_dict('records') if not df.empty else []
+            }
         }
         
         if not df.empty:
-            df["hour"] = df["timestamp"].dt.hour
-            hourly_stats = df.groupby("hour").size().reset_index(name='count')
-            response["hourly_distribution"] = hourly_stats.to_dict('records')
-    
-    return response
+            try:
+                df_debug = df.copy()
+                df_debug['timestamp'] = pd.to_datetime(df_debug['timestamp'])
+                response["data_availability"]["date_range_original"] = {
+                    "start": df_debug['timestamp'].min().isoformat(),
+                    "end": df_debug['timestamp'].max().isoformat()
+                }
+                
+                df_debug["hour"] = df_debug["timestamp"].dt.hour
+                hourly_stats = df_debug.groupby("hour").size().reset_index(name='count')
+                response["hourly_distribution"] = hourly_stats.to_dict('records')
+                
+                # Basic statistics
+                response["basic_stats"] = {
+                    "mean": float(df_debug['value'].mean()),
+                    "std": float(df_debug['value'].std()),
+                    "min": float(df_debug['value'].min()),
+                    "max": float(df_debug['value'].max())
+                }
+            except Exception as processing_error:
+                response["processing_error"] = str(processing_error)
         
+        return response
+        
+    except Exception as e:
+        logger.error(f"Debug endpoint failed: {e}")
+        return standard_error_response(f"Debug failed: {str(e)}", 500)
+# END SHAP HOURLY
+# =++++++++++++++       
 @app.get("/dataframe/{sensor_id}")
 def get_dataframe(
     sensor_id: str, 
@@ -2853,7 +3035,12 @@ def generate_prediction_recommendations(prediction_result, performance_data, sen
         recommendations = []
         prediction = prediction_result["next_day_prediction"]
         current = prediction_result["current_situation"]
-        risk = prediction_result.get("risk_assessment", {})
+        
+        # Generate risk assessment first if not present
+        risk = prediction_result.get("risk_assessment")
+        if risk is None:
+            risk = generate_risk_assessment(prediction_result, sensor, performance_data)
+            prediction_result["risk_assessment"] = risk
         
         # Confidence-based recommendations
         if not prediction["meets_confidence_threshold"]:
@@ -2888,7 +3075,7 @@ def generate_prediction_recommendations(prediction_result, performance_data, sen
         
         # Model performance recommendations
         model_accuracy = performance_data.get("performance_metrics", {}).get("accuracy", 0)
-        if model_accuracy < 0.7:
+        if model_accuracy < 0.7 and model_accuracy > 0:  # Only if we have a valid accuracy
             recommendations.append({
                 "type": "model_quality",
                 "priority": "low",
@@ -2993,86 +3180,104 @@ def generate_sensor_specific_recommendations(sensor, prediction, current_situati
     """
     Generate sensor-specific recommendations
     """
-    recommendations = []
-    sensor = sensor.lower()
-    
-    if sensor == "co2":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "ventilation",
-                "priority": "high",
-                "message": "High CO2 levels predicted",
-                "action": "Improve ventilation and reduce occupancy",
-                "icon": "💨"
-            })
-    
-    elif sensor == "methane":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "safety_check",
-                "priority": "high",
-                "message": "Elevated methane levels predicted",
-                "action": "Check for gas leaks and ensure proper ventilation",
-                "icon": "🔍"
-            })
-    
-    elif sensor == "ammonia":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "health_safety",
-                "priority": "high",
-                "message": "High ammonia concentration predicted",
-                "action": "Use respiratory protection and increase air circulation",
-                "icon": "😷"
-            })
-    
-    elif sensor == "temperature":
-        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
-            recommendations.append({
-                "type": "cooling",
-                "priority": "medium",
-                "message": "High temperature predicted",
-                "action": "Implement cooling measures and ensure hydration",
-                "icon": "❄️"
-            })
-        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
-            recommendations.append({
-                "type": "heating",
-                "priority": "medium",
-                "message": "Low temperature predicted",
-                "action": "Provide heating and warm clothing",
-                "icon": "🔥"
-            })
-    
-    elif sensor == "humidity":
-        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
-            recommendations.append({
-                "type": "moisture_control",
-                "priority": "medium",
-                "message": "High humidity predicted",
-                "action": "Use dehumidifiers and improve ventilation",
-                "icon": "💧"
-            })
-        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
-            recommendations.append({
-                "type": "humidity_control",
-                "priority": "medium",
-                "message": "Low humidity predicted",
-                "action": "Use humidifiers to maintain comfort",
-                "icon": "🌫️"
-            })
-    
-    return recommendations
-    
+    try:
+        recommendations = []
+        sensor = sensor.lower()
+        
+        if sensor == "co2":
+            if prediction["predicted_class"] == "HIGH":
+                recommendations.append({
+                    "type": "ventilation",
+                    "priority": "high",
+                    "message": "High CO2 levels predicted",
+                    "action": "Improve ventilation and reduce occupancy",
+                    "icon": "💨"
+                })
+        
+        elif sensor == "methane":
+            if prediction["predicted_class"] == "HIGH":
+                recommendations.append({
+                    "type": "safety_check",
+                    "priority": "high",
+                    "message": "Elevated methane levels predicted",
+                    "action": "Check for gas leaks and ensure proper ventilation",
+                    "icon": "🔍"
+                })
+        
+        elif sensor == "ammonia":
+            if prediction["predicted_class"] == "HIGH":
+                recommendations.append({
+                    "type": "health_safety",
+                    "priority": "high",
+                    "message": "High ammonia concentration predicted",
+                    "action": "Use respiratory protection and increase air circulation",
+                    "icon": "😷"
+                })
+        
+        elif sensor == "temperature":
+            if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
+                recommendations.append({
+                    "type": "cooling",
+                    "priority": "medium",
+                    "message": "High temperature predicted",
+                    "action": "Implement cooling measures and ensure hydration",
+                    "icon": "❄️"
+                })
+            elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
+                recommendations.append({
+                    "type": "heating",
+                    "priority": "medium",
+                    "message": "Low temperature predicted",
+                    "action": "Provide heating and warm clothing",
+                    "icon": "🔥"
+                })
+        
+        elif sensor == "humidity":
+            if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
+                recommendations.append({
+                    "type": "moisture_control",
+                    "priority": "medium",
+                    "message": "High humidity predicted",
+                    "action": "Use dehumidifiers and improve ventilation",
+                    "icon": "💧"
+                })
+            elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
+                recommendations.append({
+                    "type": "humidity_control",
+                    "priority": "medium",
+                    "message": "Low humidity predicted",
+                    "action": "Use humidifiers to maintain comfort",
+                    "icon": "🌫️"
+                })
+        
+        return recommendations
+        
+    except Exception as e:
+        logger.error(f"Sensor-specific recommendations error: {e}")
+        return []
+
+
+def safe_isoformat(timestamp):
+    """Safely convert timestamp to ISO format"""
+    try:
+        if hasattr(timestamp, 'isoformat'):
+            return timestamp.isoformat()
+        elif isinstance(timestamp, str):
+            return timestamp
+        else:
+            return str(timestamp)
+    except:
+        return str(timestamp)
+
 
 @app.get("/final_predict_output/{sensor_id}")
 def final_predict_output(
     sensor_id: str,
     sensor: str = Query(..., description="Sensor type (co2, methane, temperature, humidity, ammonia)"),
-    date_range: str = Query("all", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),  # Changed default to "all"
+    date_range: str = Query("all", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
     confidence_threshold: float = Query(0.7, description="Minimum confidence threshold for predictions"),
     include_recommendations: bool = Query(True, description="Include safety recommendations"),
-    min_data_points: int = Query(5, description="Minimum data points required")  # Added minimum data points
+    min_data_points: int = Query(5, description="Minimum data points required")
 ):
     """
     Generate final prediction output using performance metrics results
@@ -3130,11 +3335,33 @@ def final_predict_output(
                 {"available_data_points": len(df)}
             )
         
+        # Generate risk assessment for all predictions
+        try:
+            risk_assessment = generate_risk_assessment(prediction_result, sensor, performance_data)
+            prediction_result["risk_assessment"] = risk_assessment
+        except Exception as risk_error:
+            logger.warning(f"Risk assessment failed: {risk_error}")
+            prediction_result["risk_assessment"] = {
+                "level": "unknown",
+                "score": 0.0,
+                "error": str(risk_error)
+            }
+        
         # Add recommendations if requested
         if include_recommendations:
-            prediction_result["recommendations"] = generate_prediction_recommendations(
-                prediction_result, performance_data, sensor
-            )
+            try:
+                prediction_result["recommendations"] = generate_prediction_recommendations(
+                    prediction_result, performance_data, sensor
+                )
+            except Exception as rec_error:
+                logger.warning(f"Recommendations generation failed: {rec_error}")
+                prediction_result["recommendations"] = [{
+                    "type": "error",
+                    "priority": "low",
+                    "message": "Could not generate recommendations",
+                    "action": "System error",
+                    "icon": "❌"
+                }]
         
         # Add performance context if available
         if performance_data.get("model_trained"):
@@ -3142,7 +3369,7 @@ def final_predict_output(
                 "model_accuracy": performance_data.get("performance_metrics", {}).get("accuracy", 0),
                 "data_quality": performance_data.get("data_info", {}).get("data_quality", "unknown"),
                 "training_samples": performance_data.get("data_info", {}).get("training_samples", 0),
-                "feature_importance": performance_data.get("feature_importance", [])[:3]  # Top 3 features
+                "feature_importance": performance_data.get("feature_importance", [])[:3] if performance_data.get("feature_importance") else []
             }
         else:
             prediction_result["performance_context"] = {
@@ -3152,6 +3379,16 @@ def final_predict_output(
                 "note": "Using basic prediction model due to limited data"
             }
         
+        # Safely format timestamps
+        date_range_start = None
+        date_range_end = None
+        if not df.empty and 'timestamp' in df.columns:
+            try:
+                date_range_start = safe_isoformat(df['timestamp'].min())
+                date_range_end = safe_isoformat(df['timestamp'].max())
+            except Exception as time_error:
+                logger.warning(f"Timestamp formatting error: {time_error}")
+        
         prediction_result.update({
             "sensor_id": sensor_id,
             "sensor_type": sensor,
@@ -3159,8 +3396,8 @@ def final_predict_output(
             "prediction_timestamp": datetime.now().isoformat(),
             "data_summary": {
                 "total_data_points": len(df),
-                "date_range_start": df['timestamp'].min().isoformat() if not df.empty else None,
-                "date_range_end": df['timestamp'].max().isoformat() if not df.empty else None
+                "date_range_start": date_range_start,
+                "date_range_end": date_range_end
             },
             "status": "success"
         })
@@ -3168,381 +3405,68 @@ def final_predict_output(
         return prediction_result
         
     except Exception as e:
-        logger.error(f"Final prediction output error: {e}")
+        logger.error(f"Final prediction output error: {str(e)}", exc_info=True)
         return standard_error_response(f"Prediction generation failed: {str(e)}", 500)
 
 
-def get_performance_metrics_data(sensor_id: str, sensor: str, date_range: str, df: pd.DataFrame = None):
-    """
-    Get performance metrics data or compute if not available
-    Now accepts pre-fetched dataframe to avoid duplicate fetching
-    """
+# Add missing helper function stubs (you'll need to implement these based on your existing code)
+def create_simple_binary_labels(df):
+    """Create binary labels based on median value"""
     try:
-        # Use provided dataframe or fetch new one
-        if df is None:
-            df = fetch_and_preprocess_data(sensor_id, sensor, date_range)
+        if df.empty:
+            return pd.DataFrame()
         
-        if df.empty or len(df) < 10:  # Reduced minimum for performance metrics
-            return {
-                "error": f"Insufficient data for performance metrics ({len(df)} points available, 10 required)",
-                "available_data": len(df),
-                "model_trained": False
-            }
-        
-        # Create binary labels for classification
-        df_binary = create_simple_binary_labels(df)
-        if df_binary.empty or len(df_binary) < 8:  # Reduced minimum
-            return {
-                "error": "Cannot create reliable classification labels",
-                "available_data": len(df),
-                "model_trained": False
-            }
-        
-        # Create features with simpler approach for small datasets
-        if len(df_binary) < 15:
-            # Use simpler features for small datasets
-            df_features = df_binary.copy()
-            df_features['lag_1'] = df_features['value'].shift(1)
-            df_features['lag_2'] = df_features['value'].shift(2)
-            df_features['rolling_mean_3'] = df_features['value'].rolling(window=3, min_periods=1).mean()
-        else:
-            # Use enhanced features for larger datasets
-            df_features = create_enhanced_features(df_binary, sensor_col='value')
-        
-        if df_features.empty:
-            return {
-                "error": "Feature engineering failed",
-                "available_data": len(df),
-                "model_trained": False
-            }
-        
-        # Remove rows with NaN values
-        df_features = df_features.dropna()
-        
-        if len(df_features) < 5:
-            return {
-                "error": "Not enough data after feature engineering",
-                "available_data": len(df),
-                "model_trained": False
-            }
-        
-        # Prepare features and target
-        feature_cols = [col for col in df_features.columns if col not in ['class_binary', 'timestamp', 'value']]
-        if len(feature_cols) == 0:
-            return {
-                "error": "No features available for model training",
-                "available_data": len(df),
-                "model_trained": False
-            }
-        
-        X = df_features[feature_cols].values
-        y = df_features['class_binary'].values
-        
-        # For very small datasets, use different split strategy
-        if len(X) < 10:
-            # Use all data for training, no test split
-            X_train, y_train = X, y
-            X_test, y_test = X, y
-        else:
-            # Standard train-test split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
-        
-        # Use simpler model for small datasets
-        if len(X_train) < 20:
-            model = xgb.XGBClassifier(
-                n_estimators=50,  # Reduced for small datasets
-                max_depth=3,      # Reduced for small datasets
-                learning_rate=0.1,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-        else:
-            model = xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-        
-        model.fit(X_train, y_train)
-        
-        # Get predictions and metrics
-        y_pred = model.predict(X_test)
-        y_pred_proba = model.predict_proba(X_test)
-        
-        # Calculate metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-        
-        # Feature importance
-        feature_importance = []
-        for i, feature in enumerate(feature_cols):
-            feature_importance.append({
-                "feature": feature,
-                "importance": float(model.feature_importances_[i])
-            })
-        feature_importance.sort(key=lambda x: x["importance"], reverse=True)
-        
-        # Determine data quality
-        if accuracy > 0.8 and len(df_features) > 20:
-            data_quality = "excellent"
-        elif accuracy > 0.7:
-            data_quality = "good"
-        elif accuracy > 0.6:
-            data_quality = "fair"
-        else:
-            data_quality = "poor"
-        
-        return {
-            "performance_metrics": {
-                "accuracy": accuracy,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1,
-                "test_samples": len(y_test),
-                "training_samples": len(X_train)
-            },
-            "feature_importance": feature_importance,
-            "data_info": {
-                "total_samples": len(df_features),
-                "training_samples": len(X_train),
-                "test_samples": len(y_test),
-                "features_used": feature_cols,
-                "class_distribution": {
-                    str(cls): int(count) for cls, count in zip(*np.unique(y, return_counts=True))
-                },
-                "data_quality": data_quality
-            },
-            "model_trained": True
-        }
-        
+        df_copy = df.copy()
+        median_val = df_copy['value'].median()
+        df_copy['class_binary'] = (df_copy['value'] > median_val).astype(int)
+        return df_copy
     except Exception as e:
-        logger.error(f"Performance metrics data error: {e}")
-        return {
-            "error": f"Performance analysis failed: {str(e)}",
-            "model_trained": False
-        }
+        logger.error(f"Binary labels creation error: {e}")
+        return pd.DataFrame()
 
 
-def generate_final_prediction(df, performance_data, sensor, confidence_threshold):
-    """
-    Generate final prediction with confidence scores
-    Enhanced to work with minimal data
-    """
+def create_enhanced_features(df, sensor_col='value'):
+    """Create enhanced features for prediction"""
     try:
-        # Use simpler features for prediction if we have limited data
-        if len(df) < 10:
-            df_enhanced = df.copy()
-            # Basic features only
-            df_enhanced['lag_1'] = df_enhanced['value'].shift(1)
-            df_enhanced['lag_2'] = df_enhanced['value'].shift(2)
-        else:
-            df_enhanced = create_enhanced_prediction_features(df, sensor_col='value')
+        if df.empty:
+            return pd.DataFrame()
         
-        if df_enhanced.empty:
-            return {"error": "Cannot create prediction features from available data"}
+        df_copy = df.copy()
         
-        # Remove rows with NaN values
-        df_enhanced = df_enhanced.dropna()
+        # Basic lag features
+        df_copy['lag_1'] = df_copy[sensor_col].shift(1)
+        df_copy['lag_2'] = df_copy[sensor_col].shift(2)
+        df_copy['lag_3'] = df_copy[sensor_col].shift(3)
         
-        if df_enhanced.empty:
-            return {"error": "No valid data points after feature processing"}
+        # Rolling statistics
+        df_copy['rolling_mean_3'] = df_copy[sensor_col].rolling(window=3, min_periods=1).mean()
+        df_copy['rolling_std_3'] = df_copy[sensor_col].rolling(window=3, min_periods=1).std()
+        df_copy['rolling_mean_7'] = df_copy[sensor_col].rolling(window=7, min_periods=1).mean()
         
-        # Get feature columns
-        feature_cols = [col for col in df_enhanced.columns if col not in ['class_binary', 'timestamp', 'value']]
+        # Trend features
+        df_copy['momentum'] = df_copy[sensor_col] - df_copy[sensor_col].shift(3)
         
-        if len(feature_cols) == 0:
-            return {"error": "No features available for prediction"}
-        
-        # Create binary labels
-        df_binary = create_simple_binary_labels(df_enhanced)
-        if df_binary.empty:
-            # If we can't create binary labels, use simple trend-based prediction
-            return generate_simple_prediction(df_enhanced, sensor, confidence_threshold)
-        
-        X = df_binary[feature_cols].values
-        y = df_binary['class_binary'].values
-        
-        # Use simpler model for small datasets
-        if len(X) < 15:
-            model = xgb.XGBClassifier(
-                n_estimators=30,
-                max_depth=3,
-                learning_rate=0.1,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-        else:
-            model = xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=42
-            )
-        
-        model.fit(X, y)
-        
-        # Use the most recent data point for next-day prediction
-        latest_features = df_binary[feature_cols].iloc[-1:].values
-        prediction_proba = model.predict_proba(latest_features)[0]
-        prediction_class = model.predict(latest_features)[0]
-        
-        return format_prediction_result(
-            df_binary, prediction_class, prediction_proba, confidence_threshold, sensor
-        )
-        
+        return df_copy
     except Exception as e:
-        logger.error(f"Final prediction generation error: {e}")
-        # Fallback to simple prediction
-        try:
-            return generate_simple_prediction(df, sensor, confidence_threshold)
-        except Exception as fallback_error:
-            return {"error": f"Both advanced and simple prediction failed: {str(fallback_error)}"}
+        logger.error(f"Enhanced features creation error: {e}")
+        return pd.DataFrame()
 
 
-def generate_simple_prediction(df, sensor, confidence_threshold):
-    """
-    Generate simple prediction based on trends and statistics
-    Used as fallback when ML model fails
-    """
-    try:
-        if df.empty or len(df) < 3:
-            return {"error": "Insufficient data for even simple prediction"}
-        
-        current_value = float(df['value'].iloc[-1])
-        median_value = float(df['value'].median())
-        
-        # Simple trend analysis
-        if len(df) >= 3:
-            recent_trend = current_value - float(df['value'].iloc[-2])
-            if abs(recent_trend) < (median_value * 0.05):  # Less than 5% change
-                trend = "stable"
-                predicted_class = 1 if current_value > median_value else 0
-                confidence = 0.6  # Moderate confidence for stable trends
-            elif recent_trend > 0:
-                trend = "increasing"
-                predicted_class = 1  # Predict HIGH
-                confidence = 0.7  # Higher confidence for clear trends
-            else:
-                trend = "decreasing" 
-                predicted_class = 0  # Predict LOW
-                confidence = 0.7
-        else:
-            trend = "unknown"
-            predicted_class = 1 if current_value > median_value else 0
-            confidence = 0.5  # Low confidence for very little data
-        
-        # Adjust confidence based on data quantity
-        if len(df) < 5:
-            confidence *= 0.7  # Reduce confidence for very small datasets
-        
-        # Generate prediction date
-        last_timestamp = df['timestamp'].iloc[-1]
-        if isinstance(last_timestamp, pd.Timestamp):
-            prediction_date = (last_timestamp + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        else:
-            prediction_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        return {
-            "next_day_prediction": {
-                "date": prediction_date,
-                "predicted_class": "HIGH" if predicted_class == 1 else "LOW",
-                "predicted_class_numeric": int(predicted_class),
-                "confidence_scores": {
-                    "low_probability": 1.0 - confidence if predicted_class == 1 else confidence,
-                    "high_probability": confidence if predicted_class == 1 else 1.0 - confidence
-                },
-                "overall_confidence": float(confidence),
-                "confidence_level": "high" if confidence > 0.8 else "medium" if confidence > 0.6 else "low",
-                "meets_confidence_threshold": confidence >= confidence_threshold,
-                "prediction_method": "simple_trend_analysis"
-            },
-            "current_situation": {
-                "current_value": current_value,
-                "median_value": median_value,
-                "trend": trend,
-                "last_reading_date": last_timestamp.isoformat() if hasattr(last_timestamp, 'isoformat') else str(last_timestamp)
-            },
-            "prediction_quality": {
-                "confidence_threshold": confidence_threshold,
-                "actual_confidence": float(confidence),
-                "model_accuracy": 0,  # Simple model has no accuracy metric
-                "data_points_used": len(df),
-                "note": "Using simple trend analysis due to limited data"
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Simple prediction generation error: {e}")
-        return {"error": f"Simple prediction failed: {str(e)}"}
+def create_enhanced_prediction_features(df, sensor_col='value'):
+    """Create features specifically for prediction"""
+    return create_enhanced_features(df, sensor_col)
 
 
-def format_prediction_result(df_binary, prediction_class, prediction_proba, confidence_threshold, sensor):
-    """
-    Format the prediction result consistently
-    """
-    current_value = float(df_binary['value'].iloc[-1])
-    median_value = float(df_binary['value'].median())
-    
-    # Determine trend
-    if len(df_binary) >= 2:
-        recent_change = current_value - float(df_binary['value'].iloc[-2])
-        if abs(recent_change) < (median_value * 0.02):  # Less than 2% change
-            trend = "stable"
-        elif recent_change > 0:
-            trend = "increasing"
-        else:
-            trend = "decreasing"
-    else:
-        trend = "unknown"
-    
-    max_confidence = np.max(prediction_proba)
-    confidence_level = "high" if max_confidence > 0.8 else "medium" if max_confidence > 0.6 else "low"
-    
-    # Generate prediction date
-    last_timestamp = df_binary['timestamp'].iloc[-1]
-    if isinstance(last_timestamp, pd.Timestamp):
-        prediction_date = (last_timestamp + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        prediction_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    return {
-        "next_day_prediction": {
-            "date": prediction_date,
-            "predicted_class": "HIGH" if prediction_class == 1 else "LOW",
-            "predicted_class_numeric": int(prediction_class),
-            "confidence_scores": {
-                "low_probability": float(prediction_proba[0]),
-                "high_probability": float(prediction_proba[1])
-            },
-            "overall_confidence": float(max_confidence),
-            "confidence_level": confidence_level,
-            "meets_confidence_threshold": max_confidence >= confidence_threshold,
-            "prediction_method": "xgboost_ml_model"
-        },
-        "current_situation": {
-            "current_value": current_value,
-            "median_value": median_value,
-            "trend": trend,
-            "last_reading_date": last_timestamp.isoformat() if hasattr(last_timestamp, 'isoformat') else str(last_timestamp)
-        },
-        "prediction_quality": {
-            "confidence_threshold": confidence_threshold,
-            "actual_confidence": float(max_confidence),
-            "model_accuracy": 0.8,  # This would come from performance metrics
-            "data_points_used": len(df_binary)
-        }
+def standard_error_response(message: str, status_code: int, details: dict = None):
+    """Standard error response format"""
+    error_response = {
+        "error": message,
+        "status_code": status_code,
+        "timestamp": datetime.now().isoformat()
     }
+    if details:
+        error_response.update(details)
+    return error_response
     
 #===========
 # Run the application
