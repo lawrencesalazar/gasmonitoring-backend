@@ -2974,6 +2974,227 @@ def format_prediction_result(df_binary, prediction_class, prediction_proba, conf
             "data_points_used": len(df_binary)
         }
     }
+    
+#===========
+def generate_prediction_recommendations(prediction_result, performance_data, sensor):
+    """
+    Generate actionable recommendations based on prediction
+    """
+    try:
+        recommendations = []
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        risk = prediction_result.get("risk_assessment", {})
+        
+        # Confidence-based recommendations
+        if not prediction["meets_confidence_threshold"]:
+            recommendations.append({
+                "type": "confidence_warning",
+                "priority": "medium",
+                "message": f"Prediction confidence ({prediction['overall_confidence']:.1%}) below threshold ({prediction_result['prediction_quality']['confidence_threshold']:.0%})",
+                "action": "Collect more data or adjust confidence threshold",
+                "icon": "⚠️"
+            })
+        
+        # Risk-based recommendations
+        risk_level = risk.get("level", "unknown")
+        if risk_level in ["high", "very_high"]:
+            recommendations.append({
+                "type": "safety_alert",
+                "priority": "high",
+                "message": f"{risk_level.replace('_', ' ').title()} risk predicted for tomorrow",
+                "action": risk.get("recommended_action", "Increase monitoring and take preventive measures"),
+                "icon": "🚨"
+            })
+        
+        # Trend-based recommendations
+        if current["trend"] == "increasing" and prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "trend_alert",
+                "priority": "medium",
+                "message": "Consistent upward trend detected",
+                "action": "Monitor closely for continuous increases",
+                "icon": "📈"
+            })
+        
+        # Model performance recommendations
+        model_accuracy = performance_data.get("performance_metrics", {}).get("accuracy", 0)
+        if model_accuracy < 0.7:
+            recommendations.append({
+                "type": "model_quality",
+                "priority": "low",
+                "message": f"Model accuracy is relatively low ({model_accuracy:.1%})",
+                "action": "Consider collecting more training data or feature engineering",
+                "icon": "🔧"
+            })
+        
+        # Sensor-specific recommendations
+        sensor_recommendations = generate_sensor_specific_recommendations(sensor, prediction, current)
+        recommendations.extend(sensor_recommendations)
+        
+        return recommendations
+        
+    except Exception as e:
+        logger.error(f"Recommendation generation error: {e}")
+        return [{
+            "type": "error",
+            "priority": "low",
+            "message": "Could not generate recommendations",
+            "action": "Check system logs",
+            "icon": "❌"
+        }]
+
+
+def generate_risk_assessment(prediction_result, sensor, performance_data):
+    """
+    Generate risk assessment based on prediction and sensor type
+    """
+    try:
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        
+        # Base risk on predicted class and confidence
+        base_risk = 0.5 if prediction["predicted_class"] == "HIGH" else 0.1
+        confidence_factor = prediction["overall_confidence"]
+        
+        # Adjust risk based on sensor type and values
+        sensor_risk_factors = {
+            "co2": {"high_threshold": 800, "critical_threshold": 1000},
+            "methane": {"high_threshold": 500, "critical_threshold": 1000},
+            "ammonia": {"high_threshold": 25, "critical_threshold": 50},
+            "temperature": {"high_threshold": 30, "critical_threshold": 35, "low_threshold": 15, "low_critical": 10},
+            "humidity": {"high_threshold": 60, "critical_threshold": 70, "low_threshold": 40, "low_critical": 30}
+        }
+        
+        sensor_config = sensor_risk_factors.get(sensor.lower(), {})
+        current_value = current["current_value"]
+        
+        # Calculate value-based risk
+        value_risk = 0
+        if "high_threshold" in sensor_config and current_value > sensor_config["high_threshold"]:
+            value_risk = 0.7
+        if "critical_threshold" in sensor_config and current_value > sensor_config["critical_threshold"]:
+            value_risk = 0.9
+        if "low_threshold" in sensor_config and current_value < sensor_config["low_threshold"]:
+            value_risk = 0.6
+        if "low_critical" in sensor_config and current_value < sensor_config["low_critical"]:
+            value_risk = 0.8
+        
+        # Combine risks
+        combined_risk = (base_risk * 0.4) + (value_risk * 0.4) + (confidence_factor * 0.2)
+        
+        # Determine risk level
+        if combined_risk >= 0.8:
+            risk_level = "very_high"
+            recommended_action = "Take immediate safety measures and evacuate if necessary"
+        elif combined_risk >= 0.6:
+            risk_level = "high"
+            recommended_action = "Increase monitoring frequency and implement safety protocols"
+        elif combined_risk >= 0.4:
+            risk_level = "medium"
+            recommended_action = "Maintain current monitoring levels"
+        else:
+            risk_level = "low"
+            recommended_action = "Normal operations"
+        
+        return {
+            "level": risk_level,
+            "score": float(combined_risk),
+            "factors": {
+                "prediction_based": float(base_risk),
+                "value_based": float(value_risk),
+                "confidence_based": float(confidence_factor)
+            },
+            "recommended_action": recommended_action,
+            "assessment_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Risk assessment error: {e}")
+        return {
+            "level": "unknown",
+            "score": 0.0,
+            "factors": {},
+            "recommended_action": "Unable to assess risk",
+            "error": str(e)
+        }
+
+
+def generate_sensor_specific_recommendations(sensor, prediction, current_situation):
+    """
+    Generate sensor-specific recommendations
+    """
+    recommendations = []
+    sensor = sensor.lower()
+    
+    if sensor == "co2":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "ventilation",
+                "priority": "high",
+                "message": "High CO2 levels predicted",
+                "action": "Improve ventilation and reduce occupancy",
+                "icon": "💨"
+            })
+    
+    elif sensor == "methane":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "safety_check",
+                "priority": "high",
+                "message": "Elevated methane levels predicted",
+                "action": "Check for gas leaks and ensure proper ventilation",
+                "icon": "🔍"
+            })
+    
+    elif sensor == "ammonia":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "health_safety",
+                "priority": "high",
+                "message": "High ammonia concentration predicted",
+                "action": "Use respiratory protection and increase air circulation",
+                "icon": "😷"
+            })
+    
+    elif sensor == "temperature":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
+            recommendations.append({
+                "type": "cooling",
+                "priority": "medium",
+                "message": "High temperature predicted",
+                "action": "Implement cooling measures and ensure hydration",
+                "icon": "❄️"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
+            recommendations.append({
+                "type": "heating",
+                "priority": "medium",
+                "message": "Low temperature predicted",
+                "action": "Provide heating and warm clothing",
+                "icon": "🔥"
+            })
+    
+    elif sensor == "humidity":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
+            recommendations.append({
+                "type": "moisture_control",
+                "priority": "medium",
+                "message": "High humidity predicted",
+                "action": "Use dehumidifiers and improve ventilation",
+                "icon": "💧"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
+            recommendations.append({
+                "type": "humidity_control",
+                "priority": "medium",
+                "message": "Low humidity predicted",
+                "action": "Use humidifiers to maintain comfort",
+                "icon": "🌫️"
+            })
+    
+    return recommendations
+    
 # Run the application
 if __name__ == "__main__":
     import uvicorn
