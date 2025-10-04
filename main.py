@@ -960,63 +960,193 @@ async def get_sensor_stats(sensor_id: str):
 # =============================================================================
 # DATA ENDPOINTS
 # =============================================================================
-
-@app.get("/explain/{sensor_id}")
+ @app.get("/explain/{sensor_id}")
 def explain(
     sensor_id: str, 
     sensor: str = Query(...),
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+    range: str = Query("all", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),  # Changed default to "all"
+    analysis_type: str = Query("hourly", description="Analysis type: hourly, daily, simple, auto"),  # Added analysis type
+    min_samples: int = Query(5, description="Minimum samples required for analysis")  # Added configurable minimum
 ):
-    """SHAP explanation with date range filtering and memory optimization"""
+    """Enhanced SHAP explanation with multiple fallback strategies and better error handling"""
     try:
         log_memory_usage("Before SHAP explanation")
         
-        df = fetch_and_preprocess_data(sensor_id, sensor, range)
+        # Fetch and preprocess data
+        records = fetch_sensor_history(sensor_id)
+        if not records:
+            return standard_error_response(
+                "No historical data found for sensor", 
+                404,
+                {
+                    "sensor_id": sensor_id,
+                    "suggestion": "Check if sensor exists and has sent data"
+                }
+            )
         
-        if df.empty or len(df) < 10:
-            return standard_error_response("Not enough data for SHAP analysis", 400)
+        df = preprocess_dataframe(records, sensor)
+        if df.empty:
+            return standard_error_response(
+                f"No valid {sensor} data found after preprocessing", 
+                400,
+                {
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "raw_records_count": len(records),
+                    "suggestion": "Check data format and sensor type"
+                }
+            )
+        
+        df_filtered = filter_by_date_range(df, range)
+        
+        # Enhanced data availability check
+        if df_filtered.empty:
+            return standard_error_response(
+                f"No data available after applying {range} date filter", 
+                400,
+                {
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "date_range": range,
+                    "available_data_range": {
+                        "start": df['timestamp'].min().isoformat() if not df.empty else None,
+                        "end": df['timestamp'].max().isoformat() if not df.empty else None
+                    },
+                    "suggestion": f"Try a different date range like 'all' or check available data with /dataframe/{sensor_id}"
+                }
+            )
+        
+        if len(df_filtered) < min_samples:
+            return standard_error_response(
+                f"Insufficient data for SHAP analysis", 
+                400,
+                {
+                    "available_samples": len(df_filtered),
+                    "required_minimum": min_samples,
+                    "sensor_id": sensor_id,
+                    "sensor_type": sensor,
+                    "date_range": range,
+                    "suggestion": f"Reduce min_samples parameter or try a longer date range"
+                }
+            )
         
         # Limit data size for SHAP analysis
         max_shap_samples = 1000
-        if len(df) > max_shap_samples:
-            df = df.sample(max_shap_samples, random_state=42)
+        if len(df_filtered) > max_shap_samples:
+            df_filtered = df_filtered.sample(max_shap_samples, random_state=42)
             logger.info(f"Sampled {max_shap_samples} records for SHAP analysis")
         
+        # Enhanced feature engineering with multiple strategies
+        analysis_result = perform_shap_analysis(df_filtered, sensor, sensor_id, range, analysis_type)
+        
+        if "error" in analysis_result:
+            return standard_error_response(
+                analysis_result["error"],
+                400,
+                analysis_result.get("details", {})
+            )
+        
+        # Force garbage collection
+        del df, df_filtered, records
+        gc.collect()
+        
+        log_memory_usage("After SHAP explanation")
+        
+        return analysis_result
+        
+    except Exception as e:
+        logger.error(f"SHAP explanation error: {e}")
+        return standard_error_response(
+            f"SHAP analysis failed: {str(e)}", 
+            500,
+            {
+                "sensor_id": sensor_id,
+                "sensor_type": sensor,
+                "date_range": range
+            }
+        )
+
+
+def perform_shap_analysis(df, sensor, sensor_id, date_range, analysis_type="auto"):
+    """
+    Perform SHAP analysis with multiple fallback strategies
+    """
+    try:
+        # Auto-detect best analysis type if not specified
+        if analysis_type == "auto":
+            analysis_type = determine_best_analysis_type(df)
+        
+        logger.info(f"Performing {analysis_type} SHAP analysis for {sensor_id}")
+        
+        if analysis_type == "hourly":
+            return hourly_shap_analysis(df, sensor, sensor_id, date_range)
+        elif analysis_type == "daily":
+            return daily_shap_analysis(df, sensor, sensor_id, date_range)
+        elif analysis_type == "simple":
+            return simple_shap_analysis(df, sensor, sensor_id, date_range)
+        else:
+            return {"error": f"Unknown analysis type: {analysis_type}"}
+            
+    except Exception as e:
+        logger.error(f"SHAP analysis failed: {e}")
+        return {"error": f"Analysis failed: {str(e)}"}
+
+
+def determine_best_analysis_type(df):
+    """
+    Determine the best analysis type based on data characteristics
+    """
+    if len(df) < 10:
+        return "simple"
+    
+    # Check time span of data
+    time_span = df['timestamp'].max() - df['timestamp'].min()
+    days_span = time_span.days
+    
+    if days_span >= 7 and len(df) >= 24:  # At least a week with 24+ points
+        return "hourly"
+    elif days_span >= 3:  # At least 3 days
+        return "daily"
+    else:
+        return "simple"
+
+
+def hourly_shap_analysis(df, sensor, sensor_id, date_range):
+    """Hourly aggregation SHAP analysis"""
+    try:
         df["hour"] = df["timestamp"].dt.hour
-        agg = df.groupby("hour")["value"].mean().reset_index()
+        agg = df.groupby("hour")["value"].agg(['mean', 'count']).reset_index()
+        agg = agg[agg['count'] >= 1]  # Ensure we have at least 1 sample per hour
         
         if len(agg) < 3:
-            return standard_error_response("Insufficient hourly data after filtering", 400)
+            return {
+                "error": "Insufficient hourly data distribution",
+                "details": {
+                    "available_hours": len(agg),
+                    "required_minimum": 3,
+                    "suggestion": "Try daily or simple analysis type"
+                }
+            }
         
         X = agg[["hour"]]
-        y = agg["value"]
+        y = agg["mean"]
         
-        # Use smaller model for SHAP
-        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=50, random_state=42)
+        # Use appropriate model size
+        n_estimators = 30 if len(agg) < 10 else 50
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=n_estimators, random_state=42)
         model.fit(X, y)
         
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X)
         
-        buf = io.BytesIO()
-        plt.figure(figsize=(8, 5))
-        shap.summary_plot(shap_values, X, show=False)
-        plt.title(f"SHAP Summary - {sensor} (Sensor {sensor_id})\nDate Range: {range}")
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-        plt.close('all')
-        buf.seek(0)
-        
-        # Force garbage collection
-        del model, explainer, shap_values, df, agg
-        gc.collect()
-        
-        log_memory_usage("After SHAP explanation")
+        # Generate visualization
+        buf = generate_shap_plot(shap_values, X, sensor, sensor_id, date_range, "Hourly")
         
         return {
             "sensor_id": sensor_id,
             "sensor_type": sensor,
-            "date_range": range,
+            "date_range": date_range,
+            "analysis_type": "hourly",
             "shap_values": shap_values.tolist(),
             "features": X.to_dict(orient="records"),
             "feature_importance": {
@@ -1024,15 +1154,232 @@ def explain(
             },
             "summary_stats": {
                 "total_samples": len(df),
-                "shap_samples": len(agg),
-                "mean_shap_magnitude": float(np.mean(np.abs(shap_values)))
-            }
+                "analysis_samples": len(agg),
+                "mean_shap_magnitude": float(np.mean(np.abs(shap_values))),
+                "hours_analyzed": len(agg),
+                "data_distribution": f"{len(agg)}/24 hours covered"
+            },
+            "plot_image": base64.b64encode(buf.getvalue()).decode('utf-8') if buf else None
         }
         
     except Exception as e:
-        logger.error(f"SHAP explanation error: {e}")
-        return standard_error_response(f"SHAP analysis failed: {str(e)}", 500)
+        logger.error(f"Hourly SHAP analysis failed: {e}")
+        return {"error": f"Hourly analysis failed: {str(e)}"}
 
+
+def daily_shap_analysis(df, sensor, sensor_id, date_range):
+    """Daily aggregation SHAP analysis"""
+    try:
+        df["date"] = df["timestamp"].dt.date
+        df["days_since_start"] = (df["timestamp"] - df["timestamp"].min()).dt.days
+        
+        agg = df.groupby("days_since_start")["value"].mean().reset_index()
+        
+        if len(agg) < 3:
+            return {
+                "error": "Insufficient daily data distribution",
+                "details": {
+                    "available_days": len(agg),
+                    "required_minimum": 3
+                }
+            }
+        
+        X = agg[["days_since_start"]]
+        y = agg["value"]
+        
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=30, random_state=42)
+        model.fit(X, y)
+        
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        
+        # Generate visualization
+        buf = generate_shap_plot(shap_values, X, sensor, sensor_id, date_range, "Daily")
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "analysis_type": "daily",
+            "shap_values": shap_values.tolist(),
+            "features": X.to_dict(orient="records"),
+            "feature_importance": {
+                "days_since_start": float(np.abs(shap_values).mean(axis=0)[0])
+            },
+            "summary_stats": {
+                "total_samples": len(df),
+                "analysis_samples": len(agg),
+                "mean_shap_magnitude": float(np.mean(np.abs(shap_values))),
+                "days_analyzed": len(agg)
+            },
+            "plot_image": base64.b64encode(buf.getvalue()).decode('utf-8') if buf else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Daily SHAP analysis failed: {e}")
+        return {"error": f"Daily analysis failed: {str(e)}"}
+
+
+def simple_shap_analysis(df, sensor, sensor_id, date_range):
+    """Simple SHAP analysis for small datasets"""
+    try:
+        # Use time-based features for small datasets
+        df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+        df_sorted["time_index"] = df_sorted.index
+        
+        # Use all data for small datasets
+        X = df_sorted[["time_index"]]
+        y = df_sorted["value"]
+        
+        # Very simple model for small datasets
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror", 
+            n_estimators=20,  # Reduced for small datasets
+            max_depth=3,      # Reduced for small datasets
+            random_state=42
+        )
+        model.fit(X, y)
+        
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        
+        # Generate visualization
+        buf = generate_shap_plot(shap_values, X, sensor, sensor_id, date_range, "Simple")
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": date_range,
+            "analysis_type": "simple",
+            "shap_values": shap_values.tolist(),
+            "features": X.to_dict(orient="records"),
+            "feature_importance": {
+                "time_index": float(np.abs(shap_values).mean(axis=0)[0])
+            },
+            "summary_stats": {
+                "total_samples": len(df),
+                "analysis_samples": len(df_sorted),
+                "mean_shap_magnitude": float(np.mean(np.abs(shap_values))),
+                "note": "Using simple time-based analysis due to limited data"
+            },
+            "plot_image": base64.b64encode(buf.getvalue()).decode('utf-8') if buf else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Simple SHAP analysis failed: {e}")
+        return {"error": f"Simple analysis failed: {str(e)}"}
+
+
+def generate_shap_plot(shap_values, X, sensor, sensor_id, date_range, analysis_type):
+    """Generate SHAP plot visualization"""
+    try:
+        buf = io.BytesIO()
+        plt.figure(figsize=(10, 6))
+        
+        # Create SHAP summary plot
+        shap.summary_plot(shap_values, X, show=False, plot_size=None)
+        plt.title(f"SHAP Summary - {sensor.upper()} (Sensor {sensor_id})\n"
+                 f"Date Range: {date_range} | Analysis: {analysis_type}", 
+                 fontsize=12, pad=20)
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close('all')
+        buf.seek(0)
+        return buf
+        
+    except Exception as e:
+        logger.error(f"SHAP plot generation failed: {e}")
+        return None
+
+
+@app.get("/debug/explain/{sensor_id}")
+def debug_explain_data(
+    sensor_id: str, 
+    sensor: str = Query(...),
+    range: str = Query("all")
+):
+    """Debug endpoint to check data availability for SHAP analysis"""
+    try:
+        records = fetch_sensor_history(sensor_id)
+        df = preprocess_dataframe(records, sensor)
+        df_filtered = filter_by_date_range(df, range)
+        
+        # Analyze data characteristics
+        data_stats = {}
+        if not df_filtered.empty:
+            data_stats = {
+                "timestamp_range": {
+                    "start": df_filtered['timestamp'].min().isoformat(),
+                    "end": df_filtered['timestamp'].max().isoformat(),
+                    "days_span": (df_filtered['timestamp'].max() - df_filtered['timestamp'].min()).days
+                },
+                "value_stats": {
+                    "min": float(df_filtered['value'].min()),
+                    "max": float(df_filtered['value'].max()),
+                    "mean": float(df_filtered['value'].mean()),
+                    "std": float(df_filtered['value'].std())
+                },
+                "hourly_coverage": len(df_filtered.groupby(df_filtered['timestamp'].dt.hour)),
+                "daily_coverage": len(df_filtered.groupby(df_filtered['timestamp'].dt.date))
+            }
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor,
+            "date_range": range,
+            "data_availability": {
+                "raw_records": len(records),
+                "after_preprocessing": len(df),
+                "after_date_filter": len(df_filtered),
+                "suitable_for_analysis": len(df_filtered) >= 5
+            },
+            "data_characteristics": data_stats,
+            "suggested_analysis_type": determine_best_analysis_type(df_filtered) if not df_filtered.empty else "insufficient_data",
+            "recommendations": generate_data_recommendations(df_filtered, sensor_id, sensor, range)
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug explain error: {e}")
+        return {"error": f"Debug analysis failed: {str(e)}"}
+
+
+def generate_data_recommendations(df, sensor_id, sensor, date_range):
+    """Generate recommendations for improving SHAP analysis"""
+    recommendations = []
+    
+    if df.empty:
+        recommendations.append({
+            "priority": "high",
+            "message": "No data available",
+            "action": f"Check if sensor {sensor_id} is sending {sensor} data"
+        })
+        return recommendations
+    
+    if len(df) < 5:
+        recommendations.append({
+            "priority": "high",
+            "message": f"Only {len(df)} data points available",
+            "action": "Use 'all' date range or wait for more data collection"
+        })
+    
+    if len(df) < 10:
+        recommendations.append({
+            "priority": "medium",
+            "message": "Limited data for detailed analysis",
+            "action": "Use analysis_type='simple' for basic insights"
+        })
+    
+    # Check hourly coverage
+    hourly_groups = df.groupby(df['timestamp'].dt.hour)
+    if len(hourly_groups) < 12:  # Less than 12 hours covered
+        recommendations.append({
+            "priority": "low",
+            "message": f"Limited hourly coverage ({len(hourly_groups)}/24 hours)",
+            "action": "Collect data across more hours for better pattern analysis"
+        })
+    
+    return recommendations
+    
 @app.get("/plot/{sensor_id}")
 def plot_sensor_data(
     sensor_id: str, 
@@ -2495,7 +2842,228 @@ def test_endpoint(sensor_id: str, sensor: str = Query("temperature")):
         "sensor_type": sensor,
         "timestamp": datetime.now().isoformat()
     }
+# Final output prediction
+
+def generate_prediction_recommendations(prediction_result, performance_data, sensor):
+    """
+    Generate actionable recommendations based on prediction
+    """
+    try:
+        recommendations = []
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        risk = prediction_result.get("risk_assessment", {})
+        
+        # Confidence-based recommendations
+        if not prediction["meets_confidence_threshold"]:
+            recommendations.append({
+                "type": "confidence_warning",
+                "priority": "medium",
+                "message": f"Prediction confidence ({prediction['overall_confidence']:.1%}) below threshold ({prediction_result['prediction_quality']['confidence_threshold']:.0%})",
+                "action": "Collect more data or adjust confidence threshold",
+                "icon": "⚠️"
+            })
+        
+        # Risk-based recommendations
+        risk_level = risk.get("level", "unknown")
+        if risk_level in ["high", "very_high"]:
+            recommendations.append({
+                "type": "safety_alert",
+                "priority": "high",
+                "message": f"{risk_level.replace('_', ' ').title()} risk predicted for tomorrow",
+                "action": risk.get("recommended_action", "Increase monitoring and take preventive measures"),
+                "icon": "🚨"
+            })
+        
+        # Trend-based recommendations
+        if current["trend"] == "increasing" and prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "trend_alert",
+                "priority": "medium",
+                "message": "Consistent upward trend detected",
+                "action": "Monitor closely for continuous increases",
+                "icon": "📈"
+            })
+        
+        # Model performance recommendations
+        model_accuracy = performance_data.get("performance_metrics", {}).get("accuracy", 0)
+        if model_accuracy < 0.7:
+            recommendations.append({
+                "type": "model_quality",
+                "priority": "low",
+                "message": f"Model accuracy is relatively low ({model_accuracy:.1%})",
+                "action": "Consider collecting more training data or feature engineering",
+                "icon": "🔧"
+            })
+        
+        # Sensor-specific recommendations
+        sensor_recommendations = generate_sensor_specific_recommendations(sensor, prediction, current)
+        recommendations.extend(sensor_recommendations)
+        
+        return recommendations
+        
+    except Exception as e:
+        logger.error(f"Recommendation generation error: {e}")
+        return [{
+            "type": "error",
+            "priority": "low",
+            "message": "Could not generate recommendations",
+            "action": "Check system logs",
+            "icon": "❌"
+        }]
+
+
+def generate_risk_assessment(prediction_result, sensor, performance_data):
+    """
+    Generate risk assessment based on prediction and sensor type
+    """
+    try:
+        prediction = prediction_result["next_day_prediction"]
+        current = prediction_result["current_situation"]
+        
+        # Base risk on predicted class and confidence
+        base_risk = 0.5 if prediction["predicted_class"] == "HIGH" else 0.1
+        confidence_factor = prediction["overall_confidence"]
+        
+        # Adjust risk based on sensor type and values
+        sensor_risk_factors = {
+            "co2": {"high_threshold": 800, "critical_threshold": 1000},
+            "methane": {"high_threshold": 500, "critical_threshold": 1000},
+            "ammonia": {"high_threshold": 25, "critical_threshold": 50},
+            "temperature": {"high_threshold": 30, "critical_threshold": 35, "low_threshold": 15, "low_critical": 10},
+            "humidity": {"high_threshold": 60, "critical_threshold": 70, "low_threshold": 40, "low_critical": 30}
+        }
+        
+        sensor_config = sensor_risk_factors.get(sensor.lower(), {})
+        current_value = current["current_value"]
+        
+        # Calculate value-based risk
+        value_risk = 0
+        if "high_threshold" in sensor_config and current_value > sensor_config["high_threshold"]:
+            value_risk = 0.7
+        if "critical_threshold" in sensor_config and current_value > sensor_config["critical_threshold"]:
+            value_risk = 0.9
+        if "low_threshold" in sensor_config and current_value < sensor_config["low_threshold"]:
+            value_risk = 0.6
+        if "low_critical" in sensor_config and current_value < sensor_config["low_critical"]:
+            value_risk = 0.8
+        
+        # Combine risks
+        combined_risk = (base_risk * 0.4) + (value_risk * 0.4) + (confidence_factor * 0.2)
+        
+        # Determine risk level
+        if combined_risk >= 0.8:
+            risk_level = "very_high"
+            recommended_action = "Take immediate safety measures and evacuate if necessary"
+        elif combined_risk >= 0.6:
+            risk_level = "high"
+            recommended_action = "Increase monitoring frequency and implement safety protocols"
+        elif combined_risk >= 0.4:
+            risk_level = "medium"
+            recommended_action = "Maintain current monitoring levels"
+        else:
+            risk_level = "low"
+            recommended_action = "Normal operations"
+        
+        return {
+            "level": risk_level,
+            "score": float(combined_risk),
+            "factors": {
+                "prediction_based": float(base_risk),
+                "value_based": float(value_risk),
+                "confidence_based": float(confidence_factor)
+            },
+            "recommended_action": recommended_action,
+            "assessment_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Risk assessment error: {e}")
+        return {
+            "level": "unknown",
+            "score": 0.0,
+            "factors": {},
+            "recommended_action": "Unable to assess risk",
+            "error": str(e)
+        }
+
+
+def generate_sensor_specific_recommendations(sensor, prediction, current_situation):
+    """
+    Generate sensor-specific recommendations
+    """
+    recommendations = []
+    sensor = sensor.lower()
     
+    if sensor == "co2":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "ventilation",
+                "priority": "high",
+                "message": "High CO2 levels predicted",
+                "action": "Improve ventilation and reduce occupancy",
+                "icon": "💨"
+            })
+    
+    elif sensor == "methane":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "safety_check",
+                "priority": "high",
+                "message": "Elevated methane levels predicted",
+                "action": "Check for gas leaks and ensure proper ventilation",
+                "icon": "🔍"
+            })
+    
+    elif sensor == "ammonia":
+        if prediction["predicted_class"] == "HIGH":
+            recommendations.append({
+                "type": "health_safety",
+                "priority": "high",
+                "message": "High ammonia concentration predicted",
+                "action": "Use respiratory protection and increase air circulation",
+                "icon": "😷"
+            })
+    
+    elif sensor == "temperature":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
+            recommendations.append({
+                "type": "cooling",
+                "priority": "medium",
+                "message": "High temperature predicted",
+                "action": "Implement cooling measures and ensure hydration",
+                "icon": "❄️"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
+            recommendations.append({
+                "type": "heating",
+                "priority": "medium",
+                "message": "Low temperature predicted",
+                "action": "Provide heating and warm clothing",
+                "icon": "🔥"
+            })
+    
+    elif sensor == "humidity":
+        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
+            recommendations.append({
+                "type": "moisture_control",
+                "priority": "medium",
+                "message": "High humidity predicted",
+                "action": "Use dehumidifiers and improve ventilation",
+                "icon": "💧"
+            })
+        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
+            recommendations.append({
+                "type": "humidity_control",
+                "priority": "medium",
+                "message": "Low humidity predicted",
+                "action": "Use humidifiers to maintain comfort",
+                "icon": "🌫️"
+            })
+    
+    return recommendations
+    
+
 @app.get("/final_predict_output/{sensor_id}")
 def final_predict_output(
     sensor_id: str,
@@ -2976,225 +3544,6 @@ def format_prediction_result(df_binary, prediction_class, prediction_proba, conf
     }
     
 #===========
-def generate_prediction_recommendations(prediction_result, performance_data, sensor):
-    """
-    Generate actionable recommendations based on prediction
-    """
-    try:
-        recommendations = []
-        prediction = prediction_result["next_day_prediction"]
-        current = prediction_result["current_situation"]
-        risk = prediction_result.get("risk_assessment", {})
-        
-        # Confidence-based recommendations
-        if not prediction["meets_confidence_threshold"]:
-            recommendations.append({
-                "type": "confidence_warning",
-                "priority": "medium",
-                "message": f"Prediction confidence ({prediction['overall_confidence']:.1%}) below threshold ({prediction_result['prediction_quality']['confidence_threshold']:.0%})",
-                "action": "Collect more data or adjust confidence threshold",
-                "icon": "⚠️"
-            })
-        
-        # Risk-based recommendations
-        risk_level = risk.get("level", "unknown")
-        if risk_level in ["high", "very_high"]:
-            recommendations.append({
-                "type": "safety_alert",
-                "priority": "high",
-                "message": f"{risk_level.replace('_', ' ').title()} risk predicted for tomorrow",
-                "action": risk.get("recommended_action", "Increase monitoring and take preventive measures"),
-                "icon": "🚨"
-            })
-        
-        # Trend-based recommendations
-        if current["trend"] == "increasing" and prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "trend_alert",
-                "priority": "medium",
-                "message": "Consistent upward trend detected",
-                "action": "Monitor closely for continuous increases",
-                "icon": "📈"
-            })
-        
-        # Model performance recommendations
-        model_accuracy = performance_data.get("performance_metrics", {}).get("accuracy", 0)
-        if model_accuracy < 0.7:
-            recommendations.append({
-                "type": "model_quality",
-                "priority": "low",
-                "message": f"Model accuracy is relatively low ({model_accuracy:.1%})",
-                "action": "Consider collecting more training data or feature engineering",
-                "icon": "🔧"
-            })
-        
-        # Sensor-specific recommendations
-        sensor_recommendations = generate_sensor_specific_recommendations(sensor, prediction, current)
-        recommendations.extend(sensor_recommendations)
-        
-        return recommendations
-        
-    except Exception as e:
-        logger.error(f"Recommendation generation error: {e}")
-        return [{
-            "type": "error",
-            "priority": "low",
-            "message": "Could not generate recommendations",
-            "action": "Check system logs",
-            "icon": "❌"
-        }]
-
-
-def generate_risk_assessment(prediction_result, sensor, performance_data):
-    """
-    Generate risk assessment based on prediction and sensor type
-    """
-    try:
-        prediction = prediction_result["next_day_prediction"]
-        current = prediction_result["current_situation"]
-        
-        # Base risk on predicted class and confidence
-        base_risk = 0.5 if prediction["predicted_class"] == "HIGH" else 0.1
-        confidence_factor = prediction["overall_confidence"]
-        
-        # Adjust risk based on sensor type and values
-        sensor_risk_factors = {
-            "co2": {"high_threshold": 800, "critical_threshold": 1000},
-            "methane": {"high_threshold": 500, "critical_threshold": 1000},
-            "ammonia": {"high_threshold": 25, "critical_threshold": 50},
-            "temperature": {"high_threshold": 30, "critical_threshold": 35, "low_threshold": 15, "low_critical": 10},
-            "humidity": {"high_threshold": 60, "critical_threshold": 70, "low_threshold": 40, "low_critical": 30}
-        }
-        
-        sensor_config = sensor_risk_factors.get(sensor.lower(), {})
-        current_value = current["current_value"]
-        
-        # Calculate value-based risk
-        value_risk = 0
-        if "high_threshold" in sensor_config and current_value > sensor_config["high_threshold"]:
-            value_risk = 0.7
-        if "critical_threshold" in sensor_config and current_value > sensor_config["critical_threshold"]:
-            value_risk = 0.9
-        if "low_threshold" in sensor_config and current_value < sensor_config["low_threshold"]:
-            value_risk = 0.6
-        if "low_critical" in sensor_config and current_value < sensor_config["low_critical"]:
-            value_risk = 0.8
-        
-        # Combine risks
-        combined_risk = (base_risk * 0.4) + (value_risk * 0.4) + (confidence_factor * 0.2)
-        
-        # Determine risk level
-        if combined_risk >= 0.8:
-            risk_level = "very_high"
-            recommended_action = "Take immediate safety measures and evacuate if necessary"
-        elif combined_risk >= 0.6:
-            risk_level = "high"
-            recommended_action = "Increase monitoring frequency and implement safety protocols"
-        elif combined_risk >= 0.4:
-            risk_level = "medium"
-            recommended_action = "Maintain current monitoring levels"
-        else:
-            risk_level = "low"
-            recommended_action = "Normal operations"
-        
-        return {
-            "level": risk_level,
-            "score": float(combined_risk),
-            "factors": {
-                "prediction_based": float(base_risk),
-                "value_based": float(value_risk),
-                "confidence_based": float(confidence_factor)
-            },
-            "recommended_action": recommended_action,
-            "assessment_timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Risk assessment error: {e}")
-        return {
-            "level": "unknown",
-            "score": 0.0,
-            "factors": {},
-            "recommended_action": "Unable to assess risk",
-            "error": str(e)
-        }
-
-
-def generate_sensor_specific_recommendations(sensor, prediction, current_situation):
-    """
-    Generate sensor-specific recommendations
-    """
-    recommendations = []
-    sensor = sensor.lower()
-    
-    if sensor == "co2":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "ventilation",
-                "priority": "high",
-                "message": "High CO2 levels predicted",
-                "action": "Improve ventilation and reduce occupancy",
-                "icon": "💨"
-            })
-    
-    elif sensor == "methane":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "safety_check",
-                "priority": "high",
-                "message": "Elevated methane levels predicted",
-                "action": "Check for gas leaks and ensure proper ventilation",
-                "icon": "🔍"
-            })
-    
-    elif sensor == "ammonia":
-        if prediction["predicted_class"] == "HIGH":
-            recommendations.append({
-                "type": "health_safety",
-                "priority": "high",
-                "message": "High ammonia concentration predicted",
-                "action": "Use respiratory protection and increase air circulation",
-                "icon": "😷"
-            })
-    
-    elif sensor == "temperature":
-        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 30:
-            recommendations.append({
-                "type": "cooling",
-                "priority": "medium",
-                "message": "High temperature predicted",
-                "action": "Implement cooling measures and ensure hydration",
-                "icon": "❄️"
-            })
-        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 15:
-            recommendations.append({
-                "type": "heating",
-                "priority": "medium",
-                "message": "Low temperature predicted",
-                "action": "Provide heating and warm clothing",
-                "icon": "🔥"
-            })
-    
-    elif sensor == "humidity":
-        if prediction["predicted_class"] == "HIGH" and current_situation["current_value"] > 60:
-            recommendations.append({
-                "type": "moisture_control",
-                "priority": "medium",
-                "message": "High humidity predicted",
-                "action": "Use dehumidifiers and improve ventilation",
-                "icon": "💧"
-            })
-        elif prediction["predicted_class"] == "LOW" and current_situation["current_value"] < 40:
-            recommendations.append({
-                "type": "humidity_control",
-                "priority": "medium",
-                "message": "Low humidity predicted",
-                "action": "Use humidifiers to maintain comfort",
-                "icon": "🌫️"
-            })
-    
-    return recommendations
-    
 # Run the application
 if __name__ == "__main__":
     import uvicorn
