@@ -99,7 +99,7 @@ async def preflight_handler(request: Request, path: str):
 # Visualization Functions
 # ---------------------------------------------------
 def create_shap_plots(model, X, sensor_id: str):
-    """Create SHAP explanation plots"""
+    """Create SHAP explanation plots with compatible function calls"""
     if not SHAP_AVAILABLE:
         return {"error": "SHAP not available"}
     
@@ -134,24 +134,31 @@ def create_shap_plots(model, X, sensor_id: str):
         plots['bar_plot'] = base64.b64encode(buf.getvalue()).decode('utf-8')
         plt.close()
         
-        # 3. SHAP Waterfall Plot for first observation
+        # 3. SHAP Beeswarm Plot
         plt.figure(figsize=(12, 8))
-        shap.waterfall_plot(explainer.expected_value, shap_values[0], X.iloc[0], show=False)
+        shap.plots.beeswarm(shap.Explanation(values=shap_values, base_values=explainer.expected_value, data=X), show=False)
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
         buf.seek(0)
-        plots['waterfall_plot'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plots['beeswarm_plot'] = base64.b64encode(buf.getvalue()).decode('utf-8')
         plt.close()
         
-        # 4. SHAP Force Plot for first observation
-        plt.figure(figsize=(12, 4))
-        shap.force_plot(explainer.expected_value, shap_values[0], X.iloc[0], matplotlib=True, show=False)
+        # 4. Feature Importance Bar Plot
+        plt.figure(figsize=(12, 8))
+        feature_importance = pd.DataFrame({
+            'feature': X.columns,
+            'importance': np.abs(shap_values).mean(0)
+        }).sort_values('importance', ascending=True)
+        
+        plt.barh(feature_importance['feature'], feature_importance['importance'])
+        plt.xlabel('Mean |SHAP value|')
+        plt.title(f'Feature Importance - Sensor {sensor_id}')
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
         buf.seek(0)
-        plots['force_plot'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+        plots['feature_importance'] = base64.b64encode(buf.getvalue()).decode('utf-8')
         plt.close()
         
         return plots
@@ -326,7 +333,7 @@ def create_model_performance_plots(y_true, y_pred, sensor_id: str):
         return {"error": f"Performance plot creation failed: {str(e)}"}
 
 # ---------------------------------------------------
-# Simplified Firebase Setup for Realtime Database
+# Firebase Setup
 # ---------------------------------------------------
 def initialize_firebase():
     """Initialize Firebase Realtime Database"""
@@ -423,257 +430,159 @@ def save_prediction_to_firebase(sensor_id, prediction_data):
     except Exception as e:
         logger.error(f"Error saving prediction to Firebase: {e}")
 
-def prepare_data(df, sensor_id: str):
-    """Prepare data for training"""
-    if df is None or df.empty:
-        raise ValueError(f"No data available for sensor {sensor_id}")
-    
-    # Check if required columns exist
-    if 'riskIndex' not in df.columns:
-        raise ValueError(f"Required column 'riskIndex' not found in data for sensor {sensor_id}")
-    
-    # Handle timestamp
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    
-    # Drop columns that are not useful or non-numeric
-    columns_to_drop = ['riskIndex']
-    optional_columns_to_drop = ['time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID']
-    
-    for col in optional_columns_to_drop:
-        if col in df.columns:
-            columns_to_drop.append(col)
-    
-    X = df.drop(columns=columns_to_drop, errors='ignore')
-    y = df['riskIndex']
-    
-    # Fill NaN values
-    X = X.fillna(X.mean())
-    
-    logger.info(f"Prepared data for sensor {sensor_id}: X shape {X.shape}, y shape {y.shape}")
-    logger.info(f"Features used: {X.columns.tolist()}")
-    
-    return X, y
-
-def train_model_for_sensor(sensor_id: str, use_enhanced_gridsearch: bool = True):
-    """Train XGBoost model for a specific sensor"""
+# ---------------------------------------------------
+# Main XGBoost Prediction Endpoint
+# ---------------------------------------------------
+@app.get("/predict/xgboost/")
+def xgboost_regressor_predict(
+    sensor_id: str = Query(..., description="Sensor ID to train model for"),
+    test_size: float = Query(0.2, description="Test size ratio (0.1 to 0.4)", ge=0.1, le=0.4),
+    n_estimators: str = Query("100,300", description="n_estimators values (comma separated)"),
+    max_depth: str = Query("3,5,7", description="max_depth values (comma separated)"),
+    learning_rate: str = Query("0.01,0.1", description="learning_rate values (comma separated)"),
+    subsample: str = Query("0.8,1.0", description="subsample values (comma separated)"),
+    colsample_bytree: str = Query("0.8,1.0", description="colsample_bytree values (comma separated)"),
+    cv_folds: int = Query(3, description="Number of cross-validation folds", ge=2, le=10),
+    random_state: int = Query(42, description="Random state for reproducibility")
+):
+    """XGBoost Regressor with dynamic GridSearchCV parameters via GET request"""
     try:
-        # Load data
-        df = load_data_from_firebase(sensor_id)
-        if df is None or df.empty:
-            raise ValueError(f"No data available for sensor {sensor_id}")
+        # Parse parameter strings to lists
+        n_estimators_list = [int(x.strip()) for x in n_estimators.split(',')]
+        max_depth_list = [int(x.strip()) for x in max_depth.split(',')]
+        learning_rate_list = [float(x.strip()) for x in learning_rate.split(',')]
+        subsample_list = [float(x.strip()) for x in subsample.split(',')]
+        colsample_bytree_list = [float(x.strip()) for x in colsample_bytree.split(',')]
+        
+        # Load data from Firebase
+        ref = db.reference(f'/history/{sensor_id}')
+        data = ref.get()
+        
+        if not data:
+            raise HTTPException(status_code=404, detail=f"No data found for sensor {sensor_id}")
+        
+        # Convert to DataFrame
+        df = pd.DataFrame.from_dict(data, orient='index')
+        
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"Empty dataset for sensor {sensor_id}")
         
         # Prepare data
-        X, y = prepare_data(df, sensor_id)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce') 
+        
+        # Drop columns that are not useful or non-numeric for now
+        features = df.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+        target = df['riskIndex']
+        
+        # Check if we have enough data
+        if len(features) < 10:
+            raise HTTPException(status_code=400, detail=f"Insufficient data for sensor {sensor_id}. Need at least 10 samples.")
         
         # Split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            features, target, test_size=test_size, random_state=random_state
+        )
         
-        if use_enhanced_gridsearch:
-            # Enhanced training with comprehensive GridSearchCV
-            xgb_model = XGBRegressor(random_state=42)
-            
-            param_grid = {
-                'n_estimators': [100, 300],
-                'max_depth': [3, 5, 7],
-                'learning_rate': [0.01, 0.1],
-                'subsample': [0.8, 1.0],
-                'colsample_bytree': [0.8, 1.0]
-            }
-            
-            grid_search = GridSearchCV(
-                estimator=xgb_model, 
-                param_grid=param_grid,
-                scoring='neg_root_mean_squared_error',
-                cv=3, 
-                verbose=1, 
-                n_jobs=-1
-            )
-            
-            grid_search.fit(X_train, y_train)
-            best_model = grid_search.best_estimator_
-            
-            # Make predictions and calculate metrics
-            y_pred = best_model.predict(X_test)
-            
-            # Calculate metrics
-            test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-            test_mae = mean_absolute_error(y_test, y_pred)
-            test_r2 = r2_score(y_test, y_pred)
-            
-            # Create visualizations
-            shap_plots = create_shap_plots(best_model, X_train, sensor_id)
-            seaborn_plots = create_seaborn_plots(df, sensor_id)
-            performance_plots = create_model_performance_plots(y_test, y_pred, sensor_id)
-            
-            # Store metrics
-            training_metrics[sensor_id] = {
-                'best_params': grid_search.best_params_,
-                'cv_rmse': -grid_search.best_score_,
-                'test_rmse': test_rmse,
-                'test_mae': test_mae,
-                'test_r2': test_r2,
-                'training_date': datetime.now().isoformat(),
-                'sample_predictions': [
-                    {'true': float(true_val), 'predicted': float(pred_val)} 
-                    for true_val, pred_val in zip(y_test[:10], y_pred[:10])
-                ],
-                'visualizations_available': True
-            }
-            
-            logger.info(f"Enhanced model trained for sensor {sensor_id}")
-            logger.info(f"Best parameters: {grid_search.best_params_}")
-            logger.info(f"Best RMSE (CV): {-grid_search.best_score_:.6f}")
-            logger.info(f"Test RMSE: {test_rmse:.6f}")
-            logger.info(f"Test MAE: {test_mae:.6f}")
-            logger.info(f"Test R² Score: {test_r2:.4f}")
-            
-        else:
-            # Basic training with simple parameters
-            xgb_model = XGBRegressor(random_state=42)
-            param_grid = {
-                'n_estimators': [100],
-                'max_depth': [3],
-                'learning_rate': [0.1],
-                'subsample': [1.0],
-                'colsample_bytree': [1.0]
-            }
-            grid_search = GridSearchCV(xgb_model, param_grid, scoring='neg_root_mean_squared_error', cv=3, n_jobs=-1)
-            grid_search.fit(X_train, y_train)
-            best_model = grid_search.best_estimator_
-            
-            training_metrics[sensor_id] = {
-                'best_params': grid_search.best_params_,
-                'training_date': datetime.now().isoformat(),
-                'model_type': 'basic',
-                'visualizations_available': False
-            }
-            
-            logger.info(f"Basic model trained for sensor {sensor_id}")
+        # Initialize and train XGBoost with GridSearch
+        xgb = XGBRegressor(random_state=random_state)
         
-        # Store model and data
-        models[sensor_id] = best_model
-        data_cache[sensor_id] = df
-        
-        return best_model, training_metrics[sensor_id]
-        
-    except Exception as e:
-        logger.error(f"Error training model for sensor {sensor_id}: {e}")
-        raise
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize Firebase on startup"""
-    initialize_firebase()
-    logger.info("API started - models will be trained on-demand via API endpoints")
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-    <head>
-        <title>Gas Monitoring API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; background: #fafafa; }
-            h1 { color: #2c3e50; }
-            h2 { margin-top: 1.5em; color: #34495e; }
-            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
-            ul { margin-left: 1.2em; }
-            .endpoint { background: #e8f4fd; padding: 1em; border-radius: 5px; margin: 1em 0; }
-            .new { border-left: 4px solid #4CAF50; }
-        </style>
-    </head>
-    <body>
-        <h1>Gas Monitoring XGBoost API</h1>
-        <p>Welcome to the <strong>Dynamic Sensor</strong> Gas Monitoring Backend. This API performs XGBoost training and predictions for multiple sensors.</p>
-        <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
-        <p><strong>Database:</strong> ✅ Firebase Realtime Database (/history/{sensor_id})</p>
-        <p><strong>Visualizations:</strong> ✅ SHAP, Seaborn, Performance Plots</p>
-
-        <h2>API Documentation</h2>
-        <ul>
-            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
-            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
-        </ul>
-
-        <h2>Available Endpoints</h2>
-        
-        <div class="endpoint">
-            <h3>🔧 Model Training</h3>
-            <ul>
-                <li><code>POST /train/{sensor_id}</code> - Train model for specific sensor</li>
-                <li><code>GET /models</code> - List all trained models</li>
-                <li><code>GET /models/{sensor_id}</code> - Get model info for sensor</li>
-            </ul>
-        </div>
-
-        <div class="endpoint">
-            <h3>📊 Visualizations</h3>
-            <ul>
-                <li><code>GET /shap/{sensor_id}</code> - SHAP explanation plots</li>
-                <li><code>GET /plots/seaborn/{sensor_id}</code> - Seaborn data visualizations</li>
-                <li><code>GET /plots/performance/{sensor_id}</code> - Model performance plots</li>
-                <li><code>GET /plots/all/{sensor_id}</code> - All available visualizations</li>
-            </ul>
-        </div>
-
-        <div class="endpoint">
-            <h3>🔍 Predictions & Data</h3>
-            <ul>
-                <li><code>GET /explain/{sensor_id}</code> - Get predictions for a sensor</li>
-                <li><code>GET /predictions/{sensor_id}</code> - Get stored predictions</li>
-                <li><code>GET /data/{sensor_id}</code> - Get sensor data structure</li>
-            </ul>
-        </div>
-
-        <div class="endpoint">
-            <h3>📈 System Info</h3>
-            <ul>
-                <li><code>GET /health</code> - Health check</li>
-                <li><code>GET /metrics/{sensor_id}</code> - Get training metrics</li>
-            </ul>
-        </div>
-
-        <hr/>
-        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI, XGBoost, SHAP & Seaborn | Gas Monitoring Project</p>
-    </body>
-    </html>
-    """
-
-@app.post("/train/{sensor_id}")
-def train_sensor_model(
-    sensor_id: str,
-    enhanced: bool = True,
-    retrain: bool = False
-):
-    """Train or retrain model for a specific sensor"""
-    try:
-        # Check if model already exists
-        if sensor_id in models and not retrain:
-            return {
-                "status": "exists",
-                "message": f"Model for sensor {sensor_id} already exists. Use retrain=true to retrain.",
-                "sensor_id": sensor_id
-            }
-        
-        # Train the model
-        model, metrics = train_model_for_sensor(sensor_id, use_enhanced_gridsearch=enhanced)
-        
-        return {
-            "status": "success",
-            "message": f"Model trained successfully for sensor {sensor_id}",
-            "sensor_id": sensor_id,
-            "model_type": "enhanced" if enhanced else "basic",
-            "metrics": metrics,
-            "visualizations_available": metrics.get('visualizations_available', False)
+        param_grid = {
+            'n_estimators': n_estimators_list,
+            'max_depth': max_depth_list,
+            'learning_rate': learning_rate_list,
+            'subsample': subsample_list,
+            'colsample_bytree': colsample_bytree_list
         }
         
+        grid_search = GridSearchCV(
+            estimator=xgb, 
+            param_grid=param_grid,
+            scoring='neg_root_mean_squared_error',
+            cv=cv_folds, 
+            verbose=1, 
+            n_jobs=-1
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        # Get best model and predictions
+        best_model = grid_search.best_estimator_
+        y_pred = best_model.predict(X_test)
+        
+        # Calculate metrics
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        
+        # Store model and metrics
+        models[sensor_id] = best_model
+        training_metrics[sensor_id] = {
+            'best_params': grid_search.best_params_,
+            'cv_rmse': -grid_search.best_score_,
+            'test_rmse': rmse,
+            'test_mae': mae,
+            'test_r2': r2,
+            'training_date': datetime.now().isoformat(),
+            'model_type': 'xgboost_regressor',
+            'parameters_used': {
+                'test_size': test_size,
+                'cv_folds': cv_folds,
+                'random_state': random_state
+            }
+        }
+        
+        # Sample predictions for inspection
+        sample_predictions = []
+        for true_val, pred_val in zip(y_test[:10], y_pred[:10]):
+            sample_predictions.append({
+                "true": float(true_val),
+                "predicted": float(pred_val),
+                "error": float(abs(true_val - pred_val))
+            })
+        
+        # Feature importance
+        feature_importance = dict(zip(features.columns, best_model.feature_importances_))
+        sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5])
+        
+        return {
+            "sensor_id": sensor_id,
+            "status": "success",
+            "data_info": {
+                "total_samples": len(df),
+                "training_samples": len(X_train),
+                "testing_samples": len(X_test),
+                "features_used": list(features.columns)
+            },
+            "grid_search_parameters": param_grid,
+            "best_parameters": grid_search.best_params_,
+            "performance_metrics": {
+                "cross_validation": {
+                    "RMSE": round(-grid_search.best_score_, 6)
+                },
+                "test_set": {
+                    "RMSE": round(rmse, 6),
+                    "MAE": round(mae, 6),
+                    "R2_Score": round(r2, 4)
+                }
+            },
+            "top_features": sorted_importance,
+            "sample_predictions": sample_predictions,
+            "training_details": {
+                "test_size": test_size,
+                "cv_folds": cv_folds,
+                "random_state": random_state
+            }
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error training model for sensor {sensor_id}: {str(e)}")
+        logger.error(f"Error in xgboost_regressor_predict for sensor {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-# =========== VISUALIZATION ENDPOINTS ===========
-
+# ---------------------------------------------------
+# Visualization Endpoints
+# ---------------------------------------------------
 @app.get("/shap/{sensor_id}")
 def get_shap_plots(sensor_id: str):
     """Get SHAP explanation plots for a trained model"""
@@ -688,10 +597,11 @@ def get_shap_plots(sensor_id: str):
         df = data_cache[sensor_id]
         
         # Prepare features
-        X, _ = prepare_data(df, sensor_id)
+        features = df.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+        features = features.fillna(features.mean())
         
         # Create SHAP plots
-        shap_plots = create_shap_plots(model, X, sensor_id)
+        shap_plots = create_shap_plots(model, features, sensor_id)
         
         return {
             "sensor_id": sensor_id,
@@ -733,8 +643,11 @@ def get_performance_plots(sensor_id: str):
     try:
         # We need to recreate test predictions for performance plots
         df = data_cache[sensor_id]
-        X, y = prepare_data(df, sensor_id)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        features = df.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+        features = features.fillna(features.mean())
+        target = df['riskIndex']
+        
+        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
         
         model = models[sensor_id]
         y_pred = model.predict(X_test)
@@ -765,11 +678,13 @@ def get_all_plots(sensor_id: str):
         # Get SHAP and performance plots (only if model exists)
         if sensor_id in models:
             df = data_cache[sensor_id]
-            X, _ = prepare_data(df, sensor_id)
-            plots['shap'] = create_shap_plots(models[sensor_id], X, sensor_id)
+            features = df.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+            features = features.fillna(features.mean())
+            plots['shap'] = create_shap_plots(models[sensor_id], features, sensor_id)
             
             # Performance plots
-            X_train, X_test, y_train, y_test = train_test_split(X, df['riskIndex'], test_size=0.2, random_state=42)
+            target = df['riskIndex']
+            X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
             y_pred = models[sensor_id].predict(X_test)
             plots['performance'] = create_model_performance_plots(y_test, y_pred, sensor_id)
         
@@ -781,7 +696,31 @@ def get_all_plots(sensor_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating all plots: {str(e)}")
 
-# =========== EXISTING ENDPOINTS ===========
+# ---------------------------------------------------
+# Data & System Endpoints
+# ---------------------------------------------------
+@app.get("/data/{sensor_id}")
+def get_sensor_data(sensor_id: str, limit: int = 5):
+    """Get sensor data structure"""
+    try:
+        # Load data if not in cache
+        if sensor_id not in data_cache:
+            df = load_data_from_firebase(sensor_id)
+            if df is None or df.empty:
+                raise HTTPException(status_code=404, detail=f"No data found for sensor {sensor_id}")
+            data_cache[sensor_id] = df
+        else:
+            df = data_cache[sensor_id]
+        
+        return {
+            "sensor_id": sensor_id,
+            "columns": df.columns.tolist(),
+            "shape": df.shape,
+            "sample_data": df.head(limit).to_dict('records')
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading data for sensor {sensor_id}: {str(e)}")
 
 @app.get("/models")
 def list_models():
@@ -792,48 +731,124 @@ def list_models():
         "available_sensors": list(data_cache.keys())
     }
 
-@app.get("/models/{sensor_id}")
-def get_model_info(sensor_id: str):
-    """Get information about a specific model"""
-    if sensor_id not in models:
-        raise HTTPException(status_code=404, detail=f"No model found for sensor {sensor_id}")
-    
-    metrics = training_metrics.get(sensor_id, {})
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    status = {
+        "status": "healthy", 
+        "message": "Dynamic XGBoost API with Firebase integration is running",
+        "trained_models": len(models),
+        "cached_datasets": len(data_cache),
+        "timestamp": datetime.now().isoformat()
+    }
+    return status
+
+@app.get("/metrics/{sensor_id}")
+def get_training_metrics(sensor_id: str):
+    """Get training metrics for a sensor"""
+    if sensor_id not in training_metrics:
+        raise HTTPException(status_code=404, detail=f"No training metrics found for sensor {sensor_id}")
     
     return {
         "sensor_id": sensor_id,
-        "model_available": True,
-        "training_metrics": metrics,
-        "data_points": len(data_cache[sensor_id]) if sensor_id in data_cache else 0,
-        "visualizations_available": metrics.get('visualizations_available', False)
+        "metrics": training_metrics[sensor_id]
     }
 
-@app.get("/explain/{sensor_id}")
-def explain(sensor_id: str):
-    """Get predictions for a specific sensor"""
-    if sensor_id not in models:
-        raise HTTPException(status_code=404, detail=f"No trained model found for sensor {sensor_id}. Train the model first using POST /train/{sensor_id}")
-    
-    if sensor_id not in data_cache:
-        raise HTTPException(status_code=404, detail=f"No data available for sensor {sensor_id}")
-    
-    model = models[sensor_id]
-    sensor_data = data_cache[sensor_id]
-    
-    # Prepare features for prediction
-    columns_to_drop = ['riskIndex']
-    optional_columns_to_drop = ['time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID']
-    
-    for col in optional_columns_to_drop:
-        if col in sensor_data.columns:
-            columns_to_drop.append(col)
-    
-    X_sensor = sensor_data.drop(columns=columns_to_drop, errors='ignore')
-    X_sensor = X_sensor.fillna(X_sensor.mean())
+# ---------------------------------------------------
+# Home Page
+# ---------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>Gas Monitoring API</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; background: #fafafa; }
+            h1 { color: #2c3e50; }
+            h2 { margin-top: 1.5em; color: #34495e; }
+            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+            pre { background: #f4f4f4; padding: 1em; border-radius: 5px; overflow-x: auto; }
+            ul { margin-left: 1.2em; }
+            .endpoint { background: #e8f4fd; padding: 1em; border-radius: 5px; margin: 1em 0; }
+            .new { border-left: 4px solid #4CAF50; }
+            .param { color: #d63384; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>Gas Monitoring XGBoost API</h1>
+        <p>Welcome to the <strong>Dynamic Sensor</strong> Gas Monitoring Backend with dynamic XGBoost training.</p>
+        <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
+        <p><strong>Database:</strong> ✅ Firebase Realtime Database (/history/{sensor_id})</p>
 
-    # Predict riskIndex for the sensor data
-    predictions = model.predict(X_sensor)
+        <h2>API Documentation</h2>
+        <ul>
+            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
+            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
+        </ul>
 
-    # Build response with timestamps and predictions
-    response = []
-    
+        <h2>Main Endpoint</h2>
+        
+        <div class="endpoint new">
+            <h3>🎯 Dynamic XGBoost Training & Prediction</h3>
+            <code>GET /predict/xgboost/?sensor_id=3221&test_size=0.2&n_estimators=100,300&max_depth=3,5,7&learning_rate=0.01,0.1&subsample=0.8,1.0&colsample_bytree=0.8,1.0&cv_folds=3&random_state=42</code>
+            
+            <h4>Query Parameters:</h4>
+            <ul>
+                <li><span class="param">sensor_id</span> (required) - Sensor ID to train model for</li>
+                <li><span class="param">test_size</span> (default: 0.2) - Test size ratio (0.1 to 0.4)</li>
+                <li><span class="param">n_estimators</span> (default: "100,300") - n_estimators values (comma separated)</li>
+                <li><span class="param">max_depth</span> (default: "3,5,7") - max_depth values (comma separated)</li>
+                <li><span class="param">learning_rate</span> (default: "0.01,0.1") - learning_rate values (comma separated)</li>
+                <li><span class="param">subsample</span> (default: "0.8,1.0") - subsample values (comma separated)</li>
+                <li><span class="param">colsample_bytree</span> (default: "0.8,1.0") - colsample_bytree values (comma separated)</li>
+                <li><span class="param">cv_folds</span> (default: 3) - Number of cross-validation folds (2-10)</li>
+                <li><span class="param">random_state</span> (default: 42) - Random state for reproducibility</li>
+            </ul>
+            
+            <h4>Example Usage:</h4>
+            <pre>
+GET /predict/xgboost/?sensor_id=3221&test_size=0.2
+GET /predict/xgboost/?sensor_id=3221&n_estimators=50,100,200&max_depth=2,4,6
+GET /predict/xgboost/?sensor_id=3221&learning_rate=0.05,0.1,0.2&cv_folds=5
+            </pre>
+        </div>
+
+        <div class="endpoint">
+            <h3>📊 Visualization Endpoints</h3>
+            <ul>
+                <li><code>GET /shap/{sensor_id}</code> - SHAP explanation plots</li>
+                <li><code>GET /plots/seaborn/{sensor_id}</code> - Seaborn data visualizations</li>
+                <li><code>GET /plots/performance/{sensor_id}</code> - Model performance plots</li>
+                <li><code>GET /plots/all/{sensor_id}</code> - All available visualizations</li>
+            </ul>
+        </div>
+
+        <div class="endpoint">
+            <h3>🔍 Data & System</h3>
+            <ul>
+                <li><code>GET /data/{sensor_id}</code> - Get sensor data structure</li>
+                <li><code>GET /models</code> - List all trained models</li>
+                <li><code>GET /health</code> - Health check</li>
+                <li><code>GET /metrics/{sensor_id}</code> - Get training metrics</li>
+            </ul>
+        </div>
+
+        <hr/>
+        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI & XGBoost | Gas Monitoring Project</p>
+    </body>
+    </html>
+    """
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize Firebase on startup"""
+    initialize_firebase()
+    logger.info("API started - use GET /predict/xgboost/ to train models")
+
+# ===========
+# Run the application
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
