@@ -1,4 +1,3 @@
-
 import json
 import gc
 import psutil
@@ -33,15 +32,18 @@ import logging
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
 from xgboost import XGBRegressor
-   
 from io import BytesIO
+
+# Configure logging FIRST
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Global model and data (in-memory)
 model = None
 data = None
 features = None
 target = None
-db = None
+firebase_db = None
 
 # Try to import optional dependencies
 try:
@@ -57,25 +59,19 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
     logger.warning("SciPy not available, some statistical tests will be skipped")
-   
-  
-  
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Set Seaborn style
 sns.set_style("whitegrid")
 sns.set_palette("husl")
 
-# Initialize FastAPI app FIRST
+# Initialize FastAPI app
 app = FastAPI(
     title="Gas Monitoring API", 
     version="1.0.0",
     description="API for gas sensor monitoring, forecasting, and SHAP explanations"
 )
 
-# CORS Middleware - Place this RIGHT AFTER app initialization
+# Advanced CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -100,50 +96,51 @@ async def preflight_handler(request: Request, path: str):
     )
 
 # ---------------------------------------------------
-# Firebase Setup
+# Simplified Firebase Setup for Realtime Database
 # ---------------------------------------------------
-try:
-    firebase_config = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-    if firebase_config:
-        service_account_info = json.loads(firebase_config)
-    else:
-        service_account_info = {
-            "type": "service_account",
-            "project_id": os.getenv("FIREBASE_PROJECT_ID", "gasmonitoring-ec511"),
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", ""),
-            "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", ""),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID", ""),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL", "")
-        }
-    
-    database_url = os.getenv(
-        "FIREBASE_DB_URL",
-        "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
-    )
-
+def initialize_firebase():
+    """Initialize Firebase Realtime Database"""
+    global firebase_db
     try:
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(service_account_info)
-            firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-            logger.info("Firebase initialized successfully")
-    except Exception as e:
-        logger.warning(f"Firebase initialization note: {e}")
-except Exception as e:
-    logger.error(f"Firebase initialization failed: {e}")
- # --- FastAPI setup ---
-app = FastAPI(title="Gas Monitoring XGBoost API")
+        firebase_config = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+        if firebase_config:
+            service_account_info = json.loads(firebase_config)
+        else:
+            service_account_info = {
+                "type": "service_account",
+                "project_id": os.getenv("FIREBASE_PROJECT_ID", "gasmonitoring-ec511"),
+                "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", ""),
+                "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
+                "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", ""),
+                "client_id": os.getenv("FIREBASE_CLIENT_ID", ""),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL", "")
+            }
+        
+        database_url = os.getenv(
+            "FIREBASE_DB_URL",
+            "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
+        )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        try:
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(service_account_info)
+                firebase_admin.initialize_app(cred, {"databaseURL": database_url})
+                firebase_db = db.reference()
+                logger.info("Firebase Realtime Database initialized successfully")
+            else:
+                firebase_db = db.reference()
+                logger.info("Firebase already initialized, using existing app")
+                
+        except Exception as e:
+            logger.warning(f"Firebase initialization note: {e}")
+            
+    except Exception as e:
+        logger.error(f"Firebase initialization failed: {e}")
+        raise
+
 def load_data_from_firebase():
     """Load data from Firebase Realtime Database /history"""
     try:
@@ -380,8 +377,8 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
     return status
-    
-#===========
+
+# ===========
 # Run the application
 if __name__ == "__main__":
     import uvicorn
