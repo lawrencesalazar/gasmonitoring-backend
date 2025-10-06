@@ -1,4 +1,3 @@
-
 import json
 import gc
 import psutil
@@ -32,8 +31,19 @@ import base64
 import logging
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
-   
+from xgboost import XGBRegressor
 from io import BytesIO
+
+# Configure logging FIRST
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global model and data (in-memory)
+model = None
+data = None
+features = None
+target = None
+firebase_db = None
 
 # Try to import optional dependencies
 try:
@@ -49,25 +59,19 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
     logger.warning("SciPy not available, some statistical tests will be skipped")
-   
-  
-  
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Set Seaborn style
 sns.set_style("whitegrid")
 sns.set_palette("husl")
 
-# Initialize FastAPI app FIRST
+# Initialize FastAPI app
 app = FastAPI(
     title="Gas Monitoring API", 
     version="1.0.0",
     description="API for gas sensor monitoring, forecasting, and SHAP explanations"
 )
 
-# CORS Middleware - Place this RIGHT AFTER app initialization
+# Advanced CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -92,52 +96,135 @@ async def preflight_handler(request: Request, path: str):
     )
 
 # ---------------------------------------------------
-# Firebase Setup
+# Simplified Firebase Setup for Realtime Database
 # ---------------------------------------------------
-try:
-    firebase_config = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-    if firebase_config:
-        service_account_info = json.loads(firebase_config)
-    else:
-        service_account_info = {
-            "type": "service_account",
-            "project_id": os.getenv("FIREBASE_PROJECT_ID", "gasmonitoring-ec511"),
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", ""),
-            "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", ""),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID", ""),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL", "")
-        }
-    
-    database_url = os.getenv(
-        "FIREBASE_DB_URL",
-        "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
-    )
-
+def initialize_firebase():
+    """Initialize Firebase Realtime Database"""
+    global firebase_db
     try:
         if not firebase_admin._apps:
-            cred = credentials.Certificate(service_account_info)
+            # Use environment variables with fallbacks
+            database_url = os.getenv(
+                "FIREBASE_DB_URL",
+                "https://gasmonitoring-ec511-default-rtdb.asia-southeast1.firebasedatabase.app"
+            )
+            
+            # Simple credential setup
+            cred = credentials.Certificate({
+                "type": "service_account",
+                "project_id": os.getenv("FIREBASE_PROJECT_ID", "gasmonitoring-ec511"),
+                "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
+                "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", ""),
+                "token_uri": "https://oauth2.googleapis.com/token",
+            })
+            
             firebase_admin.initialize_app(cred, {"databaseURL": database_url})
-            logger.info("Firebase initialized successfully")
+            firebase_db = db.reference()
+            logger.info("Firebase Realtime Database initialized successfully")
+        else:
+            firebase_db = db.reference()
+            logger.info("Firebase already initialized, using existing app")
+            
     except Exception as e:
-        logger.warning(f"Firebase initialization note: {e}")
-except Exception as e:
-    logger.error(f"Firebase initialization failed: {e}")
- # --- FastAPI setup ---
-app = FastAPI(title="Gas Monitoring XGBoost API")
+        logger.error(f"Firebase initialization failed: {e}")
+        raise
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def load_data_from_firebase():
+    """Load data from Firebase Realtime Database /history"""
+    try:
+        # Get data from /history path in Realtime Database
+        history_ref = db.reference('/history')
+        history_data = history_ref.get()
+        
+        if not history_data:
+            logger.warning("No data found in Firebase /history. Using local CSV as fallback.")
+            return pd.read_csv("data.csv")
+        
+        # Convert the nested dictionary to DataFrame
+        data_list = []
+        for key, value in history_data.items():
+            if isinstance(value, dict):
+                value['firebase_key'] = key  # Keep the Firebase key for reference
+                data_list.append(value)
+        
+        df = pd.DataFrame(data_list)
+        logger.info(f"Loaded {len(df)} records from Firebase /history")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error loading data from Firebase: {e}")
+        logger.info("Using local CSV as fallback")
+        return pd.read_csv("data.csv")
 
-# --- HOME ROUTE (Render Documentation Page) ---
+def save_prediction_to_firebase(sensor_id, prediction_data):
+    """Save prediction results to Firebase Realtime Database"""
+    try:
+        predictions_ref = db.reference('/predictions')
+        
+        for pred in prediction_data:
+            # Create a unique key using sensor_id and timestamp
+            unique_key = f"{sensor_id}_{pred['timestamp']}".replace(':', '_').replace(' ', '_')
+            
+            # Prepare prediction data
+            pred_data = {
+                'sensor_id': sensor_id,
+                'timestamp': pred['timestamp'],
+                'predicted_riskIndex': pred['predicted_riskIndex'],
+                'prediction_date': datetime.now().isoformat()
+            }
+            
+            # Save to Firebase under /predictions/{unique_key}
+            predictions_ref.child(unique_key).set(pred_data)
+        
+        logger.info(f"Saved {len(prediction_data)} predictions to Firebase for sensor {sensor_id}")
+        
+    except Exception as e:
+        logger.error(f"Error saving prediction to Firebase: {e}")
+
+def prepare_data(df):
+    """Prepare data for training"""
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    X = df.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+    y = df['riskIndex']
+    X = X.fillna(X.mean())
+    return X, y
+
+def train_model(X_train, y_train):
+    """Train XGBoost model with GridSearch"""
+    xgb_model = XGBRegressor(random_state=42)
+    param_grid = {
+        'n_estimators': [100],
+        'max_depth': [3],
+        'learning_rate': [0.1],
+        'subsample': [1.0],
+        'colsample_bytree': [1.0]
+    }
+    grid_search = GridSearchCV(xgb_model, param_grid, scoring='neg_root_mean_squared_error', cv=3, n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+    return grid_search.best_estimator_
+
+@app.on_event("startup")
+async def load_and_train():
+    """Startup event to load data and train model"""
+    global data, features, target, model
+
+    # Initialize Firebase
+    initialize_firebase()
+    
+    # Load data from Firebase (with CSV fallback)
+    data = load_data_from_firebase()
+
+    if data is None or data.empty:
+        logger.error("No data available for training")
+        return
+
+    # Prepare and train model
+    features, target = prepare_data(data)
+    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
+
+    model = train_model(X_train, y_train)
+    logger.info("Model trained and ready.")
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -159,6 +246,7 @@ def home():
         <h1>Gas Monitoring XGBoost API</h1>
         <p>Welcome to the <strong>Render-ready</strong> Gas Monitoring Backend. This API performs XGBoost training and visualization on Firebase Realtime Database data.</p>
         <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
+        <p><strong>Database:</strong> ✅ Firebase Realtime Database (/history)</p>
 
         <h2>API Documentation</h2>
         <ul>
@@ -167,8 +255,18 @@ def home():
         </ul>
 
         <h2>Available Endpoints</h2>
+        
+        <div class="endpoint">
+            <h3>🔍 Data & Predictions</h3>
+            <ul>
+                <li><code>GET /explain/{sensor_id}</code> - Get predictions for a sensor</li>
+                <li><code>GET /predictions/{sensor_id}</code> - Get stored predictions</li>
+                <li><code>GET /health</code> - Health check</li>
+            </ul>
+        </div>
+
         <div class="endpoint new">
-            <h3>🧠 Machine Learning Endpoint (NEW)</h3>
+            <h3>🧠 Machine Learning Endpoints</h3>
             <ul>
                 <li><code>POST /train_xgboost</code> — Train XGBoost using Firebase /history data</li>
             </ul>
@@ -187,113 +285,88 @@ def home():
         </div>
 
         <hr/>
-        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI, XGBoost & Seaborn | Gas Monitoring Project</p>
+        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI, XGBoost & Firebase Realtime Database | Gas Monitoring Project</p>
     </body>
     </html>
     """
 
-# --- XGBoost Training Endpoint ---
-@app.post("/train_xgboost")
-def train_xgboost(params: dict):
+@app.get("/explain/{sensor_id}")
+def explain(sensor_id: int):
+    global data, features, target, model
+
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not trained yet")
+
+    # Filter data for the requested sensor_id
+    sensor_data = data[data['sensorID'] == sensor_id]
+
+    if sensor_data.empty:
+        raise HTTPException(status_code=404, detail="Sensor ID not found")
+
+    # Prepare features for prediction
+    X_sensor = sensor_data.drop(columns=['riskIndex', 'time', 'timestamp', 'apiUserID', 'apiPass', 'sensorID'], errors='ignore')
+    X_sensor = X_sensor.fillna(X_sensor.mean())
+
+    # Predict riskIndex for the sensor data
+    predictions = model.predict(X_sensor)
+
+    # Build response with timestamps and predictions
+    response = []
+    for ts, pred in zip(sensor_data['timestamp'], predictions):
+        response.append({
+            "timestamp": str(ts),
+            "predicted_riskIndex": float(pred)
+        })
+
+    # Save predictions to Firebase
+    save_prediction_to_firebase(sensor_id, response)
+
+    return {
+        "sensor_id": sensor_id,
+        "predictions": response
+    }
+
+@app.get("/predictions/{sensor_id}")
+def get_predictions(sensor_id: int, limit: int = 10):
+    """Get recent predictions for a sensor from Firebase"""
     try:
-        sensor_id = params.get("sensor_id")
-        if not sensor_id:
-            raise HTTPException(status_code=400, detail="Missing sensor_id")
-
-        test_size = float(params.get("test_size", 0.2))
-        plot_type = params.get("plot_type", "scatter")
-        plot_output = params.get("plot_output", "base64")
-
-        # --- Fetch Firebase data ---
-        ref = db.reference(f"/history/{sensor_id}")
-        data = ref.get()
-        if not data:
-            raise HTTPException(status_code=404, detail="No data found for sensor_id")
-
-        df = pd.DataFrame.from_dict(data, orient="index")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
-        # --- Prepare features and target ---
-        features = df.drop(columns=["riskIndex", "time", "timestamp", "apiUserID", "apiPass", "sensorID"], errors="ignore")
-        target = df["riskIndex"]
-
-        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=test_size, random_state=42)
-
-        # --- Grid Search ---
-        xgb = XGBRegressor(random_state=42)
-        param_grid = {
-            "n_estimators": params.get("n_estimators", [100, 300]),
-            "max_depth": params.get("max_depth", [3, 5, 7]),
-            "learning_rate": params.get("learning_rate", [0.01, 0.1]),
-            "subsample": params.get("subsample", [0.8, 1.0]),
-            "colsample_bytree": params.get("colsample_bytree", [0.8, 1.0])
-        }
-
-        grid_search = GridSearchCV(
-            estimator=xgb,
-            param_grid=param_grid,
-            scoring="neg_root_mean_squared_error",
-            cv=3,
-            verbose=0,
-            n_jobs=-1
-        )
-        grid_search.fit(X_train, y_train)
-        best_model = grid_search.best_estimator_
-
-        # --- Predictions & metrics ---
-        y_pred = best_model.predict(X_test)
-        metrics = {
-            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
-            "mae": float(mean_absolute_error(y_test, y_pred)),
-            "r2": float(r2_score(y_test, y_pred))
-        }
-
-        # --- Visualization ---
-        plt.figure(figsize=(8, 6))
-        if plot_type == "scatter":
-            sns.scatterplot(x=y_test, y=y_pred)
-            plt.xlabel("True Values")
-            plt.ylabel("Predicted Values")
-            plt.title("Predicted vs True Risk Index")
-        elif plot_type == "line":
-            plt.plot(y_test.values, label="True")
-            plt.plot(y_pred, label="Predicted")
-            plt.legend()
-            plt.title("True vs Predicted Over Time")
-        elif plot_type == "heatmap":
-            corr = features.corr()
-            sns.heatmap(corr, annot=True, cmap="coolwarm")
-            plt.title("Feature Correlation Heatmap")
-
-        # --- Convert or Save plot ---
-        image_data = None
-        if plot_output == "base64":
-            buf = io.BytesIO()
-            plt.savefig(buf, format="png", bbox_inches="tight")
-            buf.seek(0)
-            image_data = base64.b64encode(buf.read()).decode("utf-8")
-            plt.close()
-        else:
-            os.makedirs("static/plots", exist_ok=True)
-            filename = f"static/plots/{sensor_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            plt.savefig(filename, bbox_inches="tight")
-            plt.close()
-            image_data = f"/{filename}"
-
-        # --- Response ---
-        response = {
+        predictions_ref = db.reference('/predictions')
+        all_predictions = predictions_ref.get()
+        
+        if not all_predictions:
+            return {"sensor_id": sensor_id, "recent_predictions": []}
+        
+        # Filter and sort predictions
+        sensor_predictions = []
+        for key, pred_data in all_predictions.items():
+            if pred_data.get('sensor_id') == sensor_id:
+                sensor_predictions.append(pred_data)
+        
+        # Sort by timestamp descending and limit results
+        sensor_predictions.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        recent_predictions = sensor_predictions[:limit]
+        
+        return {
             "sensor_id": sensor_id,
-            "best_params": grid_search.best_params_,
-            "metrics": metrics,
-            "plot_type": plot_type,
-            "plot_output": plot_output,
-            "plot_data": image_data
+            "recent_predictions": recent_predictions
         }
-        return JSONResponse(content=response)
-
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-#===========
+        raise HTTPException(status_code=500, detail=f"Error retrieving predictions: {str(e)}")
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    status = {
+        "status": "healthy", 
+        "message": "ML Model API with Firebase Realtime Database integration is running",
+        "model_ready": model is not None,
+        "data_loaded": data is not None and not data.empty,
+        "timestamp": datetime.now().isoformat()
+    }
+    return status
+
+# ===========
 # Run the application
 if __name__ == "__main__":
     import uvicorn
