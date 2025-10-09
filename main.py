@@ -439,6 +439,7 @@ def get_xgboost_model(
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
 ):
   result = xgboost_model(sensor_id,range)
+  return result
 
 @app.get("/api/correlation_summary/{sensor_id}")
 def getprint_correlation_summary(
@@ -447,7 +448,8 @@ def getprint_correlation_summary(
     target_col: str = Query("riskIndex", description="Target column for correlation analysis")
 ):
   df = fetch_history(sensor_id, range) 
-  print_correlation_summary(df, target_col) 
+  result =  print_correlation_summary(df, target_col) 
+  return result
 
 @app.get("/api/correlation_scatterplots/{sensor_id}")
 def getplot_correlation_scatterplots(
@@ -456,8 +458,8 @@ def getplot_correlation_scatterplots(
     target_col: str = Query("riskIndex", description="Target column for correlation analysis")
 ):
   df = fetch_history(sensor_id, range) 
-  plot_correlation_scatterplots(df, target_col) 
-
+  result =  plot_correlation_scatterplots(df, target_col) 
+  return result
 
 @app.get("/api/correlations/{sensor_id}")
 def getplot_target_correlations(
@@ -466,8 +468,8 @@ def getplot_target_correlations(
     target_col: str = Query("riskIndex", description="Target column for correlation analysis")
 ):
   df = fetch_history(sensor_id, range) 
-  plot_target_correlations(df, target_col) 
-
+  result = plot_target_correlations(df, target_col) 
+  return result
 @app.get("/api/correlations_heatmap/{sensor_id}")
 def getplot_correlation_heatmap(
     sensor_id: str,
@@ -475,8 +477,8 @@ def getplot_correlation_heatmap(
     target_col: str = Query("riskIndex", description="Target column for correlation heatmap")
 ):
   df = fetch_history(sensor_id, range) 
-  plot_correlation_heatmap(df) 
-
+  result = plot_correlation_heatmap(df) 
+  return result
 
 #______________________________________________________
 @app.get("/health")
@@ -528,8 +530,7 @@ def home():
         
         <div class="endpoint new">
             <h3>🎯 Dynamic XGBoost Training & Prediction</h3>
-            <code>GET /predict/xgboost/?sensor_id=3221&test_size=0.2&n_estimators=100,300&max_depth=3,5,7&learning_rate=0.01,0.1&subsample=0.8,1.0&colsample_bytree=0.8,1.0&cv_folds=3&random_state=42</code>
-            
+             
             <h4>Query Parameters:</h4>
              <div class="card">
                 <h2>Dataset Overview</h2>
