@@ -226,13 +226,8 @@ def fetch_history(sensor_ID, range="1month"):
 def xgboost_model(sensor_ID, range="1month"):
     """Train XGBoost model and return results with fallback data"""
     try:
-        df = fetch_history(sensor_ID, range)
-        
-        # Fallback to sample data if Firebase fails
-        if df.empty:
-            logger.warning(f"Using sample data for sensor {sensor_ID}")
-            df = generate_sample_data()
-        
+        df = fetch_history(sensor_ID, range)       
+      
         if df.empty:
             return {"error": f"No data available for sensor {sensor_ID} with range {range}"}
         
@@ -249,19 +244,20 @@ def xgboost_model(sensor_ID, range="1month"):
         X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
         xgb_model = XGBRegressor(random_state=42)
 
-        # Simplified parameter grid for faster training on Render
         param_grid = {
-            'n_estimators': [100, 200],
-            'max_depth': [3, 5],
-            'learning_rate': [0.1, 0.01],
+          'n_estimators': [100, 300],
+          'max_depth': [3, 5, 7],
+          'learning_rate': [0.01, 0.1],
+          'subsample': [0.8, 1.0],
+          'colsample_bytree': [0.8, 1.0]
         }
-
+ 
         grid_search = GridSearchCV(
             estimator=xgb_model, 
             param_grid=param_grid,
             scoring='neg_root_mean_squared_error',
-            cv=2,  # Reduced for faster training
-            verbose=0,
+            cv=3,  # Reduced for faster training
+            verbose=2,
             n_jobs=1    # Use 1 job to avoid issues on Render
         )
         
@@ -293,8 +289,7 @@ def xgboost_model(sensor_ID, range="1month"):
                 "test_records": len(X_test),
                 "date_range_used": f"{df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}" if not df.empty and 'timestamp' in df.columns else "Sample data",
                 "selected_range": range,
-                "features_used": list(features.columns),
-                "data_source": "firebase" if not df.empty else "sample"
+                "features_used": list(features.columns), 
             }
         }
 
@@ -303,29 +298,7 @@ def xgboost_model(sensor_ID, range="1month"):
     except Exception as e:
         logger.error(f"Error in xgboost_model for {sensor_ID}: {e}")
         return {"error": f"Model training failed: {str(e)}"}
-
-def generate_sample_data():
-    """Generate sample data for testing when Firebase is unavailable"""
-    np.random.seed(42)
-    n_samples = 100
-    
-    sample_data = {
-        'sensorID': ['3221'] * n_samples,
-        'apiUserID': ['user123'] * n_samples,
-        'apiPass': ['pass123'] * n_samples,
-        'time': [f"{i:02d}:00" for i in range(n_samples)],
-        'riskIndex': np.random.uniform(0, 100, n_samples),
-        'temperature': np.random.uniform(20, 35, n_samples),
-        'humidity': np.random.uniform(30, 80, n_samples),
-        'co2': np.random.uniform(300, 2000, n_samples),
-        'voc': np.random.uniform(0, 500, n_samples),
-        'pm25': np.random.uniform(0, 100, n_samples),
-        'timestamp': [datetime.now() - timedelta(hours=i) for i in range(n_samples)]
-    }
-    
-    df = pd.DataFrame(sample_data)
-    return df
-
+ 
 # ---------------------------------------------------
 # Visualization Functions (Return Base64 Images)
 # ---------------------------------------------------
@@ -614,62 +587,62 @@ def get_correlation_heatmap(
 # ---------------------------------------------------
 # Debug and Health Endpoints
 # ---------------------------------------------------
-@app.get("/debug/firebase-config")
-def debug_firebase_config():
-    """Debug Firebase configuration without exposing sensitive data"""
-    env_info = {
-        "FIREBASE_PROJECT_ID": bool(os.getenv("FIREBASE_PROJECT_ID")),
-        "FIREBASE_CLIENT_EMAIL": bool(os.getenv("FIREBASE_CLIENT_EMAIL")),
-        "FIREBASE_PRIVATE_KEY": "***" if os.getenv("FIREBASE_PRIVATE_KEY") else None,
-        "FIREBASE_PRIVATE_KEY_ID": bool(os.getenv("FIREBASE_PRIVATE_KEY_ID")),
-        "FIREBASE_SERVICE_ACCOUNT": bool(os.getenv("FIREBASE_SERVICE_ACCOUNT")),
-        "FIREBASE_DB_URL": os.getenv("FIREBASE_DB_URL"),
-    }
+# @app.get("/debug/firebase-config")
+# def debug_firebase_config():
+    # """Debug Firebase configuration without exposing sensitive data"""
+    # env_info = {
+        # "FIREBASE_PROJECT_ID": bool(os.getenv("FIREBASE_PROJECT_ID")),
+        # "FIREBASE_CLIENT_EMAIL": bool(os.getenv("FIREBASE_CLIENT_EMAIL")),
+        # "FIREBASE_PRIVATE_KEY": "***" if os.getenv("FIREBASE_PRIVATE_KEY") else None,
+        # "FIREBASE_PRIVATE_KEY_ID": bool(os.getenv("FIREBASE_PRIVATE_KEY_ID")),
+        # "FIREBASE_SERVICE_ACCOUNT": bool(os.getenv("FIREBASE_SERVICE_ACCOUNT")),
+        # "FIREBASE_DB_URL": os.getenv("FIREBASE_DB_URL"),
+    # }
     
-    return {
-        "firebase_initialized": firebase_db is not None,
-        "environment_variables": env_info,
-        "firebase_apps_initialized": len(firebase_admin._apps) > 0 if 'firebase_admin' in globals() else False
-    }
+    # return {
+        # "firebase_initialized": firebase_db is not None,
+        # "environment_variables": env_info,
+        # "firebase_apps_initialized": len(firebase_admin._apps) > 0 if 'firebase_admin' in globals() else False
+    # }
 
-@app.get("/debug/test-functions")
-def debug_test_functions():
-    """Test if functions are properly defined"""
-    functions = {
-        "xgboost_model": callable(xgboost_model),
-        "plot_correlation_heatmap": callable(plot_correlation_heatmap),
-        "plot_target_correlations": callable(plot_target_correlations),
-        "plot_correlation_scatterplots": callable(plot_correlation_scatterplots),
-        "print_correlation_summary": callable(print_correlation_summary),
-        "fetch_history": callable(fetch_history),
-        "generate_sample_data": callable(generate_sample_data)
-    }
+# @app.get("/debug/test-functions")
+# def debug_test_functions():
+    # """Test if functions are properly defined"""
+    # functions = {
+        # "xgboost_model": callable(xgboost_model),
+        # "plot_correlation_heatmap": callable(plot_correlation_heatmap),
+        # "plot_target_correlations": callable(plot_target_correlations),
+        # "plot_correlation_scatterplots": callable(plot_correlation_scatterplots),
+        # "print_correlation_summary": callable(print_correlation_summary),
+        # "fetch_history": callable(fetch_history),
+        # "generate_sample_data": callable(generate_sample_data)
+    # }
     
-    return {
-        "functions_defined": functions,
-        "firebase_initialized": firebase_db is not None,
-    }
+    # return {
+        # "functions_defined": functions,
+        # "firebase_initialized": firebase_db is not None,
+    # }
 
-@app.get("/debug/firebase/{sensor_id}")
-def debug_firebase(sensor_id: str):
-    """Debug Firebase connection"""
-    try:
-        if not firebase_db:
-            return {"status": "error", "message": "Firebase not initialized"}
+# @app.get("/debug/firebase/{sensor_id}")
+# def debug_firebase(sensor_id: str):
+    # """Debug Firebase connection"""
+    # try:
+        # if not firebase_db:
+            # return {"status": "error", "message": "Firebase not initialized"}
         
-        ref = db.reference(f'/history/{sensor_id}')
-        data = ref.get()
+        # ref = db.reference(f'/history/{sensor_id}')
+        # data = ref.get()
         
-        return {
-            "status": "success",
-            "sensor_id": sensor_id,
-            "data_retrieved": bool(data),
-            "data_sample_keys": list(data.keys())[:3] if data else None,
-            "data_count": len(data) if data else 0
-        }
+        # return {
+            # "status": "success",
+            # "sensor_id": sensor_id,
+            # "data_retrieved": bool(data),
+            # "data_sample_keys": list(data.keys())[:3] if data else None,
+            # "data_count": len(data) if data else 0
+        # }
         
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    # except Exception as e:
+        # return {"status": "error", "message": str(e)}
 
 @app.get("/health")
 def health_check():
