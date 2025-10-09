@@ -461,7 +461,7 @@ def plot_correlation_scatterplots(df, target_col='riskIndex', top_n=6):
     except Exception as e:
         logger.error(f"Error creating scatter plots: {e}")
         return {"error": f"Failed to create scatter plots: {str(e)}"}
-
+        
 def print_correlation_summary(df, target_col='riskIndex'):
     """Return correlation summary as structured data"""
     try:
@@ -473,9 +473,13 @@ def print_correlation_summary(df, target_col='riskIndex'):
         corr_matrix = numeric_df.corr()
         target_corr = corr_matrix[target_col].drop(target_col).sort_values(ascending=False)
         
+        # FIX: Properly separate positive and negative correlations
+        positive_corr = target_corr[target_corr > 0].sort_values(ascending=False)
+        negative_corr = target_corr[target_corr < 0].sort_values(ascending=True)  # Most negative first
+        
         # Convert to dictionaries for JSON serialization
-        top_positive = target_corr.head(5).to_dict()
-        top_negative = target_corr.tail(5).to_dict()
+        top_positive = positive_corr.head(5).to_dict()
+        top_negative = negative_corr.head(5).to_dict()  # This will now show actual negative values
         
         return {
             "target_variable": target_col,
