@@ -586,7 +586,7 @@ def get_feature_importance(sensor_id):
         
         plt.barh(features, scores)
         plt.xlabel('Feature Importance Score')
-        plt.title('Top 10 Feature Importances from XGBoost Model')
+        plt.title('Top Feature Importances from XGBoost Model')
         plt.tight_layout()
         
         # Convert to base64
