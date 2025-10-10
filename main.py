@@ -529,12 +529,34 @@ def predict_risk_index(sensor_ID, sensor_data):
 
 def convert_risk_to_aqi(risk_index):
     """
+    Piecewise Linear Scaling
     Convert risk index to AQI (0-500 scale)
     Adjust based on your domain knowledge
     """
-    # Example conversion - calibrate based on your data
-    aqi = risk_index * 50  # Adjust multiplier as needed
-    return min(max(aqi, 0), 500)  # Cap between 0-500
+    
+    # AQI categories and their corresponding risk index ranges
+    # Adjust these thresholds based on your domain knowledge
+    aqi_thresholds = [
+        (0, 50, 0, 2),      # Good: 0-50 AQI, 0-2 risk
+        (51, 100, 2.1, 4),  # Moderate: 51-100 AQI, 2.1-4 risk
+        (101, 150, 4.1, 6), # Unhealthy for Sensitive: 101-150 AQI, 4.1-6 risk
+        (151, 200, 6.1, 8), # Unhealthy: 151-200 AQI, 6.1-8 risk
+        (201, 500, 8.1, 10) # Very Unhealthy/Hazardous: 201-500 AQI, 8.1-10 risk
+    ]
+    
+    # aqi = risk_index * 50  # Adjust multiplier as needed
+    # return min(max(aqi, 0), 500)  # Cap between 0-500
+    for aqi_min, aqi_max, risk_min, risk_max in aqi_thresholds:
+        if risk_min <= risk_index <= risk_max:
+            # Linear interpolation within this category
+            aqi = aqi_min + (risk_index - risk_min) * (aqi_max - aqi_min) / (risk_max - risk_min)
+            return min(max(aqi, 0), 500)
+    
+    # Fallback: cap at extremes
+    if risk_index < 0:
+        return 0
+    else:
+        return 500 
 
 def calculate_risk_category(risk_index):
     """
