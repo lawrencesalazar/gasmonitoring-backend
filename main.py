@@ -569,8 +569,11 @@ def get_feature_importance(sensor_id):
         # Get feature importance
         importance_scores = model.feature_importances_
         
-        # Create feature importance dictionary
-        feature_importance = dict(zip(feature_columns, importance_scores))
+        # Convert numpy types to native Python types
+        feature_importance = {}
+        for feature, score in zip(feature_columns, importance_scores):
+            # Convert numpy.float32 to native Python float
+            feature_importance[feature] = float(score)
         
         # Sort by importance
         sorted_importance = dict(sorted(feature_importance.items(), 
@@ -579,7 +582,7 @@ def get_feature_importance(sensor_id):
         # Create feature importance plot
         plt.figure(figsize=(10, 8))
         features = list(sorted_importance.keys())[:10]  # Top 10 features
-        scores = list(sorted_importance.values())[:10]
+        scores = [float(score) for score in list(sorted_importance.values())[:10]]  # Convert to float
         
         plt.barh(features, scores)
         plt.xlabel('Feature Importance Score')
@@ -593,13 +596,17 @@ def get_feature_importance(sensor_id):
         image_base64 = base64.b64encode(buffer.getvalue()).decode()
         plt.close()
         
+        # Calculate total importance for percentages
+        total_importance = sum(sorted_importance.values())
+        
         return {
             "feature_importance": sorted_importance,
             "importance_plot": f"data:image/png;base64,{image_base64}",
-            "top_features": features[:5],  # Top 5 most important features
+            "top_features": list(sorted_importance.keys())[:5],  # Top 5 most important features
             "metadata": {
                 "total_features": len(feature_columns),
-                "model_type": "XGBoost"
+                "model_type": "XGBoost",
+                "total_importance": float(total_importance)  # Convert to float
             }
         }
         
