@@ -550,12 +550,73 @@ def calculate_risk_category(risk_index):
         return 4, "Very High", "Unhealthy", "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available."
     else:
         return 5, "Hazardous", "Very Unhealthy", "Air quality is hazardous. Avoid outdoor activities. Evacuate if necessary."
+
+def get_feature_importance(sensor_id):
+    """Get feature importance from trained XGBoost model"""
+    try:
+        # Load the trained model
+        model = load_model_from_firebase(sensor_id)
+        if not model:
+            return {"error": f"No trained model found for sensor {sensor_id}"}
+        
+        # Load model metadata to get feature names
+        metadata = load_model_metadata(sensor_id)
+        if not metadata:
+            return {"error": "Model metadata not found"}
+        
+        feature_columns = metadata.get('feature_columns', [])
+        
+        # Get feature importance
+        importance_scores = model.feature_importances_
+        
+        # Create feature importance dictionary
+        feature_importance = dict(zip(feature_columns, importance_scores))
+        
+        # Sort by importance
+        sorted_importance = dict(sorted(feature_importance.items(), 
+                                      key=lambda x: x[1], reverse=True))
+        
+        # Create feature importance plot
+        plt.figure(figsize=(10, 8))
+        features = list(sorted_importance.keys())[:10]  # Top 10 features
+        scores = list(sorted_importance.values())[:10]
+        
+        plt.barh(features, scores)
+        plt.xlabel('Feature Importance Score')
+        plt.title('Top 10 Feature Importances from XGBoost Model')
+        plt.tight_layout()
+        
+        # Convert to base64
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', bbox_inches='tight', dpi=100)
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode()
+        plt.close()
+        
+        return {
+            "feature_importance": sorted_importance,
+            "importance_plot": f"data:image/png;base64,{image_base64}",
+            "top_features": features[:5],  # Top 5 most important features
+            "metadata": {
+                "total_features": len(feature_columns),
+                "model_type": "XGBoost"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting feature importance: {e}")
+        return {"error": f"Failed to get feature importance: {str(e)}"}
+
 # ---------------------------------------------------
 # Visualization Functions (Return Base64 Images)
 # ---------------------------------------------------
 def plot_correlation_heatmap(df, figsize=(12, 10)):
     """Return correlation heatmap as base64 image"""
     try:
+        # Enhanced validation
+        if df is None or df.empty:
+            return {"error": "No data provided for correlation heatmap"}
+        
         numeric_df = df.select_dtypes(include=[np.number])
         
         if numeric_df.empty:
@@ -564,8 +625,16 @@ def plot_correlation_heatmap(df, figsize=(12, 10)):
         if len(numeric_df.columns) < 2:
             return {"error": "Need at least 2 numeric columns for correlation heatmap"}
         
+        # Check for sufficient data points
+        if len(numeric_df) < 3:
+            return {"error": "Insufficient data points (need at least 3) for correlation analysis"}
+        
         # Calculate correlation matrix
         corr_matrix = numeric_df.corr()
+        
+        # Check if correlation matrix is valid
+        if corr_matrix.isnull().all().all():
+            return {"error": "Unable to calculate correlations - data may be constant"}
         
         # Create the plot
         plt.figure(figsize=figsize)
@@ -593,15 +662,21 @@ def plot_correlation_heatmap(df, figsize=(12, 10)):
         image_base64 = base64.b64encode(buffer.getvalue()).decode()
         plt.close()
         
+        # Return additional metadata
         return {
             "image": f"data:image/png;base64,{image_base64}",
-            "correlation_matrix": corr_matrix.to_dict()
+            "correlation_matrix": corr_matrix.to_dict(),
+            "metadata": {
+                "data_points": len(numeric_df),
+                "features_analyzed": len(numeric_df.columns),
+                "matrix_shape": corr_matrix.shape
+            }
         }
         
     except Exception as e:
         logger.error(f"Error creating correlation heatmap: {e}")
         return {"error": f"Failed to create heatmap: {str(e)}"}
-
+        
 def plot_target_correlations(df, target_col='riskIndex', top_n=10):
     """Return target correlations bar chart as base64 image"""
     try:
@@ -751,6 +826,63 @@ def print_correlation_summary(df, target_col='riskIndex'):
         logger.error(f"Error creating correlation summary: {e}")
         return {"error": f"Failed to create correlation summary: {str(e)}"}
 
+def enhanced_correlation_summary(df, target_col='riskIndex'):
+    """Return enhanced correlation summary with statistical significance"""
+    try:
+        numeric_df = df.select_dtypes(include=[np.number])
+        
+        if target_col not in numeric_df.columns:
+            return {"error": f"Target column '{target_col}' not found"}
+        
+        corr_matrix = numeric_df.corr()
+        target_corr = corr_matrix[target_col].drop(target_col)
+        
+        # Calculate p-values for correlations
+        p_values = {}
+        for feature in target_corr.index:
+            if feature != target_col:
+                corr_coef, p_value = stats.pearsonr(numeric_df[feature], numeric_df[target_col])
+                p_values[feature] = p_value
+        
+        # Separate correlations
+        positive_corr = target_corr[target_corr > 0].sort_values(ascending=False)
+        negative_corr = target_corr[target_corr < 0].sort_values(ascending=True)
+        
+        # Get statistically significant correlations (p < 0.05)
+        significant_features = {
+            feature: {
+                "correlation": target_corr[feature],
+                "p_value": p_values[feature],
+                "significant": p_values[feature] < 0.05
+            }
+            for feature in target_corr.index
+        }
+        
+        return {
+            "target_variable": target_col,
+            "total_features_analyzed": len(target_corr),
+            "data_points": len(df),
+            "top_positive_correlations": positive_corr.head(5).to_dict(),
+            "top_negative_correlations": negative_corr.head(5).to_dict(),
+            "statistically_significant": {
+                feature: data for feature, data in significant_features.items() 
+                if data["significant"]
+            },
+            "correlation_strength_breakdown": {
+                "strong_positive": int(len(target_corr[target_corr > 0.7])),
+                "moderate_positive": int(len(target_corr[(target_corr > 0.3) & (target_corr <= 0.7)])),
+                "weak": int(len(target_corr[(target_corr >= -0.3) & (target_corr <= 0.3)])),
+                "moderate_negative": int(len(target_corr[(target_corr >= -0.7) & (target_corr < -0.3)])),
+                "strong_negative": int(len(target_corr[target_corr < -0.7]))
+            },
+            "all_correlations": target_corr.to_dict(),
+            "p_values": p_values
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating enhanced correlation summary: {e}")
+        return {"error": f"Failed to create correlation summary: {str(e)}"}
+
 # ---------------------------------------------------
 # API Endpoints with Error Handling
 # ---------------------------------------------------
@@ -874,6 +1006,52 @@ def check_sensor_credential(
     except Exception as e:
         logger.error(f"Error fetching sensor locations for {sensor_ID}: {e}")
         return False
+
+@app.get("/api/feature_importance/{sensor_id}")
+def get_feature_importance_endpoint(sensor_id: str):
+    """Get feature importance from trained model"""
+    try:
+        result = get_feature_importance(sensor_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error in feature importance for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Feature importance analysis failed: {str(e)}")
+        
+        
+@app.get("/api/data_quality/{sensor_id}")
+def get_data_quality_report(
+    sensor_id: str,
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+):
+    """Get data quality report for sensor data"""
+    try:
+        df = fetch_history(sensor_id, range)
+        if df.empty:
+            return {"error": f"No data found for sensor {sensor_id} with range {range}"}
+        
+        # Basic data quality metrics
+        numeric_df = df.select_dtypes(include=[np.number])
+        
+        quality_report = {
+            "sensor_id": sensor_id,
+            "date_range": range,
+            "total_records": len(df),
+            "numeric_columns": len(numeric_df.columns),
+            "date_range_actual": {
+                "start": df['timestamp'].min().isoformat() if 'timestamp' in df.columns else "Unknown",
+                "end": df['timestamp'].max().isoformat() if 'timestamp' in df.columns else "Unknown"
+            },
+            "missing_values": df.isnull().sum().to_dict(),
+            "data_types": df.dtypes.astype(str).to_dict(),
+            "basic_statistics": numeric_df.describe().to_dict() if not numeric_df.empty else {}
+        }
+        
+        return quality_report
+        
+    except Exception as e:
+        logger.error(f"Error in data quality report for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Data quality analysis failed: {str(e)}")
+        
 ###
 ## PRedict 
 ## 
@@ -1018,6 +1196,8 @@ def retrain_model(
     except Exception as e:
         logger.error(f"Error retraining model for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Model retraining failed: {str(e)}")
+
+
 
 @app.get("/api/sensor_readings/{sensor_id}")
 def get_latest_sensor_reading(
