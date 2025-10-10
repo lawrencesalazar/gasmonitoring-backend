@@ -219,13 +219,177 @@ def fetch_history(sensor_ID, range="1month"):
     except Exception as e:
         logger.error(f"Error fetching history for {sensor_ID}: {e}")
         return pd.DataFrame()
+##
+# saving to firebase added functions
+##
+import pickle
+import base64
+import joblib
 
+# Add these model management functions after your existing Firebase functions
+
+def save_model_to_firebase(model, sensor_ID, model_type="xgboost"):
+    """
+    Save trained model to Firebase as base64 encoded string
+    """
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot save model")
+            return None
+        
+        # Serialize model to bytes
+        model_bytes = pickle.dumps(model)
+        model_b64 = base64.b64encode(model_bytes).decode('utf-8')
+        
+        # Save model metadata and data to Firebase
+        ref = db.reference(f'/trained_models/{sensor_ID}')
+        model_data = {
+            'model_data': model_b64,
+            'model_type': model_type,
+            'timestamp': datetime.now().isoformat(),
+            'sensor_ID': sensor_ID,
+            'version': '1.0'
+        }
+        
+        ref.set(model_data)
+        logger.info(f"Model saved to Firebase for sensor {sensor_ID}")
+        return f"firebase:/trained_models/{sensor_ID}"
+        
+    except Exception as e:
+        logger.error(f"Error saving model to Firebase: {e}")
+        return None
+
+def load_model_from_firebase(sensor_ID):
+    """
+    Load trained model from Firebase
+    """
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot load model")
+            return None
+        
+        ref = db.reference(f'/trained_models/{sensor_ID}')
+        model_data = ref.get()
+        
+        if not model_data or 'model_data' not in model_data:
+            logger.warning(f"No trained model found for sensor {sensor_ID}")
+            return None
+        
+        # Decode and deserialize model
+        model_b64 = model_data['model_data']
+        model_bytes = base64.b64decode(model_b64)
+        model = pickle.loads(model_bytes)
+        
+        logger.info(f"Model loaded from Firebase for sensor {sensor_ID}")
+        return model
+        
+    except Exception as e:
+        logger.error(f"Error loading model from Firebase: {e}")
+        return None
+
+def save_model_metadata(sensor_ID, metrics, feature_columns, best_params):
+    """
+    Save model metadata and performance metrics to Firebase
+    """
+    try:
+        if not firebase_db:
+            return None
+        
+        ref = db.reference(f'/model_metadata/{sensor_ID}')
+        metadata = {
+            'training_metrics': metrics,
+            'feature_columns': feature_columns,
+            'best_params': best_params,
+            'last_trained': datetime.now().isoformat(),
+            'sensor_ID': sensor_ID
+        }
+        
+        ref.set(metadata)
+        logger.info(f"Model metadata saved for sensor {sensor_ID}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error saving model metadata: {e}")
+        return False
+
+def load_model_metadata(sensor_ID):
+    """
+    Load model metadata from Firebase
+    """
+    try:
+        if not firebase_db:
+            return None
+        
+        ref = db.reference(f'/model_metadata/{sensor_ID}')
+        return ref.get()
+        
+    except Exception as e:
+        logger.error(f"Error loading model metadata: {e}")
+        return None
+
+def model_exists_in_firebase(sensor_ID):
+    """
+    Check if a trained model exists in Firebase
+    """
+    try:
+        if not firebase_db:
+            return False
+        
+        ref = db.reference(f'/trained_models/{sensor_ID}')
+        model_data = ref.get()
+        return model_data is not None and 'model_data' in model_data
+        
+    except Exception as e:
+        logger.error(f"Error checking model existence: {e}")
+        return False
+
+def delete_model_from_firebase(sensor_ID):
+    """
+    Delete trained model from Firebase
+    """
+    try:
+        if not firebase_db:
+            return False
+        
+        # Delete model data
+        model_ref = db.reference(f'/trained_models/{sensor_ID}')
+        model_ref.delete()
+        
+        # Delete metadata
+        metadata_ref = db.reference(f'/model_metadata/{sensor_ID}')
+        metadata_ref.delete()
+        
+        logger.info(f"Model deleted from Firebase for sensor {sensor_ID}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error deleting model from Firebase: {e}")
+        return False
 # ---------------------------------------------------
 # XGBoost Model Function with Sample Data Fallback
 # ---------------------------------------------------
-def xgboost_model(sensor_ID, range="1month"):
-    """Train XGBoost model and return results with fallback data"""
+def xgboost_model(
+    sensor_ID, 
+    range: str = "1month",
+    save_model: bool = True,
+    retrain: bool = False
+):
+    """Train XGBoost model and save to Firebase"""
     try:
+        # Check if model already exists and we don't want to retrain
+        if not retrain and model_exists_in_firebase(sensor_ID):
+            logger.info(f"Using existing model for sensor {sensor_ID}")
+            existing_model = load_model_from_firebase(sensor_ID)
+            metadata = load_model_metadata(sensor_ID)
+            
+            return {
+                "status": "existing_model",
+                "message": "Using pre-trained model from Firebase",
+                "sensor_ID": sensor_ID,
+                "model_available": True,
+                "last_trained": metadata.get('last_trained') if metadata else None
+            }
+        
         df = fetch_history(sensor_ID, range)       
       
         if df.empty:
@@ -256,38 +420,56 @@ def xgboost_model(sensor_ID, range="1month"):
             estimator=xgb_model, 
             param_grid=param_grid,
             scoring='neg_root_mean_squared_error',
-            cv=3,  # Reduced for faster training
+            cv=3,
             verbose=2,
-            n_jobs=1    # Use 1 job to avoid issues on Render
+            n_jobs=1
         )
         
         grid_search.fit(X_train, y_train)
 
-        # Predict on test set
+        # Get the best model
         best_model = grid_search.best_estimator_
         y_pred = best_model.predict(X_test) 
 
-        # Create test results
-        test_results = X_test.copy()
-        test_results['true_riskIndex'] = y_test
-        test_results['predicted_riskIndex'] = y_pred
-
+        # Calculate metrics
         result_predict_test = { 
             "TestRMSE": np.sqrt(mean_squared_error(y_test, y_pred)),
             "Test_MAE": mean_absolute_error(y_test, y_pred),
             "Test_r_score": r2_score(y_test, y_pred)
         }
 
+        # SAVE MODEL TO FIREBASE
+        model_saved = False
+        model_path = None
+        if save_model:
+            model_path = save_model_to_firebase(best_model, sensor_ID)
+            if model_path:
+                # Save metadata
+                save_model_metadata(
+                    sensor_ID, 
+                    result_predict_test, 
+                    list(features.columns), 
+                    grid_search.best_params_
+                )
+                model_saved = True
+
+        # Create test results
+        test_results = X_test.copy()
+        test_results['true_riskIndex'] = y_test
+        test_results['predicted_riskIndex'] = y_pred
+
         result = {
             "best_params": grid_search.best_params_,
             "RMSE": -grid_search.best_score_,
             "test_result": result_predict_test,
             "predicted_sample": test_results.head().to_dict('records'),
+            "model_saved": model_saved,
+            "model_path": model_path,
             "data_info": {
                 "total_records": len(df),
                 "training_records": len(X_train),
                 "test_records": len(X_test),
-                "date_range_used": f"{df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}" if not df.empty and 'timestamp' in df.columns else "Sample data",
+                "date_range_used": f"{df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}" if not df.empty and 'timestamp' in df.columns else "Unknown",
                 "selected_range": range,
                 "features_used": list(features.columns), 
             }
@@ -298,7 +480,76 @@ def xgboost_model(sensor_ID, range="1month"):
     except Exception as e:
         logger.error(f"Error in xgboost_model for {sensor_ID}: {e}")
         return {"error": f"Model training failed: {str(e)}"}
- 
+        
+def predict_risk_index(sensor_ID, sensor_data):
+    """
+    Predict risk index using pre-trained model
+    """
+    try:
+        # Load model from Firebase
+        model = load_model_from_firebase(sensor_ID)
+        if not model:
+            return {
+                "error": f"No trained model found for sensor {sensor_ID}",
+                "suggestion": "Train a model first using /api/xgboost endpoint"
+            }
+        
+        # Load model metadata to get feature columns
+        metadata = load_model_metadata(sensor_ID)
+        if not metadata:
+            return {"error": "Model metadata not found"}
+        
+        feature_columns = metadata.get('feature_columns', [])
+        
+        # Create input DataFrame
+        input_df = pd.DataFrame([sensor_data])
+        
+        # Ensure all required features are present
+        for col in feature_columns:
+            if col not in input_df.columns:
+                return {"error": f"Missing required feature: {col}"}
+        
+        # Reorder columns to match training data
+        input_df = input_df[feature_columns]
+        
+        # Make prediction
+        predicted_risk = model.predict(input_df)[0]
+        
+        return {
+            "sensor_ID": sensor_ID,
+            "predicted_risk_index": float(predicted_risk),
+            "timestamp": datetime.now().isoformat(),
+            "features_used": feature_columns,
+            "input_data": sensor_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in prediction for sensor {sensor_ID}: {e}")
+        return {"error": f"Prediction failed: {str(e)}"}
+
+def convert_risk_to_aqi(risk_index):
+    """
+    Convert risk index to AQI (0-500 scale)
+    Adjust based on your domain knowledge
+    """
+    # Example conversion - calibrate based on your data
+    aqi = risk_index * 50  # Adjust multiplier as needed
+    return min(max(aqi, 0), 500)  # Cap between 0-500
+
+def calculate_risk_category(risk_index):
+    """
+    Categorize risk and provide recommendations
+    """
+    if risk_index <= 2:
+        return 1, "Low", "Good", "Air quality is good. No action required."
+    elif risk_index <= 4:
+        return 2, "Moderate", "Moderate", "Air quality is acceptable. Sensitive individuals should consider reducing prolonged outdoor exposure."
+    elif risk_index <= 6:
+        return 3, "High", "Unhealthy for Sensitive Groups", "Air quality is poor. Reduce outdoor activities. Consider improving ventilation."
+    elif risk_index <= 8:
+        return 4, "Very High", "Unhealthy", "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available."
+    else:
+        return 5, "Hazardous", "Very Unhealthy", "Air quality is hazardous. Avoid outdoor activities. Evacuate if necessary."
 # ---------------------------------------------------
 # Visualization Functions (Return Base64 Images)
 # ---------------------------------------------------
@@ -506,11 +757,13 @@ def print_correlation_summary(df, target_col='riskIndex'):
 @app.get("/api/xgboost/{sensor_id}")
 def get_xgboost_model(
     sensor_id: str,
-    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all")
+    range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
+    save_model: bool = Query(True, description="Save trained model to Firebase"),
+    retrain: bool = Query(False, description="Force retrain even if model exists")
 ):
-    """Train XGBoost model for specific sensor"""
+    """Train XGBoost model for specific sensor and optionally save to Firebase"""
     try:
-        result = xgboost_model(sensor_id, range)
+        result = xgboost_model(sensor_id, range, save_model, retrain)
         return result
     except Exception as e:
         logger.error(f"Error in XGBoost endpoint for {sensor_id}: {e}")
@@ -621,7 +874,151 @@ def check_sensor_credential(
     except Exception as e:
         logger.error(f"Error fetching sensor locations for {sensor_ID}: {e}")
         return False
+###
+## PRedict 
+## 
+
+@app.get("/api/predict/{sensor_id}")
+def predict_risk_endpoint(
+    sensor_id: str,
+    methane: float = Query(..., description="Methane level"),
+    co2: float = Query(..., description="CO2 level"),
+    ammonia: float = Query(..., description="Ammonia level"),
+    humidity: float = Query(..., description="Humidity percentage"),
+    temperature: float = Query(..., description="Temperature in Celsius")
+):
+    """Predict risk index using pre-trained model"""
+    try:
+        sensor_data = {
+            "methane": methane,
+            "co2": co2,
+            "ammonia": ammonia,
+            "humidity": humidity,
+            "temperature": temperature
+        }
         
+        prediction_result = predict_risk_index(sensor_id, sensor_data)
+        
+        if "error" in prediction_result:
+            raise HTTPException(status_code=404, detail=prediction_result["error"])
+        
+        # Enhance with AQI and risk category
+        risk_index = prediction_result["predicted_risk_index"]
+        aqi = convert_risk_to_aqi(risk_index)
+        risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
+        
+        enhanced_result = {
+            **prediction_result,
+            "aqi": aqi,
+            "aqi_category": aqi_category,
+            "risk_level": risk_level,
+            "risk_label": risk_label,
+            "recommendation": recommendation
+        }
+        
+        return enhanced_result
+        
+    except Exception as e:
+        logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/api/predict/{sensor_id}")
+def predict_risk_bulk(
+    sensor_id: str,
+    sensor_readings: List[Dict[str, float]]
+):
+    """Bulk prediction for multiple sensor readings"""
+    try:
+        results = []
+        for reading in sensor_readings:
+            result = predict_risk_index(sensor_id, reading)
+            if "error" not in result:
+                risk_index = result["predicted_risk_index"]
+                aqi = convert_risk_to_aqi(risk_index)
+                risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
+                
+                enhanced_result = {
+                    **result,
+                    "aqi": aqi,
+                    "aqi_category": aqi_category,
+                    "risk_level": risk_level,
+                    "risk_label": risk_label,
+                    "recommendation": recommendation
+                }
+                results.append(enhanced_result)
+            else:
+                results.append({"error": result["error"], "input_data": reading})
+        
+        return {
+            "sensor_ID": sensor_id,
+            "predictions": results,
+            "total_predictions": len(results),
+            "successful_predictions": len([r for r in results if "error" not in r])
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in bulk prediction for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Bulk prediction failed: {str(e)}")
+
+@app.get("/api/model/status/{sensor_id}")
+def get_model_status(sensor_id: str):
+    """Check if a trained model exists and get its status"""
+    try:
+        model_exists = model_exists_in_firebase(sensor_id)
+        metadata = load_model_metadata(sensor_id) if model_exists else None
+        
+        return {
+            "sensor_ID": sensor_id,
+            "model_exists": model_exists,
+            "last_trained": metadata.get('last_trained') if metadata else None,
+            "training_metrics": metadata.get('training_metrics') if metadata else None,
+            "feature_columns": metadata.get('feature_columns') if metadata else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking model status for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Model status check failed: {str(e)}")
+
+@app.delete("/api/model/{sensor_id}")
+def delete_model_endpoint(sensor_id: str):
+    """Delete trained model from Firebase"""
+    try:
+        success = delete_model_from_firebase(sensor_id)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Model for sensor {sensor_id} deleted successfully"
+            }
+        else:
+            raise HTTPException(status_code=404, detail=f"Failed to delete model or model not found for sensor {sensor_id}")
+            
+    except Exception as e:
+        logger.error(f"Error deleting model for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Model deletion failed: {str(e)}")
+
+@app.post("/api/model/retrain/{sensor_id}")
+def retrain_model(
+    sensor_id: str,
+    range: str = Query("1month", description="Date range for retraining")
+):
+    """Force retrain model and save to Firebase"""
+    try:
+        result = xgboost_model(sensor_id, range, save_model=True, retrain=True)
+        
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        return {
+            "status": "success",
+            "message": f"Model retrained and saved for sensor {sensor_id}",
+            "training_result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retraining model for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Model retraining failed: {str(e)}")
+ 
 # ---------------------------------------------------
 # Debug and Health Endpoints
 # ---------------------------------------------------
@@ -790,3 +1187,12 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    
+## Train and Save Model:
+# GET /api/xgboost/SENSOR_123?range=1month&save_model=true
+# Fast Prediction:
+# GET /api/predict/SENSOR_123?methane=45.2&co2=420.5&ammonia=12.8&humidity=65.2&temperature=25.8
+# Force Retrain:
+# POST /api/model/retrain/SENSOR_123?range=1month
+   
