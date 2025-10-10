@@ -587,7 +587,41 @@ def get_correlation_heatmap(
     except Exception as e:
         logger.error(f"Error in correlation heatmap for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Heatmap generation failed: {str(e)}")
+@app.get("/api/verify_sensor/{sensor_id}")
+def check_sensor_credential(
+    sensor_id: str,
+    apiuser: str,
+    apipassword: str,
+):
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot fetch data")
+            return False       
+      
+        ref = db.reference(f'/sensorLocations')
+        data = ref.get()
+        result = False
 
+        if data:
+            # Iterate through all sensor entries
+            for key, sensor_data in data.items():
+                # Check if this sensor matches the sensor_id
+                if sensor_data.get('sensorID') == sensor_id:
+                    # Check credentials
+                    if (sensor_data.get('APIUserID') == apiuser and 
+                        sensor_data.get('APIUserPass') == apipassword):
+                        result = True
+                        break  # Found matching sensor with correct credentials
+                    else:
+                        result = False  # Sensor exists but wrong credentials
+                        break
+
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error fetching sensor locations for {sensor_ID}: {e}")
+        return False
+        
 # ---------------------------------------------------
 # Debug and Health Endpoints
 # ---------------------------------------------------
