@@ -1018,7 +1018,58 @@ def retrain_model(
     except Exception as e:
         logger.error(f"Error retraining model for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Model retraining failed: {str(e)}")
- 
+
+@app.get("/api/sensor_readings/{sensor_id}")
+def get_latest_sensor_reading(
+    sensor_id: str
+):
+    """
+    Get the most recent sensor reading for a specific sensor
+    """
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot fetch data")
+            return {"error": "Firebase not initialized", "sensor_id": sensor_id}
+        
+        ref = db.reference(f'/sensorReadings')
+        data = ref.get()
+        
+        if not data:
+            return {"error": "No sensor readings data available", "sensor_id": sensor_id}
+        
+        latest_reading = None
+        latest_timestamp = None
+        
+        # Find the most recent reading for this sensor
+        for key, sensor_data in data.items():
+            if sensor_data.get('sensorID') == sensor_id:
+                current_timestamp = sensor_data.get('timestamp')
+                
+                # If this is the first matching reading or it's more recent
+                if not latest_reading or (current_timestamp and current_timestamp > latest_timestamp):
+                    latest_reading = {
+                        'timestamp': current_timestamp,
+                        'methane': sensor_data.get('methane'),
+                        'co2': sensor_data.get('co2'),
+                        'ammonia': sensor_data.get('ammonia'),
+                        'humidity': sensor_data.get('humidity'),
+                        'temperature': sensor_data.get('temperature'),
+                        'sensorID': sensor_data.get('sensorID')
+                    }
+                    latest_timestamp = current_timestamp
+        
+        if not latest_reading:
+            return {"error": f"No readings found for sensor {sensor_id}", "sensor_id": sensor_id}
+        
+        return {
+            "sensor_id": sensor_id,
+            "latest_reading": latest_reading,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching sensor readings for {sensor_id}: {str(e)}")
+        return {"error": f"Failed to fetch sensor readings: {str(e)}", "sensor_id": sensor_id}
 # ---------------------------------------------------
 # Debug and Health Endpoints
 # ---------------------------------------------------
