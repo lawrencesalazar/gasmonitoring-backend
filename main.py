@@ -572,7 +572,7 @@ def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
         
         result = {
             "sensor_ID": sensor_ID,
-            "risk_index": float(risk_value),
+            "predicted_risk_index": float(risk_value),
             "aqi": float(aqi),
             "risk_level": risk_level,
             "risk_label": risk_label,
