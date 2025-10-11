@@ -480,62 +480,126 @@ def xgboost_model(
     except Exception as e:
         logger.error(f"Error in xgboost_model for {sensor_ID}: {e}")
         return {"error": f"Model training failed: {str(e)}"}
-        
-def predict_risk_index(sensor_ID, sensor_data):
+
+def calculate_regulatory_risk(methane, co2, ammonia, humidity, temperature):
     """
-    Predict risk index using pre-trained model
+    Risk index based on regulatory exposure limits
+    """
+    # OSHA and NIOSH exposure limits (adjust based on your region)
+    exposure_limits = {
+        'methane': {'stel': 1000, 'twa': 1000, 'idlh': 50000},  # Short-term, Time-weighted, Immediately Dangerous
+        'co2': {'stel': 30000, 'twa': 5000, 'idlh': 40000},
+        'ammonia': {'stel': 35, 'twa': 25, 'idlh': 500}
+    }
+    
+    risks = []
+    
+    # Calculate compliance risk for each gas
+    for gas, concentration in [('methane', methane), ('co2', co2), ('ammonia', ammonia)]:
+        limits = exposure_limits[gas]
+        
+        if concentration <= limits['twa']:
+            risk = 0  # Within safe limits
+        elif concentration <= limits['stel']:
+            risk = 3  # Exceeded TWA but within STEL
+        elif concentration <= limits['idlh']:
+            risk = 7  # Exceeded STEL but below IDLH
+        else:
+            risk = 10 # Immediately dangerous
+            
+        risks.append(risk)
+    
+    # Consider environmental factors
+    env_risk = 0
+    if humidity > 85:  # High humidity can affect gas dispersion
+        env_risk += 1
+    if temperature > 35:  # High temperature increases volatility
+        env_risk += 1
+        
+    # Overall risk (maximum individual risk + environmental factors)
+    overall_risk = max(risks) + env_risk
+    
+    return min(overall_risk, 10)
+    
+def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
+    """
+    Predict risk index using either regulatory calculation or pre-trained model
     """
     try:
-        # Load model from Firebase
-        model = load_model_from_firebase(sensor_ID)
-        if not model:
-            return {
-                "error": f"No trained model found for sensor {sensor_ID}",
-                "suggestion": "Train a model first using /api/xgboost endpoint"
-            }
+        if use_regulatory_calculation:
+            # Use regulatory risk calculation
+            required_params = ['methane', 'co2', 'ammonia', 'humidity', 'temperature']
+            
+            for param in required_params:
+                if param not in sensor_data:
+                    return {"error": f"Missing required parameter: {param}"}
+            
+            methane = sensor_data['methane']
+            co2 = sensor_data['co2']
+            ammonia = sensor_data['ammonia']
+            humidity = sensor_data['humidity']
+            temperature = sensor_data['temperature']
+            
+            calculated_risk = calculate_regulatory_risk(methane, co2, ammonia, humidity, temperature)
+            risk_value = calculated_risk
+            
+        else:
+            # Use ML model prediction (original code)
+            model = load_model_from_firebase(sensor_ID)
+            if not model:
+                return {
+                    "error": f"No trained model found for sensor {sensor_ID}",
+                    "suggestion": "Train a model first using /api/xgboost endpoint"
+                }
+            
+            metadata = load_model_metadata(sensor_ID)
+            if not metadata:
+                return {"error": "Model metadata not found"}
+            
+            feature_columns = metadata.get('feature_columns', [])
+            input_df = pd.DataFrame([sensor_data])
+            
+            for col in feature_columns:
+                if col not in input_df.columns:
+                    return {"error": f"Missing required feature: {col}"}
+            
+            input_df = input_df[feature_columns]
+            risk_value = model.predict(input_df)[0]
         
-        # Load model metadata to get feature columns
-        metadata = load_model_metadata(sensor_ID)
-        if not metadata:
-            return {"error": "Model metadata not found"}
+        # Convert to AQI and get category
+        aqi = convert_risk_to_aqi(risk_value)
+        risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_value)
         
-        feature_columns = metadata.get('feature_columns', [])
-        
-        # Create input DataFrame
-        input_df = pd.DataFrame([sensor_data])
-        
-        # Ensure all required features are present
-        for col in feature_columns:
-            if col not in input_df.columns:
-                return {"error": f"Missing required feature: {col}"}
-        
-        # Reorder columns to match training data
-        input_df = input_df[feature_columns]
-        
-        # Make prediction
-        predicted_risk = model.predict(input_df)[0]
-        
-        return {
+        result = {
             "sensor_ID": sensor_ID,
-            "predicted_risk_index": float(predicted_risk),
+            "risk_index": float(risk_value),
+            "aqi": float(aqi),
+            "risk_level": risk_level,
+            "risk_label": risk_label,
+            "aqi_category": aqi_category,
+            "recommendation": recommendation,
             "timestamp": datetime.now().isoformat(),
-            "features_used": feature_columns,
-            "input_data": sensor_data
+            "calculation_method": "regulatory_calculation" if use_regulatory_calculation else "ml_model"
         }
         
+        if not use_regulatory_calculation:
+            result["features_used"] = feature_columns
+            
+        result["input_data"] = sensor_data
+        
+        return result
+        
     except Exception as e:
-        logger.error(f"Error in prediction for sensor {sensor_ID}: {e}")
-        return {"error": f"Prediction failed: {str(e)}"}
-
+        logger.error(f"Error in risk prediction for sensor {sensor_ID}: {e}")
+        return {"error": f"Risk prediction failed: {str(e)}"}
+        
 def convert_risk_to_aqi(risk_index):
     """
     Piecewise Linear Scaling
-    Convert risk index to AQI (0-500 scale)
-    Adjust based on your domain knowledge
+    Convert risk index to AQI (0-500 scale) 
     """
     
-    # AQI categories and their corresponding risk index ranges
-    # Adjust these thresholds based on your domain knowledge
+    # AQI categories and their corresponding risk index ranges 
     aqi_thresholds = [
         (0, 50, 0, 2),      # Good: 0-50 AQI, 0-2 risk
         (51, 100, 2.1, 4),  # Moderate: 51-100 AQI, 2.1-4 risk
