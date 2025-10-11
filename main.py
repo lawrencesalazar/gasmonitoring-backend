@@ -499,13 +499,13 @@ def calculate_regulatory_risk(methane, co2, ammonia, humidity, temperature):
         limits = exposure_limits[gas]
         
         if concentration <= limits['twa']:
-            risk = 0  # Within safe limits
+            risk = 1  # Within safe limits
         elif concentration <= limits['stel']:
             risk = 3  # Exceeded TWA but within STEL
         elif concentration <= limits['idlh']:
-            risk = 7  # Exceeded STEL but below IDLH
+            risk = 6  # Exceeded STEL but below IDLH
         else:
-            risk = 10 # Immediately dangerous
+            risk = 9 # Immediately dangerous
             
         risks.append(risk)
     
@@ -581,7 +581,13 @@ def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
             "timestamp": datetime.now().isoformat(),
             "calculation_method": "regulatory_calculation" if use_regulatory_calculation else "ml_model"
         }
-        
+        # return {
+        # "sensor_ID": sensor_ID,
+        # "predicted_risk_index": float(predicted_risk),
+        # "timestamp": datetime.now().isoformat(),
+        # "features_used": feature_columns,
+        # "input_data": sensor_data
+        # }
         if not use_regulatory_calculation:
             result["features_used"] = feature_columns
             
@@ -600,12 +606,11 @@ def convert_risk_to_aqi(risk_index):
     """
     
     # AQI categories and their corresponding risk index ranges 
-    aqi_thresholds = [
-        (0, 50, 0, 2),      # Good: 0-50 AQI, 0-2 risk
-        (51, 100, 2.1, 4),  # Moderate: 51-100 AQI, 2.1-4 risk
-        (101, 150, 4.1, 6), # Unhealthy for Sensitive: 101-150 AQI, 4.1-6 risk
-        (151, 200, 6.1, 8), # Unhealthy: 151-200 AQI, 6.1-8 risk
-        (201, 500, 8.1, 10) # Very Unhealthy/Hazardous: 201-500 AQI, 8.1-10 risk
+      aqi_thresholds = [
+        (0, 50, 0, 3),      # Good: 0-50 AQI, 0-3 risk
+        (51, 100, 3.1, 7),  # Moderate: 51-100 AQI, 3.1-7 risk  
+        (101, 150, 7.1, 9), # Unhealthy for Sensitive: 101-150 AQI, 7.1-9 risk
+        (151, 500, 9.1, 10) # Unhealthy/Very Unhealthy: 151-500 AQI, 9.1-10 risk
     ]
     
     # aqi = risk_index * 50  # Adjust multiplier as needed
