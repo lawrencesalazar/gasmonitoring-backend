@@ -622,8 +622,8 @@ def convert_risk_to_aqi(risk_index):
             return min(max(aqi, 0), 500)
     
     # Fallback: cap at extremes
-    if risk_index < 0:
-        return 0
+    if risk_index < 1:
+        return 10
     else:
         return 500 
 
