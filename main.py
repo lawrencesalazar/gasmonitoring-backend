@@ -35,12 +35,12 @@ from xgboost import XGBRegressor
 from io import BytesIO
 import shap
 from scipy import stats
-
+ 
 import smtplib
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
-from email.mime.application import MimeApplication
-import threading 
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import threading
 
 ## email config
 class EmailConfig:
@@ -298,7 +298,7 @@ def send_risk_alert(sensor_id: str, risk_data: Dict[str, Any], email_config: Ema
         # Create message
         subject = f"🚨 GAS MONITORING ALERT - Sensor {sensor_id} - {risk_data['risk_label']}"
         
-        # HTML email content (same as before)
+        # HTML email content
         html_content = f"""
         <html>
         <head>
@@ -352,14 +352,14 @@ def send_risk_alert(sensor_id: str, risk_data: Dict[str, Any], email_config: Ema
         </html>
         """
 
-        # Create message
-        msg = MimeMultipart()
+        # ✅ FIXED: Use correct class names
+        msg = MIMEMultipart()  # Was MimeMultipart
         msg['Subject'] = subject
         msg['From'] = email_config.sender_email
         msg['To'] = ", ".join(recipients)
         
-        # Add HTML content
-        html_part = MimeText(html_content, 'html')
+        # ✅ FIXED: Use correct class names
+        html_part = MIMEText(html_content, 'html')  # Was MimeText
         msg.attach(html_part)
 
         # Send email
@@ -1341,7 +1341,7 @@ def check_sensor_credential(
         return result
         
     except Exception as e:
-        logger.error(f"Error fetching sensor locations for {sensor_ID}: {e}")
+        logger.error(f"Error fetching sensor locations for {sensor_id}: {e}")
         return False
 
 @app.get("/api/feature_importance/{sensor_id}")

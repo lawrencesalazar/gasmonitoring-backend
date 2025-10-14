@@ -11,7 +11,3 @@ shap
 seaborn
 psutil
 scipy
-smtplib
-MimeText
-MimeMultipart
-MimeApplication
