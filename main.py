@@ -36,6 +36,111 @@ from io import BytesIO
 import shap
 from scipy import stats
 
+import smtplib
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+from email.mime.application import MimeApplication
+import threading 
+
+## email config
+class EmailConfig:
+    """Email configuration for alerts with Firebase integration"""
+    def __init__(self):
+        self.smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self.sender_email = os.getenv("SENDER_EMAIL", "")
+        self.sender_password = os.getenv("SENDER_PASSWORD", "")
+        self.enable_ssl = os.getenv("SMTP_SSL", "False").lower() == "true"
+        self._recipient_cache = {}  # Cache for sensor-specific recipients
+        self._cache_time = {}  # Cache timestamp
+        
+    def is_configured(self):
+        """Check if basic email configuration is complete"""
+        return all([self.sender_email, self.sender_password])
+    
+    def get_recipients_for_sensor(self, sensor_id: str) -> List[str]:
+        """
+        Fetch recipient emails from Firebase for a specific sensor
+        Structure in Firebase:
+        /alert_recipients/{sensor_id}/emails: ["email1@com", "email2@com"]
+        OR
+        /alert_recipients/global/emails: ["email1@com", "email2@com"] (fallback)
+        """
+        try:
+            # Check cache first (cache for 5 minutes)
+            current_time = datetime.now()
+            if (sensor_id in self._recipient_cache and 
+                sensor_id in self._cache_time and
+                (current_time - self._cache_time[sensor_id]).total_seconds() < 300):
+                return self._recipient_cache[sensor_id]
+            
+            if not firebase_db:
+                logger.error("Firebase not initialized - cannot fetch recipients")
+                return []
+            
+            recipients = []
+            
+            # First try: Get sensor-specific recipients
+            sensor_ref = db.reference(f'/alert_recipients/{sensor_id}/emails')
+            sensor_emails = sensor_ref.get()
+            
+            if sensor_emails:
+                recipients = sensor_emails if isinstance(sensor_emails, list) else [sensor_emails]
+                logger.info(f"Found {len(recipients)} sensor-specific recipients for {sensor_id}")
+            else:
+                # Second try: Get global recipients
+                global_ref = db.reference('/alert_recipients/global/emails')
+                global_emails = global_ref.get()
+                
+                if global_emails:
+                    recipients = global_emails if isinstance(global_emails, list) else [global_emails]
+                    logger.info(f"Using {len(recipients)} global recipients for {sensor_id}")
+                else:
+                    # Third try: Get from sensorLocations (backward compatibility)
+                    locations_ref = db.reference('/sensorLocations')
+                    locations_data = locations_ref.get()
+                    
+                    if locations_data:
+                        for key, sensor_data in locations_data.items():
+                            if sensor_data.get('sensorID') == sensor_id:
+                                # Check for email fields in sensor location data
+                                if 'alertEmail' in sensor_data:
+                                    recipients = [sensor_data['alertEmail']] if sensor_data['alertEmail'] else []
+                                elif 'contactEmail' in sensor_data:
+                                    recipients = [sensor_data['contactEmail']] if sensor_data['contactEmail'] else []
+                                break
+                    
+                    if recipients:
+                        logger.info(f"Found {len(recipients)} recipients in sensorLocations for {sensor_id}")
+            
+            # Validate email format
+            valid_recipients = []
+            for email in recipients:
+                if email and isinstance(email, str) and '@' in email:
+                    valid_recipients.append(email.strip())
+            
+            # Update cache
+            self._recipient_cache[sensor_id] = valid_recipients
+            self._cache_time[sensor_id] = current_time
+            
+            logger.info(f"Final recipient list for {sensor_id}: {valid_recipients}")
+            return valid_recipients
+            
+        except Exception as e:
+            logger.error(f"Error fetching recipients for sensor {sensor_id}: {e}")
+            return []
+    
+    def clear_cache(self, sensor_id: str = None):
+        """Clear recipient cache"""
+        if sensor_id:
+            self._recipient_cache.pop(sensor_id, None)
+            self._cache_time.pop(sensor_id, None)
+        else:
+            self._recipient_cache.clear()
+            self._cache_time.clear()
+## end email config
+
+
 # Configure logging FIRST
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,10 +276,125 @@ def initialize_firebase():
         
         firebase_db = None
         return False
+##
+# EMAIL
+#
+def send_risk_alert(sensor_id: str, risk_data: Dict[str, Any], email_config: EmailConfig):
+    """
+    Send email alert for high-risk and critical predictions
+    """
+    try:
+        if not email_config.is_configured():
+            logger.warning("Email not configured - skipping alert")
+            return False
+
+        # Get recipients for this specific sensor
+        recipients = email_config.get_recipients_for_sensor(sensor_id)
+        
+        if not recipients:
+            logger.warning(f"No recipients found for sensor {sensor_id} - skipping alert")
+            return False
+
+        # Create message
+        subject = f"🚨 GAS MONITORING ALERT - Sensor {sensor_id} - {risk_data['risk_label']}"
+        
+        # HTML email content (same as before)
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .alert-box {{ 
+                    padding: 20px; 
+                    border-radius: 10px; 
+                    margin: 10px 0;
+                    {'background: #ffebee; color: #c62828; border: 2px solid #f44336;' if risk_data['risk_level'] >= 4 else 'background: #fff3e0; color: #ef6c00; border: 2px solid #ff9800;'}
+                }}
+                .risk-level {{ font-size: 24px; font-weight: bold; }}
+                .sensor-info {{ background: #f5f5f5; padding: 15px; border-radius: 5px; }}
+                .values {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 15px 0; }}
+                .value-item {{ padding: 8px; background: white; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="alert-box">
+                <div class="risk-level">Risk Level: {risk_data['risk_label']}</div>
+                <p><strong>Sensor ID:</strong> {sensor_id}</p>
+                <p><strong>Time:</strong> {risk_data['timestamp']}</p>
+            </div>
+            
+            <div class="sensor-info">
+                <h3>📊 Sensor Readings</h3>
+                <div class="values">
+                    <div class="value-item"><strong>Risk Index:</strong> {risk_data['predicted_risk_index']:.2f}</div>
+                    <div class="value-item"><strong>AQI:</strong> {risk_data['aqi']:.1f}</div>
+                    <div class="value-item"><strong>AQI Category:</strong> {risk_data['aqi_category']}</div>
+                    <div class="value-item"><strong>Methane:</strong> {risk_data['input_data']['methane']}</div>
+                    <div class="value-item"><strong>CO2:</strong> {risk_data['input_data']['co2']}</div>
+                    <div class="value-item"><strong>Ammonia:</strong> {risk_data['input_data']['ammonia']}</div>
+                    <div class="value-item"><strong>Humidity:</strong> {risk_data['input_data']['humidity']}%</div>
+                    <div class="value-item"><strong>Temperature:</strong> {risk_data['input_data']['temperature']}°C</div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 20px; padding: 15px; background: #e3f2fd; border-radius: 5px;">
+                <h3>💡 Recommended Actions</h3>
+                <p>{risk_data['recommendation']}</p>
+                <p><strong>Calculation Method:</strong> {risk_data.get('calculation_method', 'Unknown')}</p>
+            </div>
+            
+            <hr>
+            <p style="color: #666; font-size: 12px;">
+                This is an automated alert from the Gas Monitoring System. 
+                Please take appropriate safety measures immediately.
+            </p>
+        </body>
+        </html>
+        """
+
+        # Create message
+        msg = MimeMultipart()
+        msg['Subject'] = subject
+        msg['From'] = email_config.sender_email
+        msg['To'] = ", ".join(recipients)
+        
+        # Add HTML content
+        html_part = MimeText(html_content, 'html')
+        msg.attach(html_part)
+
+        # Send email
+        if email_config.enable_ssl:
+            server = smtplib.SMTP_SSL(email_config.smtp_server, email_config.smtp_port)
+        else:
+            server = smtplib.SMTP(email_config.smtp_server, email_config.smtp_port)
+            server.starttls()
+        
+        server.login(email_config.sender_email, email_config.sender_password)
+        server.send_message(msg)
+        server.quit()
+        
+        logger.info(f"Risk alert email sent for sensor {sensor_id} to {len(recipients)} recipients - Risk level: {risk_data['risk_label']}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send email alert: {e}")
+        return False
+        
+def send_alert_async(sensor_id: str, risk_data: Dict[str, Any], email_config: EmailConfig):
+    """
+    Send email alert asynchronously to avoid blocking the API response
+    """
+    thread = threading.Thread(
+        target=send_risk_alert, 
+        args=(sensor_id, risk_data, email_config)
+    )
+    thread.daemon = True
+    thread.start()
 
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
 # ---------------------------------------------------
+
 def fetch_history(sensor_ID, range="1month"):
     """Fetch sensor history data from Firebase with fallback"""
     try:
@@ -581,6 +801,25 @@ def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
             "timestamp": datetime.now().isoformat(),
             "calculation_method": "regulatory_calculation" if use_regulatory_calculation else "ml_model"
         }
+            
+        # 🔥 NEW: Send email alert for high risk and critical levels
+        if risk_level >= 4:  # High risk (level 4) and Critical (level 5)
+            email_config = EmailConfig()
+            if email_config.is_configured():
+                recipients = email_config.get_recipients_for_sensor(sensor_ID)
+                if recipients:
+                    send_alert_async(sensor_ID, result, email_config)
+                    result["alert_sent"] = True
+                    result["alert_recipients"] = recipients
+                    result["recipient_count"] = len(recipients)
+                else:
+                    result["alert_sent"] = False
+                    result["alert_reason"] = "No recipients found for this sensor"
+            else:
+                result["alert_sent"] = False
+                result["alert_reason"] = "Email not configured"
+         
+        
         # return {
         # "sensor_ID": sensor_ID,
         # "predicted_risk_index": float(predicted_risk),
@@ -1206,6 +1445,9 @@ def predict_risk_bulk(
     """Bulk prediction for multiple sensor readings"""
     try:
         results = []
+        alert_count = 0
+        email_config = EmailConfig()
+        
         for reading in sensor_readings:
             result = predict_risk_index(sensor_id, reading)
             if "error" not in result:
@@ -1221,6 +1463,11 @@ def predict_risk_bulk(
                     "risk_label": risk_label,
                     "recommendation": recommendation
                 }
+                
+                # Check if alert was sent
+                if enhanced_result.get("alert_sent"):
+                    alert_count += 1
+                    
                 results.append(enhanced_result)
             else:
                 results.append({"error": result["error"], "input_data": reading})
@@ -1229,13 +1476,15 @@ def predict_risk_bulk(
             "sensor_ID": sensor_id,
             "predictions": results,
             "total_predictions": len(results),
-            "successful_predictions": len([r for r in results if "error" not in r])
+            "successful_predictions": len([r for r in results if "error" not in r]),
+            "alerts_triggered": alert_count,
+            "email_alerts_enabled": email_config.is_configured()
         }
         
     except Exception as e:
         logger.error(f"Error in bulk prediction for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Bulk prediction failed: {str(e)}")
-
+        
 @app.get("/api/model/status/{sensor_id}")
 def get_model_status(sensor_id: str):
     """Check if a trained model exists and get its status"""
@@ -1509,7 +1758,161 @@ async def startup_event():
         
     except Exception as e:
         logger.error(f"Startup error: {e}")
+ 
+#### EMAIL ENDPOINTS
+@app.post("/api/test-email-alert/{sensor_id}")
+def test_email_alert(sensor_id: str):
+    """Test email alert functionality for a specific sensor"""
+    try:
+        email_config = EmailConfig()
+        
+        if not email_config.is_configured():
+            return {"error": "Email not configured - check SMTP environment variables"}
+        
+        recipients = email_config.get_recipients_for_sensor(sensor_id)
+        if not recipients:
+            return {"error": f"No recipients found for sensor {sensor_id}"}
 
+        # Create test risk data
+        test_risk_data = {
+            "predicted_risk_index": 8.5,
+            "aqi": 280.5,
+            "risk_level": 4,
+            "risk_label": "Very High",
+            "aqi_category": "Unhealthy",
+            "recommendation": "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available.",
+            "timestamp": datetime.now().isoformat(),
+            "calculation_method": "test",
+            "input_data": {
+                "methane": 45.2,
+                "co2": 420.5,
+                "ammonia": 12.8,
+                "humidity": 65.2,
+                "temperature": 25.8
+            }
+        }
+        
+        success = send_risk_alert(sensor_id, test_risk_data, email_config)
+        
+        return {
+            "status": "success" if success else "failed",
+            "message": "Test email sent" if success else "Failed to send test email",
+            "sensor_id": sensor_id,
+            "recipients": recipients,
+            "email_config": {
+                "smtp_server": email_config.smtp_server,
+                "sender_email": email_config.sender_email,
+                "recipient_count": len(recipients),
+                "configured": email_config.is_configured()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Email test failed for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Email test failed: {str(e)}")
+        
+@app.get("/api/alert-recipients/{sensor_id}")
+def get_alert_recipients(sensor_id: str):
+    """Get current alert recipients for a sensor"""
+    try:
+        email_config = EmailConfig()
+        recipients = email_config.get_recipients_for_sensor(sensor_id)
+        
+        return {
+            "sensor_id": sensor_id,
+            "recipients": recipients,
+            "recipient_count": len(recipients),
+            "cache_status": "cached" if sensor_id in email_config._recipient_cache else "fresh"
+        }
+    except Exception as e:
+        logger.error(f"Error getting recipients for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get recipients: {str(e)}")
+
+@app.post("/api/alert-recipients/{sensor_id}")
+def set_alert_recipients(
+    sensor_id: str,
+    recipients: List[str],
+    recipient_type: str = Query("sensor", description="sensor or global")
+):
+    """Set alert recipients for a sensor or globally"""
+    try:
+        if not firebase_db:
+            raise HTTPException(status_code=500, detail="Firebase not initialized")
+        
+        # Validate emails
+        valid_recipients = []
+        for email in recipients:
+            if email and isinstance(email, str) and '@' in email:
+                valid_recipients.append(email.strip())
+        
+        if not valid_recipients:
+            raise HTTPException(status_code=400, detail="No valid email addresses provided")
+        
+        # Save to Firebase
+        if recipient_type == "global":
+            ref = db.reference('/alert_recipients/global/emails')
+        else:
+            ref = db.reference(f'/alert_recipients/{sensor_id}/emails')
+        
+        ref.set(valid_recipients)
+        
+        # Clear cache
+        email_config = EmailConfig()
+        if recipient_type == "global":
+            email_config.clear_cache()  # Clear all cache
+        else:
+            email_config.clear_cache(sensor_id)
+        
+        logger.info(f"Updated {recipient_type} recipients for {sensor_id}: {valid_recipients}")
+        
+        return {
+            "status": "success",
+            "message": f"Recipients updated for {recipient_type}",
+            "sensor_id": sensor_id,
+            "recipients": valid_recipients,
+            "recipient_count": len(valid_recipients)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error setting recipients for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to set recipients: {str(e)}")
+
+@app.delete("/api/alert-recipients/{sensor_id}")
+def clear_alert_recipients(
+    sensor_id: str,
+    recipient_type: str = Query("sensor", description="sensor or global")
+):
+    """Clear alert recipients for a sensor or globally"""
+    try:
+        if not firebase_db:
+            raise HTTPException(status_code=500, detail="Firebase not initialized")
+        
+        if recipient_type == "global":
+            ref = db.reference('/alert_recipients/global')
+        else:
+            ref = db.reference(f'/alert_recipients/{sensor_id}')
+        
+        ref.delete()
+        
+        # Clear cache
+        email_config = EmailConfig()
+        if recipient_type == "global":
+            email_config.clear_cache()
+        else:
+            email_config.clear_cache(sensor_id)
+        
+        logger.info(f"Cleared {recipient_type} recipients for {sensor_id}")
+        
+        return {
+            "status": "success",
+            "message": f"Recipients cleared for {recipient_type}",
+            "sensor_id": sensor_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Error clearing recipients for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear recipients: {str(e)}")
+        
 # ===========
 # Run the application
 if __name__ == "__main__":
