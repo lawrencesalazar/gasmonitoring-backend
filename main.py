@@ -845,7 +845,7 @@ def convert_risk_to_aqi(risk_index):
     """
     
     # AQI categories and their corresponding risk index ranges 
-      aqi_thresholds = [
+    aqi_thresholds = [
         (0, 50, 0, 3),      # Good: 0-50 AQI, 0-3 risk
         (51, 100, 3.1, 7),  # Moderate: 51-100 AQI, 3.1-7 risk  
         (101, 150, 7.1, 9), # Unhealthy for Sensitive: 101-150 AQI, 7.1-9 risk
