@@ -53,11 +53,35 @@ class EmailConfig:
         self.enable_ssl = os.getenv("SMTP_SSL", "False").lower() == "true"
         self._recipient_cache = {}  # Cache for sensor-specific recipients
         self._cache_time = {}  # Cache timestamp
-        
     def is_configured(self):
-        """Check if basic email configuration is complete"""
-        return all([self.sender_email, self.sender_password])
+        """Check if basic email configuration is complete with detailed logging"""
+        missing = []
+        
+        if not self.sender_email:
+            missing.append("SENDER_EMAIL")
+        if not self.sender_password:
+            missing.append("SENDER_PASSWORD")
+            
+        if missing:
+            logger.warning(f"Email configuration incomplete. Missing: {', '.join(missing)}")
+            logger.warning(f"SENDER_EMAIL set: {bool(self.sender_email)}")
+            logger.warning(f"SENDER_PASSWORD set: {bool(self.sender_password)}")
+            return False
+            
+        logger.info("Email configuration is complete and ready")
+        return True
     
+    def get_config_status(self):
+        """Get detailed configuration status"""
+        return {
+            "smtp_server": self.smtp_server,
+            "smtp_port": self.smtp_port,
+            "sender_email": self.sender_email,
+            "sender_password_set": bool(self.sender_password),
+            "sender_password_length": len(self.sender_password),
+            "enable_ssl": self.enable_ssl,
+            "fully_configured": self.is_configured()
+        }
     def get_recipients_for_sensor(self, sensor_id: str) -> List[str]:
         """
         Fetch recipient emails from Firebase for a specific sensor
@@ -837,6 +861,31 @@ def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
     except Exception as e:
         logger.error(f"Error in risk prediction for sensor {sensor_ID}: {e}")
         return {"error": f"Risk prediction failed: {str(e)}"}
+        
+def generate_sample_data():
+    """Generate sample data for testing when Firebase is unavailable"""
+    try:
+        # Create sample data with realistic ranges
+        np.random.seed(42)
+        n_samples = 100
+        
+        sample_data = {
+            'timestamp': [datetime.now() - timedelta(hours=i) for i in range(n_samples)],
+            'methane': np.random.uniform(0, 100, n_samples),
+            'co2': np.random.uniform(300, 2000, n_samples),
+            'ammonia': np.random.uniform(0, 50, n_samples),
+            'humidity': np.random.uniform(20, 90, n_samples),
+            'temperature': np.random.uniform(15, 40, n_samples),
+            'riskIndex': np.random.uniform(1, 10, n_samples)
+        }
+        
+        df = pd.DataFrame(sample_data)
+        logger.info("Generated sample data for testing")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error generating sample data: {e}")
+        return pd.DataFrame()
         
 def convert_risk_to_aqi(risk_index):
     """
@@ -1913,6 +1962,33 @@ def clear_alert_recipients(
         logger.error(f"Error clearing recipients for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to clear recipients: {str(e)}")
         
+@app.get("/api/debug-email-config")
+def debug_email_config():
+    """Debug email configuration to see what's actually set"""
+    email_config = EmailConfig()
+    
+    # Get actual values (mask passwords)
+    sender_email = os.getenv("SENDER_EMAIL", "NOT_SET")
+    sender_password = os.getenv("SENDER_PASSWORD", "NOT_SET")
+    
+    config_status = {
+        "SMTP_SERVER": os.getenv("SMTP_SERVER", "NOT_SET"),
+        "SMTP_PORT": os.getenv("SMTP_PORT", "NOT_SET"),
+        "SENDER_EMAIL": sender_email,
+        "SENDER_PASSWORD_SET": bool(sender_password and sender_password != "NOT_SET"),
+        "SENDER_PASSWORD_LENGTH": len(sender_password) if sender_password and sender_password != "NOT_SET" else 0,
+        "SMTP_SSL": os.getenv("SMTP_SSL", "NOT_SET"),
+        "is_configured": email_config.is_configured(),
+        "all_env_vars_available": {
+            "SMTP_SERVER": bool(os.getenv("SMTP_SERVER")),
+            "SMTP_PORT": bool(os.getenv("SMTP_PORT")),
+            "SENDER_EMAIL": bool(os.getenv("SENDER_EMAIL")),
+            "SENDER_PASSWORD": bool(os.getenv("SENDER_PASSWORD")),
+            "SMTP_SSL": bool(os.getenv("SMTP_SSL")),
+        }
+    }
+    
+    return config_status        
 # ===========
 # Run the application
 if __name__ == "__main__":
