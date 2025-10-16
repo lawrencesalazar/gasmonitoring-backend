@@ -183,7 +183,6 @@ def initialize_firebase():
 # ---------------------------------------------------
 # Enhanced Email Config with Firebase Integration
 # ---------------------------------------------------
-
 class EmailJSEmailSystem:
     """Email system using EmailJS.com - WORKS ON RENDER"""
     
@@ -274,7 +273,7 @@ class EmailJSEmailSystem:
         return isinstance(email, str) and '@' in email and '.' in email
     
     def send_email(self, subject: str, message: str, recipient_emails: List[str]) -> Dict[str, Any]:
-        """Send email using EmailJS HTTP API - WORKS ON RENDER"""
+        """Send email using EmailJS HTTP API - FIXED RECIPIENT ISSUE"""
         if not self.is_configured():
             return {
                 "success": False, 
@@ -292,11 +291,13 @@ class EmailJSEmailSystem:
             # EmailJS API endpoint
             url = "https://api.emailjs.com/api/v1.0/email/send"
             
-            # Prepare template parameters
+            # FIXED: Ensure proper recipient mapping
             template_params = {
-                "to_email": valid_recipients[0],  # EmailJS sends to one recipient at a time
+                "to_email": valid_recipients[0],  # This goes to lawrence.c.salazar@gmail.com
                 "to_name": "Gas Alert Recipient",
                 "from_name": "GasVanguard Alerts",
+                "from_email": self.sender_email,  # This is gasvanguard@gmail.com (sender)
+                "reply_to": self.sender_email,    # Add reply-to for better deliverability
                 "subject": subject,
                 "message": message,
                 "sensor_id": "Gas Monitoring System",
@@ -318,17 +319,21 @@ class EmailJSEmailSystem:
             # Send email via EmailJS HTTP API
             headers = {
                 "Content-Type": "application/json",
-                "origin": "https://gasmonitoring-backend-evw0.onrender.com"  # Your Render URL
+                "origin": "https://gasmonitoring-backend-evw0.onrender.com"
             }
             
             response = requests.post(url, json=email_data, headers=headers, timeout=30)
             
+            logger.info(f"Attempting to send email from {self.sender_email} to {valid_recipients[0]}")
+            
             if response.status_code == 200:
-                logger.info(f"Email sent via EmailJS to {valid_recipients[0]}")
+                logger.info(f"✅ Email sent via EmailJS from {self.sender_email} to {valid_recipients[0]}")
                 
                 return {
                     "success": True,
-                    "message": f"Email sent to {valid_recipients[0]}",
+                    "message": f"Email sent from {self.sender_email} to {valid_recipients[0]}",
+                    "from_email": self.sender_email,
+                    "to_email": valid_recipients[0],
                     "recipient": valid_recipients[0],
                     "service": "EmailJS",
                     "cost": "FREE (200 emails/month)",
@@ -341,7 +346,12 @@ class EmailJSEmailSystem:
                     "success": False,
                     "error": error_msg,
                     "status_code": response.status_code,
-                    "service": "EmailJS"
+                    "service": "EmailJS",
+                    "debug_info": {
+                        "from_email": self.sender_email,
+                        "to_email": valid_recipients[0],
+                        "template_id": self.template_id
+                    }
                 }
             
         except requests.exceptions.Timeout:
@@ -372,15 +382,17 @@ class EmailJSEmailSystem:
         # Send to each recipient (EmailJS sends one email per call)
         successful_sends = 0
         errors = []
+        sent_to_emails = []
         
         for recipient in recipients:
             result = self.send_email(subject, message, [recipient])
             if result["success"]:
                 successful_sends += 1
-                logger.info(f"Alert sent to {recipient} for sensor {sensor_id}")
+                sent_to_emails.append(recipient)
+                logger.info(f"✅ Alert sent to {recipient} for sensor {sensor_id}")
             else:
                 errors.append(f"{recipient}: {result.get('error', 'Unknown error')}")
-                logger.error(f"Failed to send alert to {recipient}: {result.get('error')}")
+                logger.error(f"❌ Failed to send alert to {recipient}: {result.get('error')}")
         
         if successful_sends > 0:
             return {
@@ -388,6 +400,8 @@ class EmailJSEmailSystem:
                 "message": f"Alerts sent to {successful_sends} recipients",
                 "sensor_id": sensor_id,
                 "recipients_count": successful_sends,
+                "sent_to": sent_to_emails,
+                "from_email": self.sender_email,
                 "total_recipients": len(recipients),
                 "errors": errors if errors else None,
                 "service": "EmailJS",
@@ -398,6 +412,8 @@ class EmailJSEmailSystem:
                 "success": False,
                 "error": f"Failed to send alerts to any recipients: {', '.join(errors)}",
                 "sensor_id": sensor_id,
+                "from_email": self.sender_email,
+                "intended_recipients": recipients,
                 "service": "EmailJS"
             }
     
@@ -444,13 +460,14 @@ class EmailJSEmailSystem:
         
         message += f"""
 
-        RECOMMENDED ACTIONS:
-        {risk_data.get('recommendation', 'Please check the sensor immediately and ensure proper ventilation.')}
+            RECOMMENDED ACTIONS:
+            {risk_data.get('recommendation', 'Please check the sensor immediately and ensure proper ventilation.')}
 
-        ---
-        Gas Monitoring System Alert
-        Sent via EmailJS API | Service: FREE | Works on Render: ✅
-        """
+            ---
+            Gas Monitoring System Alert
+            From: {self.sender_email}
+            Sent via EmailJS API | Service: FREE | Works on Render: ✅
+            """
         
         return message
     
@@ -460,6 +477,20 @@ class EmailJSEmailSystem:
             self._recipient_cache.pop(sensor_id, None)
         else:
             self._recipient_cache.clear()
+    
+    def get_config_status(self):
+        """Get current configuration status"""
+        return {
+            "service": "EmailJS",
+            "configured": self.is_configured(),
+            "sender_email": self.sender_email,
+            "service_id_set": bool(self.service_id),
+            "template_id_set": bool(self.template_id),
+            "user_id_set": bool(self.user_id),
+            "access_token_set": bool(self.access_token),
+            "works_on_render": True,
+            "cost": "FREE (200 emails/month)"
+        }
  
 # Email Configuration
 @app.get("/api/email-config")
@@ -1541,6 +1572,48 @@ def get_data_quality_report(
     except Exception as e:
         logger.error(f"Error in data quality report for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Data quality analysis failed: {str(e)}")
+import threading
+
+def send_alert_async(sensor_id: str, risk_data: Dict[str, Any]):
+    """Send alert email in background thread"""
+    def _send_alert():
+        try:
+            email_system = EmailJSEmailSystem(db)
+            if email_system.is_configured():
+                result = email_system.send_alert_email(sensor_id, risk_data)
+                if result["success"]:
+                    logger.info(f"✅ Async alert sent for sensor {sensor_id} - Risk: {risk_data['predicted_risk_index']:.2f}")
+                else:
+                    logger.error(f"❌ Async alert failed for {sensor_id}: {result.get('error')}")
+            else:
+                logger.warning(f"Email system not configured - alert not sent for {sensor_id}")
+        except Exception as e:
+            logger.error(f"Async alert error for {sensor_id}: {e}")
+    
+    thread = threading.Thread(target=_send_alert, daemon=True)
+    thread.start()
+
+# Alert throttling to prevent spam
+_last_alert_times = {}
+_alert_throttle_minutes = 30  # Only send one alert per sensor every 30 minutes
+
+def should_send_alert(sensor_id: str, risk_index: float) -> bool:
+    """Check if we should send alert (prevent spam)"""
+    global _last_alert_times
+    
+    current_time = datetime.now()
+    last_alert = _last_alert_times.get(sensor_id)
+    
+    # Always send critical alerts (risk >= 4)
+    if risk_index >= 4:
+        return True
+    
+    # For non-critical alerts, check throttle time
+    if not last_alert or (current_time - last_alert).total_seconds() > (_alert_throttle_minutes * 60):
+        _last_alert_times[sensor_id] = current_time
+        return True
+    
+    return False
 
 @app.get("/api/predict/{sensor_id}")
 def predict_risk_endpoint(
@@ -1581,12 +1654,81 @@ def predict_risk_endpoint(
             "input_data": sensor_data,  # Include input data for email alerts
             "timestamp": datetime.now().isoformat()
         }
-         
+        
+        # Send email alert if risk index > 1 and not throttled
+        if risk_index > 1 and should_send_alert(sensor_id, risk_index):
+            enhanced_result["alert_triggered"] = True
+            enhanced_result["alert_message"] = "Alert being sent via EmailJS"
+            
+            # Send alert asynchronously (don't wait for it to complete)
+            send_alert_async(sensor_id, enhanced_result)
+            
+            logger.info(f"🚨 Alert triggered for sensor {sensor_id} - Risk: {risk_index:.2f}")
+        else:
+            enhanced_result["alert_triggered"] = False
+            if risk_index <= 1:
+                enhanced_result["alert_message"] = "No alert needed (risk <= 1)"
+            else:
+                # Alert throttled
+                last_alert = _last_alert_times.get(sensor_id)
+                if last_alert:
+                    minutes_since_last = (datetime.now() - last_alert).total_seconds() / 60
+                    minutes_remaining = _alert_throttle_minutes - minutes_since_last
+                    enhanced_result["alert_message"] = f"Alert throttled ({minutes_remaining:.0f} min remaining)"
+                else:
+                    enhanced_result["alert_message"] = "Alert throttled"
+        
         return enhanced_result
         
     except Exception as e:
         logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+# @app.get("/api/predict/{sensor_id}")
+# def predict_risk_endpoint(
+    # sensor_id: str,
+    # methane: float = Query(..., description="Methane level"),
+    # co2: float = Query(..., description="CO2 level"),
+    # ammonia: float = Query(..., description="Ammonia level"),
+    # humidity: float = Query(..., description="Humidity percentage"),
+    # temperature: float = Query(..., description="Temperature in Celsius")
+# ):
+    # """Predict risk index using pre-trained model and send alerts if risk > 1"""
+    # try:
+        # sensor_data = {
+            # "methane": methane,
+            # "co2": co2,
+            # "ammonia": ammonia,
+            # "humidity": humidity,
+            # "temperature": temperature
+        # }
+        
+        # prediction_result = predict_risk_index(sensor_id, sensor_data)
+        
+        # if "error" in prediction_result:
+            # raise HTTPException(status_code=404, detail=prediction_result["error"])
+        
+        Enhance with AQI and risk category
+        # risk_index = prediction_result["predicted_risk_index"]
+        # aqi = convert_risk_to_aqi(risk_index)
+        # risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
+        
+        # enhanced_result = {
+            # **prediction_result,
+            # "aqi": aqi,
+            # "aqi_category": aqi_category,
+            # "risk_level": risk_level,
+            # "risk_label": risk_label,
+            # "recommendation": recommendation,
+            # "input_data": sensor_data,  # Include input data for email alerts
+            # "timestamp": datetime.now().isoformat()
+        # }
+         
+        # return enhanced_result
+        
+    # except Exception as e:
+        # logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
+        # raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
         
 @app.post("/api/predict/{sensor_id}")
 def predict_risk_bulk(
