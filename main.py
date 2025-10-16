@@ -1647,9 +1647,6 @@ def get_latest_sensor_reading(
 # ---------------------------------------------------
 # Email Configuration Endpoints
 # ---------------------------------------------------
-# ---------------------------------------------------
-# Email Configuration Endpoints
-# ---------------------------------------------------
 @app.get("/api/email-config")
 def get_email_config():
     """Get current email configuration from Firebase"""
@@ -1997,7 +1994,33 @@ def home():
     </body>
     </html>
     """
+###
+# test from collab
+##
 
+sender_email = os.environ.get("SENDER_EMAIL")
+recipient_email = "lawrence.c.salazar@gmail.com"
+subject = "Test Email"
+body = "This is a test email sent from Python."
+app_password = os.environ.get("SENDER_PASSWORD")
+
+def send_email(subject, body, sender_email, recipient_email, password):
+  msg = MIMEText(body)
+
+  msg['Subject'] = subject
+  msg['From'] = sender_email
+  msg['To'] = recipient_email
+
+  with smtplib.SMTP('smtp.gmail.com', 587) as server:
+    server.starttls()
+    server.login(sender_email, app_password)
+    server.sendmail(sender_email, recipient_email, msg.as_string())
+    print("Email sent successfully!")
+    
+@app.on_event("test_email")
+def test_mail():
+    send_email(subject, body, sender_email, recipient_email, app_password)
+    
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
