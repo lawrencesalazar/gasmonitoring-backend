@@ -2017,7 +2017,7 @@ def send_email(subject, body, sender_email, recipient_email, password):
     server.sendmail(sender_email, recipient_email, msg.as_string())
     print("Email sent successfully!")
     
-@app.on_event("test_email")
+@app.get("/test_email")
 def test_mail():
     send_email(subject, body, sender_email, recipient_email, app_password)
     
