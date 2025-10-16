@@ -1995,32 +1995,85 @@ def home():
     </html>
     """
 ###
-# test from collab
+# test  
 ##
+@app.get("/test_email_simple")
+def test_email_simple():
+    """Simple test email endpoint that should work"""
+    try:
+        # Initialize email system
+        email_system = EmailAlertSystem(db)
+        
+        # Check if configured
+        if not email_system.is_configured():
+            return {
+                "success": False,
+                "error": "Email not configured in Firebase",
+                "config_status": {
+                    "sender_email_set": bool(email_system.sender_email),
+                    "sender_password_set": bool(email_system.sender_password),
+                    "smtp_server": email_system.smtp_server,
+                    "smtp_port": email_system.smtp_port
+                }
+            }
+        
+        # Test with a simple recipient
+        test_recipient = "lawrence.c.salazar@gmail.com"
+        
+        # Send simple test email
+        result = email_system.send_email(
+            subject="Simple Test Email",
+            body="This is a simple test email from the Gas Monitoring System.",
+            recipient_emails=[test_recipient]
+        )
+        
+        return {
+            "success": result["success"],
+            "message": result.get("message", result.get("error", "Unknown result")),
+            "recipient": test_recipient,
+            "config_used": {
+                "smtp_server": email_system.smtp_server,
+                "smtp_port": email_system.smtp_port,
+                "sender_email": email_system.sender_email
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Simple test email failed: {e}")
+        return {
+            "success": False,
+            "error": f"Test email failed: {str(e)}",
+            "details": "Check Firebase email configuration"
+        }
+        
+@app.get("/test_email_direct")
+def test_email_direct():
+    """Direct email test without Firebase config"""
+    try:
+        # self.smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+        # self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        # self.sender_email = os.getenv('SENDER_EMAIL', '')
+        # self.sender_password = os.getenv('SENDER_PASSWORD', '')
+        
+        sender_email = os.getenv('SENDER_EMAIL', '') # Your email
+        app_password =  os.getenv('SENDER_PASSWORD', '')   # Your app password
+        recipient_email = "lawrence.c.salazar@gmail.com"
+        
+        msg = MIMEText("This is a direct test email.")
+        msg['Subject'] = "Direct Test Email"
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
 
-sender_email = os.environ.get("SENDER_EMAIL")
-recipient_email = "lawrence.c.salazar@gmail.com"
-subject = "Test Email"
-body = "This is a test email sent from Python."
-app_password = os.environ.get("SENDER_PASSWORD")
-
-def send_email(subject, body, sender_email, recipient_email, password):
-  msg = MIMEText(body)
-
-  msg['Subject'] = subject
-  msg['From'] = sender_email
-  msg['To'] = recipient_email
-
-  with smtplib.SMTP('smtp.gmail.com', 587) as server:
-    server.starttls()
-    server.login(sender_email, app_password)
-    server.sendmail(sender_email, recipient_email, msg.as_string())
-    print("Email sent successfully!")
-    
-@app.get("/test_email")
-def test_mail():
-    send_email(subject, body, sender_email, recipient_email, app_password)
-    
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender_email, app_password)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+        
+        return {"success": True, "message": "Direct email sent successfully!"}
+        
+    except Exception as e:
+        return {"success": False, "error": f"Direct email failed: {str(e)}"}
+        
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
