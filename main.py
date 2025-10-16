@@ -1996,56 +1996,7 @@ def home():
     """
 ###
 # test  
-##
-@app.get("/test_email_simple")
-def test_email_simple():
-    """Simple test email endpoint that should work"""
-    try:
-        # Initialize email system
-        email_system = EmailAlertSystem(db)
-        
-        # Check if configured
-        if not email_system.is_configured():
-            return {
-                "success": False,
-                "error": "Email not configured in Firebase",
-                "config_status": {
-                    "sender_email_set": bool(email_system.sender_email),
-                    "sender_password_set": bool(email_system.sender_password),
-                    "smtp_server": email_system.smtp_server,
-                    "smtp_port": email_system.smtp_port
-                }
-            }
-        
-        # Test with a simple recipient
-        test_recipient = "lawrence.c.salazar@gmail.com"
-        
-        # Send simple test email
-        result = email_system.send_email(
-            subject="Simple Test Email",
-            body="This is a simple test email from the Gas Monitoring System.",
-            recipient_emails=[test_recipient]
-        )
-        
-        return {
-            "success": result["success"],
-            "message": result.get("message", result.get("error", "Unknown result")),
-            "recipient": test_recipient,
-            "config_used": {
-                "smtp_server": email_system.smtp_server,
-                "smtp_port": email_system.smtp_port,
-                "sender_email": email_system.sender_email
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Simple test email failed: {e}")
-        return {
-            "success": False,
-            "error": f"Test email failed: {str(e)}",
-            "details": "Check Firebase email configuration"
-        }
-        
+## 
 @app.get("/test_email_direct")
 def test_email_direct():
     """Direct email test without Firebase config"""
