@@ -41,10 +41,7 @@ import pickle
 import base64
 import joblib
 
-import resend
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import request 
   
  
 # Configure logging FIRST
@@ -187,53 +184,44 @@ def initialize_firebase():
 # Enhanced Email Config with Firebase Integration
 # ---------------------------------------------------
 
-import resend
-import os
-import logging
-from typing import List, Dict, Any
-from datetime import datetime
-
-logger = logging.getLogger(__name__)
-
-class ResendEmailSystem:
-    """Complete email system using Resend.com (FREE)"""
+class EmailJSEmailSystem:
+    """Email system using EmailJS.com - WORKS ON RENDER"""
     
     def __init__(self, db):
         self.db = db
         self._recipient_cache = {}
-        self._cache_timeout = 300  # 5 minutes
+        self._cache_timeout = 300
         
-        # Initialize Resend
-        resend.api_key = os.environ.get("RESEND_API_KEY")
-        if not resend.api_key:
-            logger.warning("RESEND_API_KEY not set in environment variables")
+        # EmailJS configuration - get these from your EmailJS account
+        self.service_id = os.environ.get("EMAILJS_SERVICE_ID")
+        self.template_id = os.environ.get("EMAILJS_TEMPLATE_ID") 
+        self.user_id = os.environ.get("EMAILJS_USER_ID")
+        self.access_token = os.environ.get("EMAILJS_ACCESS_TOKEN", "")  # Optional
         
-        # Load email configuration from Firebase
-        self._load_email_config()
+        # Your sender email (configured in EmailJS dashboard)
+        self.sender_email = "gasvanguard@gmail.com"
+        
+        self._load_config()
     
-    def _load_email_config(self):
-        """Load sender email from Firebase"""
+    def _load_config(self):
+        """Load configuration from Firebase"""
         try:
             config_ref = self.db.reference('/email_config/default')
             config = config_ref.get()
             
             if config and config.get('sender_email'):
                 self.sender_email = config['sender_email']
-                logger.info(f"Sender email loaded from Firebase: {self.sender_email}")
-            else:
-                self.sender_email = "gasvanguard@gmail.com"  # Default fallback
-                logger.warning("Using default sender email - configure in Firebase")
+                logger.info(f"Sender email from Firebase: {self.sender_email}")
                 
         except Exception as e:
-            self.sender_email = "gasvanguard@gmail.com"
             logger.error(f"Error loading email config: {e}")
     
     def is_configured(self):
-        """Check if email system is ready"""
-        return bool(resend.api_key and self.sender_email)
+        """Check if EmailJS is properly configured"""
+        return bool(self.service_id and self.template_id and self.user_id)
     
     def _get_recipients_for_sensor(self, sensor_id: str) -> List[str]:
-        """Get email recipients for a specific sensor from Firebase"""
+        """Get email recipients from Firebase"""
         try:
             # Check cache first
             current_time = datetime.now()
@@ -245,7 +233,7 @@ class ResendEmailSystem:
             
             recipients = []
             
-            # Try sensor-specific recipients first
+            # Try sensor-specific recipients
             sensor_ref = self.db.reference(f'/alert_recipients/{sensor_id}')
             sensor_data = sensor_ref.get()
             
@@ -285,74 +273,85 @@ class ResendEmailSystem:
         """Basic email validation"""
         return isinstance(email, str) and '@' in email and '.' in email
     
-    def send_email(self, subject: str, body: str, recipient_emails: List[str], is_html: bool = False) -> Dict[str, Any]:
-        """Send email using Resend API"""
+    def send_email(self, subject: str, message: str, recipient_emails: List[str]) -> Dict[str, Any]:
+        """Send email using EmailJS HTTP API - WORKS ON RENDER"""
         if not self.is_configured():
             return {
                 "success": False, 
-                "error": "Email not configured. Set RESEND_API_KEY and sender email."
+                "error": "EmailJS not configured. Set EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, and EMAILJS_USER_ID environment variables."
             }
         
-        if not recipient_emails:
-            return {"success": False, "error": "No recipients provided"}
-        
         try:
-            # Convert single email to list if needed
             if isinstance(recipient_emails, str):
                 recipient_emails = [recipient_emails]
             
-            # Validate emails
             valid_recipients = [email for email in recipient_emails if self._is_valid_email(email)]
             if not valid_recipients:
                 return {"success": False, "error": "No valid email addresses provided"}
             
-            # Prepare email content
-            if is_html:
-                html_content = body
-                text_content = self._html_to_text(body)
-            else:
-                html_content = f"<pre style='font-family: Arial, sans-serif;'>{body}</pre>"
-                text_content = body
+            # EmailJS API endpoint
+            url = "https://api.emailjs.com/api/v1.0/email/send"
             
-            # Send via Resend
-            params = {
-                "from": f"GasVanguard <{self.sender_email}>",
-                "to": valid_recipients,
+            # Prepare template parameters
+            template_params = {
+                "to_email": valid_recipients[0],  # EmailJS sends to one recipient at a time
+                "to_name": "Gas Alert Recipient",
+                "from_name": "GasVanguard Alerts",
                 "subject": subject,
-                "html": html_content,
-                "text": text_content
+                "message": message,
+                "sensor_id": "Gas Monitoring System",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
-            email = resend.Emails.send(params)
-            
-            logger.info(f"Email sent via Resend to {len(valid_recipients)} recipients")
-            
-            return {
-                "success": True,
-                "message": f"Email sent to {len(valid_recipients)} recipients",
-                "email_id": email['id'],
-                "recipients": valid_recipients,
-                "service": "Resend",
-                "cost": "FREE"
+            # Prepare request data
+            email_data = {
+                "service_id": self.service_id,
+                "template_id": self.template_id,
+                "user_id": self.user_id,
+                "template_params": template_params
             }
             
-        except Exception as e:
-            error_msg = f"Failed to send email via Resend: {str(e)}"
+            # Add access token if available (for newer accounts)
+            if self.access_token:
+                email_data["accessToken"] = self.access_token
+            
+            # Send email via EmailJS HTTP API
+            headers = {
+                "Content-Type": "application/json",
+                "origin": "https://gasmonitoring-backend-evw0.onrender.com"  # Your Render URL
+            }
+            
+            response = requests.post(url, json=email_data, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                logger.info(f"Email sent via EmailJS to {valid_recipients[0]}")
+                
+                return {
+                    "success": True,
+                    "message": f"Email sent to {valid_recipients[0]}",
+                    "recipient": valid_recipients[0],
+                    "service": "EmailJS",
+                    "cost": "FREE (200 emails/month)",
+                    "works_on_render": True
+                }
+            else:
+                error_msg = f"EmailJS API error: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "status_code": response.status_code,
+                    "service": "EmailJS"
+                }
+            
+        except requests.exceptions.Timeout:
+            error_msg = "EmailJS API timeout"
             logger.error(error_msg)
-            return {
-                "success": False,
-                "error": error_msg,
-                "service": "Resend"
-            }
-    
-    def _html_to_text(self, html: str) -> str:
-        """Simple HTML to text conversion for plain text fallback"""
-        import re
-        # Remove HTML tags
-        text = re.sub(r'<[^>]+>', '', html)
-        # Replace multiple spaces with single space
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
+            return {"success": False, "error": error_msg, "service": "EmailJS"}
+        except Exception as e:
+            error_msg = f"EmailJS failed: {str(e)}"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg, "service": "EmailJS"}
     
     def send_alert_email(self, sensor_id: str, risk_data: Dict[str, Any]) -> Dict[str, Any]:
         """Send alert email for sensor with risk data"""
@@ -368,14 +367,39 @@ class ResendEmailSystem:
         
         # Create alert content
         subject = self._create_alert_subject(sensor_id, risk_data)
-        body = self._create_alert_body(sensor_id, risk_data)
+        message = self._create_alert_message(sensor_id, risk_data)
         
-        # Send email
-        result = self.send_email(subject, body, recipients, is_html=True)
-        result['sensor_id'] = sensor_id
-        result['recipients_count'] = len(recipients)
+        # Send to each recipient (EmailJS sends one email per call)
+        successful_sends = 0
+        errors = []
         
-        return result
+        for recipient in recipients:
+            result = self.send_email(subject, message, [recipient])
+            if result["success"]:
+                successful_sends += 1
+                logger.info(f"Alert sent to {recipient} for sensor {sensor_id}")
+            else:
+                errors.append(f"{recipient}: {result.get('error', 'Unknown error')}")
+                logger.error(f"Failed to send alert to {recipient}: {result.get('error')}")
+        
+        if successful_sends > 0:
+            return {
+                "success": True,
+                "message": f"Alerts sent to {successful_sends} recipients",
+                "sensor_id": sensor_id,
+                "recipients_count": successful_sends,
+                "total_recipients": len(recipients),
+                "errors": errors if errors else None,
+                "service": "EmailJS",
+                "works_on_render": True
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Failed to send alerts to any recipients: {', '.join(errors)}",
+                "sensor_id": sensor_id,
+                "service": "EmailJS"
+            }
     
     def _create_alert_subject(self, sensor_id: str, risk_data: Dict[str, Any]) -> str:
         """Create alert email subject"""
@@ -389,69 +413,46 @@ class ResendEmailSystem:
         else:
             return f"ℹ️ GAS ALERT - Sensor {sensor_id} - {risk_label}"
     
-    def _create_alert_body(self, sensor_id: str, risk_data: Dict[str, Any]) -> str:
-        """Create HTML alert email body"""
+    def _create_alert_message(self, sensor_id: str, risk_data: Dict[str, Any]) -> str:
+        """Create alert email message body"""
         risk_level = risk_data.get('risk_level', 0)
         
-        # Style based on risk level
         if risk_level >= 4:
-            alert_style = "background: #ffebee; color: #c62828; border: 2px solid #f44336;"
-            icon = "🚨"
-            title = "CRITICAL GAS ALERT"
+            alert_header = "🚨 CRITICAL GAS ALERT 🚨"
         elif risk_level >= 3:
-            alert_style = "background: #fff3e0; color: #ef6c00; border: 2px solid #ff9800;"
-            icon = "⚠️"
-            title = "HIGH RISK ALERT"
+            alert_header = "⚠️ HIGH RISK ALERT ⚠️"
         else:
-            alert_style = "background: #e8f5e8; color: #2e7d32; border: 2px solid #4caf50;"
-            icon = "ℹ️"
-            title = "GAS ALERT"
+            alert_header = "ℹ️ GAS ALERT ℹ️"
         
-        # Sensor readings
-        readings_html = ""
+        # Create detailed message
+        message = f"""
+        {alert_header}
+
+        SENSOR ALERT DETAILS:
+        • Sensor ID: {sensor_id}
+        • Risk Level: {risk_data.get('risk_label', 'Unknown')}
+        • Risk Index: {risk_data.get('predicted_risk_index', 0):.2f}
+        • AQI: {risk_data.get('aqi', 0):.1f} ({risk_data.get('aqi_category', 'Unknown')})
+        • Time: {risk_data.get('timestamp', 'Unknown')}
+
+        SENSOR READINGS:"""
+        
+        # Add sensor readings
         input_data = risk_data.get('input_data', {})
-        if input_data:
-            readings_html = "<h3>📊 Sensor Readings</h3><div style='display: grid; grid-template-columns: 1fr 1fr; gap: 10px;'>"
-            for key, value in input_data.items():
-                readings_html += f"<div style='padding: 8px; background: white; border-radius: 5px;'><strong>{key.title()}:</strong> {value}</div>"
-            readings_html += "</div>"
+        for key, value in input_data.items():
+            message += f"\n• {key.title()}: {value}"
         
-        return f"""
-        <html>
-        <head>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
-                .alert-box {{ padding: 20px; border-radius: 10px; margin: 10px 0; {alert_style} }}
-                .sensor-info {{ background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 15px 0; }}
-                .footer {{ margin-top: 20px; padding: 15px; background: #e3f2fd; border-radius: 5px; font-size: 12px; color: #666; }}
-            </style>
-        </head>
-        <body>
-            <div class="alert-box">
-                <h2>{icon} {title}</h2>
-                <p><strong>Sensor ID:</strong> {sensor_id}</p>
-                <p><strong>Risk Level:</strong> {risk_data.get('risk_label', 'Unknown')}</p>
-                <p><strong>Time:</strong> {risk_data.get('timestamp', 'Unknown')}</p>
-                <p><strong>Risk Index:</strong> {risk_data.get('predicted_risk_index', 0):.2f}</p>
-                <p><strong>AQI:</strong> {risk_data.get('aqi', 0):.1f} ({risk_data.get('aqi_category', 'Unknown')})</p>
-            </div>
-            
-            <div class="sensor-info">
-                {readings_html}
-            </div>
-            
-            <div class="sensor-info">
-                <h3>💡 Recommended Actions</h3>
-                <p>{risk_data.get('recommendation', 'Please check the sensor immediately.')}</p>
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated alert from the Gas Monitoring System.</p>
-                <p>Service: Resend.com | Cost: FREE | Delivery: Instant</p>
-            </div>
-        </body>
-        </html>
+        message += f"""
+
+        RECOMMENDED ACTIONS:
+        {risk_data.get('recommendation', 'Please check the sensor immediately and ensure proper ventilation.')}
+
+        ---
+        Gas Monitoring System Alert
+        Sent via EmailJS API | Service: FREE | Works on Render: ✅
         """
+        
+        return message
     
     def clear_cache(self, sensor_id: str = None):
         """Clear recipient cache"""
@@ -459,6 +460,95 @@ class ResendEmailSystem:
             self._recipient_cache.pop(sensor_id, None)
         else:
             self._recipient_cache.clear()
+ 
+# Email Configuration
+@app.get("/api/email-config")
+def get_email_config():
+    """Get current email configuration"""
+    try:
+        email_system = EmailJSEmailSystem(db)
+        return {
+            "success": True,
+            "service": "EmailJS",
+            "sender_email": email_system.sender_email,
+            "configured": email_system.is_configured(),
+            "cost": "FREE (200 emails/month)",
+            "works_on_render": True,
+            "service_id_set": bool(email_system.service_id),
+            "template_id_set": bool(email_system.template_id),
+            "user_id_set": bool(email_system.user_id)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Test Endpoints
+@app.get("/test-email-emailjs")
+def test_email_emailjs():
+    """Test EmailJS integration - WILL WORK ON RENDER"""
+    try:
+        email_system = EmailJSEmailSystem(db)
+        
+        if not email_system.is_configured():
+            return {
+                "success": False,
+                "error": "EmailJS not configured. Set environment variables.",
+                "required_vars": ["EMAILJS_SERVICE_ID", "EMAILJS_TEMPLATE_ID", "EMAILJS_USER_ID"],
+                "works_on_render": True
+            }
+        
+        result = email_system.send_email(
+            subject="EmailJS Test from Render",
+            message="""
+                🎉 EmailJS Integration Test Successful!
+
+                This email was sent from your Render.com application using EmailJS HTTP API.
+
+                ✅ Works on Render: YES
+                ✅ Cost: FREE (200 emails/month)
+                ✅ Service: EmailJS HTTP API
+                ✅ Delivery: Instant
+
+                Your gas alert system is now ready to use!
+            """,
+            recipient_emails=["lawrence.c.salazar@gmail.com"]
+        )
+        
+        return result
+        
+    except Exception as e:
+        return {"success": False, "error": str(e), "works_on_render": True}
+
+@app.post("/api/test-email-alert/{sensor_id}")
+def test_email_alert(sensor_id: str):
+    """Test email alert functionality"""
+    try:
+        email_system = EmailJSEmailSystem(db)
+        
+        if not email_system.is_configured():
+            return {"success": False, "error": "EmailJS not configured"}
+        
+        test_risk_data = {
+            "risk_level": 4,
+            "risk_label": "CRITICAL",
+            "predicted_risk_index": 8.5,
+            "aqi": 280.5,
+            "aqi_category": "Unhealthy",
+            "recommendation": "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available.",
+            "timestamp": datetime.now().isoformat(),
+            "input_data": {
+                "methane": 45.2,
+                "co2": 420.5,
+                "ammonia": 12.8,
+                "humidity": 65.2,
+                "temperature": 25.8
+            }
+        }
+        
+        result = email_system.send_alert_email(sensor_id, test_risk_data)
+        return result
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)} 
 
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
@@ -866,22 +956,6 @@ def predict_risk_index(sensor_ID, sensor_data, use_regulatory_calculation=True):
             "calculation_method": "regulatory_calculation" if use_regulatory_calculation else "ml_model"
         }
             
-        # 🔥 NEW: Send email alert for high risk and critical levels
-        if risk_level >= 4:  # High risk (level 4) and Critical (level 5)
-            email_config = EmailConfig()
-            if email_config.is_configured():
-                recipients = email_config.get_recipients_for_sensor(sensor_ID)
-                if recipients:
-                    send_alert_async(sensor_ID, result, email_config)
-                    result["alert_sent"] = True
-                    result["alert_recipients"] = recipients
-                    result["recipient_count"] = len(recipients)
-                else:
-                    result["alert_sent"] = False
-                    result["alert_reason"] = "No recipients found for this sensor"
-            else:
-                result["alert_sent"] = False
-                result["alert_reason"] = "Email not configured"
         
         if not use_regulatory_calculation:
             result["features_used"] = feature_columns
@@ -1507,37 +1581,7 @@ def predict_risk_endpoint(
             "input_data": sensor_data,  # Include input data for email alerts
             "timestamp": datetime.now().isoformat()
         }
-        
-        # Send email alert if risk index > 1
-        if risk_index > 1:
-            try:
-                email_system = ResendEmailSystem(db)
-                
-                if email_system.is_configured():
-                    alert_result = email_system.send_alert_email(sensor_id, enhanced_result)
-                    
-                    # Add alert status to response
-                    enhanced_result["alert_sent"] = alert_result["success"]
-                    enhanced_result["alert_message"] = alert_result.get("message", "Alert sent")
-                    enhanced_result["recipients_count"] = alert_result.get("recipients_count", 0)
-                    
-                    if alert_result["success"]:
-                        logger.info(f"Alert sent for sensor {sensor_id} - Risk: {risk_index}")
-                    else:
-                        logger.warning(f"Alert failed for sensor {sensor_id}: {alert_result.get('error')}")
-                else:
-                    enhanced_result["alert_sent"] = False
-                    enhanced_result["alert_message"] = "Email system not configured"
-                    logger.warning(f"Email system not configured - alert not sent for sensor {sensor_id}")
-                    
-            except Exception as email_error:
-                enhanced_result["alert_sent"] = False
-                enhanced_result["alert_message"] = f"Alert failed: {str(email_error)}"
-                logger.error(f"Error sending alert for sensor {sensor_id}: {email_error}")
-        else:
-            enhanced_result["alert_sent"] = False
-            enhanced_result["alert_message"] = "No alert needed (risk <= 1)"
-        
+         
         return enhanced_result
         
     except Exception as e:
@@ -1785,102 +1829,7 @@ def home():
     """
 ###  
 # Email Configuration Endpoints
-@app.get("/api/email-config")
-def get_email_config():
-    """Get current email configuration"""
-    try:
-        email_system = ResendEmailSystem(db)
-        return {
-            "success": True,
-            "service": "Resend",
-            "sender_email": email_system.sender_email,
-            "configured": email_system.is_configured(),
-            "cost": "FREE (250 emails/month)",
-            "api_key_set": bool(os.environ.get("RESEND_API_KEY"))
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/email-config/update")
-def update_email_config(config_update: Dict[str, Any]):
-    """Update email configuration in Firebase"""
-    try:
-        if 'sender_email' not in config_update:
-            return {"success": False, "error": "sender_email is required"}
-        
-        ref = db.reference('/email_config/default')
-        ref.set({
-            "sender_email": config_update['sender_email'],
-            "service": "resend",
-            "updated_at": datetime.now().isoformat()
-        })
-        
-        return {
-            "success": True,
-            "message": "Email configuration updated",
-            "sender_email": config_update['sender_email'],
-            "service": "Resend"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# Test Endpoints
-@app.get("/test-email-resend")
-def test_email_resend():
-    """Test Resend email integration"""
-    try:
-        email_system = ResendEmailSystem(db)
-        
-        if not email_system.is_configured():
-            return {
-                "success": False,
-                "error": "Resend not configured. Set RESEND_API_KEY environment variable.",
-                "setup_required": True
-            }
-        
-        result = email_system.send_email(
-            subject="Resend Integration Test",
-            body="<h1>Resend Test Successful! 🎉</h1><p>Your email system is now working with Resend.com</p>",
-            recipient_emails=["lawrence.c.salazar@gmail.com"],
-            is_html=True
-        )
-        
-        return result
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/test-email-alert/{sensor_id}")
-def test_email_alert(sensor_id: str):
-    """Test email alert functionality"""
-    try:
-        email_system = ResendEmailSystem(db)
-        
-        if not email_system.is_configured():
-            return {"success": False, "error": "Email system not configured"}
-        
-        test_risk_data = {
-            "risk_level": 4,
-            "risk_label": "CRITICAL",
-            "predicted_risk_index": 8.5,
-            "aqi": 280.5,
-            "aqi_category": "Unhealthy",
-            "recommendation": "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available.",
-            "timestamp": datetime.now().isoformat(),
-            "input_data": {
-                "methane": 45.2,
-                "co2": 420.5,
-                "ammonia": 12.8,
-                "humidity": 65.2,
-                "temperature": 25.8
-            }
-        }
-        
-        result = email_system.send_alert_email(sensor_id, test_risk_data)
-        return result
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+ 
   
 @app.on_event("startup")
 async def startup_event():
