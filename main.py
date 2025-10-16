@@ -1920,7 +1920,7 @@ def predict_risk_endpoint(
         # if "error" in prediction_result:
             # raise HTTPException(status_code=404, detail=prediction_result["error"])
         
-        Enhance with AQI and risk category
+        # Enhance with AQI and risk category
         # risk_index = prediction_result["predicted_risk_index"]
         # aqi = convert_risk_to_aqi(risk_index)
         # risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
