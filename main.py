@@ -41,7 +41,7 @@ import pickle
 import base64
 import joblib
 
-import request 
+import requests   
   
  
 # Configure logging FIRST
