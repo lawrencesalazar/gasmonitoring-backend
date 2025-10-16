@@ -1573,22 +1573,75 @@ def get_data_quality_report(
         logger.error(f"Error in data quality report for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Data quality analysis failed: {str(e)}")
 import threading
+from datetime import datetime
+
+def save_alert_to_firebase(sensor_id: str, risk_data: Dict[str, Any], email_result: Dict[str, Any]):
+    """Save alert record to Firebase Realtime Database"""
+    try:
+        alert_data = {
+            "sensor_id": sensor_id,
+            "risk_index": risk_data.get('predicted_risk_index', 0),
+            "risk_level": risk_data.get('risk_level', 0),
+            "risk_label": risk_data.get('risk_label', 'Unknown'),
+            "aqi": risk_data.get('aqi', 0),
+            "aqi_category": risk_data.get('aqi_category', 'Unknown'),
+            "timestamp": datetime.now().isoformat(),
+            "email_sent": email_result.get('success', False),
+            "email_service": email_result.get('service', 'Unknown'),
+            "recipients_count": email_result.get('recipients_count', 0),
+            "recipients": email_result.get('sent_to', []),
+            "email_error": email_result.get('error'),
+            "sensor_readings": risk_data.get('input_data', {}),
+            "recommendation": risk_data.get('recommendation', '')
+        }
+        
+        # Generate unique alert ID
+        alert_id = f"alert_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        
+        # Save to Firebase: /alerts/{sensor_id}/{alert_id}
+        alert_ref = db.reference(f'/alerts/{sensor_id}/{alert_id}')
+        alert_ref.set(alert_data)
+        
+        logger.info(f"✅ Alert saved to Firebase: {sensor_id}/{alert_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to save alert to Firebase: {e}")
+        return False
 
 def send_alert_async(sensor_id: str, risk_data: Dict[str, Any]):
-    """Send alert email in background thread"""
+    """Send alert email in background thread and save to Firebase"""
     def _send_alert():
         try:
             email_system = EmailJSEmailSystem(db)
+            email_result = {}
+            
             if email_system.is_configured():
-                result = email_system.send_alert_email(sensor_id, risk_data)
-                if result["success"]:
+                email_result = email_system.send_alert_email(sensor_id, risk_data)
+                if email_result["success"]:
                     logger.info(f"✅ Async alert sent for sensor {sensor_id} - Risk: {risk_data['predicted_risk_index']:.2f}")
                 else:
-                    logger.error(f"❌ Async alert failed for {sensor_id}: {result.get('error')}")
+                    logger.error(f"❌ Async alert failed for {sensor_id}: {email_result.get('error')}")
             else:
+                email_result = {
+                    "success": False,
+                    "error": "Email system not configured",
+                    "service": "EmailJS"
+                }
                 logger.warning(f"Email system not configured - alert not sent for {sensor_id}")
+            
+            # Save alert record to Firebase regardless of email success
+            save_alert_to_firebase(sensor_id, risk_data, email_result)
+            
         except Exception as e:
             logger.error(f"Async alert error for {sensor_id}: {e}")
+            # Still try to save to Firebase even if email fails
+            error_result = {
+                "success": False,
+                "error": str(e),
+                "service": "EmailJS"
+            }
+            save_alert_to_firebase(sensor_id, risk_data, error_result)
     
     thread = threading.Thread(target=_send_alert, daemon=True)
     thread.start()
@@ -1614,7 +1667,166 @@ def should_send_alert(sensor_id: str, risk_index: float) -> bool:
         return True
     
     return False
+@app.get("/api/alerts/{sensor_id}")
+def get_sensor_alerts(
+    sensor_id: str,
+    limit: int = Query(50, description="Number of alerts to return"),
+    days: int = Query(7, description="Number of past days to include")
+):
+    """Get alert history for a specific sensor"""
+    try:
+        alerts_ref = db.reference(f'/alerts/{sensor_id}')
+        alerts_data = alerts_ref.order_by_child('timestamp').limit_to_last(limit).get()
+        
+        if not alerts_data:
+            return {
+                "success": True,
+                "sensor_id": sensor_id,
+                "alerts": [],
+                "count": 0,
+                "message": "No alerts found for this sensor"
+            }
+        
+        # Convert to list and sort by timestamp (newest first)
+        alerts_list = []
+        for alert_id, alert_data in alerts_data.items():
+            alerts_list.append({
+                "alert_id": alert_id,
+                **alert_data
+            })
+        
+        # Sort by timestamp descending (newest first)
+        alerts_list.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        # Filter by days if specified
+        if days > 0:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            alerts_list = [alert for alert in alerts_list 
+                         if datetime.fromisoformat(alert['timestamp'].replace('Z', '+00:00')) > cutoff_date]
+        
+        return {
+            "success": True,
+            "sensor_id": sensor_id,
+            "alerts": alerts_list,
+            "count": len(alerts_list),
+            "timeframe_days": days
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching alerts for {sensor_id}: {e}")
+        return {"success": False, "error": str(e)}
 
+@app.get("/api/alerts")
+def get_all_alerts(
+    limit: int = Query(100, description="Number of alerts to return"),
+    risk_level: int = Query(None, description="Filter by risk level")
+):
+    """Get all alerts across all sensors"""
+    try:
+        alerts_ref = db.reference('/alerts')
+        all_alerts_data = alerts_ref.get()
+        
+        if not all_alerts_data:
+            return {
+                "success": True,
+                "alerts": [],
+                "count": 0,
+                "message": "No alerts found"
+            }
+        
+        # Flatten all alerts from all sensors
+        all_alerts = []
+        for sensor_id, sensor_alerts in all_alerts_data.items():
+            for alert_id, alert_data in sensor_alerts.items():
+                all_alerts.append({
+                    "sensor_id": sensor_id,
+                    "alert_id": alert_id,
+                    **alert_data
+                })
+        
+        # Sort by timestamp descending (newest first)
+        all_alerts.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        # Filter by risk level if specified
+        if risk_level is not None:
+            all_alerts = [alert for alert in all_alerts if alert.get('risk_level') == risk_level]
+        
+        # Apply limit
+        all_alerts = all_alerts[:limit]
+        
+        return {
+            "success": True,
+            "alerts": all_alerts,
+            "count": len(all_alerts),
+            "total_sensors": len(all_alerts_data.keys()),
+            "risk_level_filter": risk_level
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching all alerts: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.delete("/api/alerts/{sensor_id}/{alert_id}")
+def delete_alert(sensor_id: str, alert_id: str):
+    """Delete a specific alert"""
+    try:
+        alert_ref = db.reference(f'/alerts/{sensor_id}/{alert_id}')
+        alert_ref.delete()
+        
+        logger.info(f"Alert deleted: {sensor_id}/{alert_id}")
+        
+        return {
+            "success": True,
+            "message": f"Alert {alert_id} deleted for sensor {sensor_id}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error deleting alert {sensor_id}/{alert_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/test-alert-saving/{sensor_id}")
+def test_alert_saving(sensor_id: str):
+    """Test the alert system with Firebase saving"""
+    try:
+        # Test with high risk data
+        test_risk_data = {
+            "predicted_risk_index": 8.2,
+            "aqi": 290.5,
+            "risk_level": 4,
+            "risk_label": "CRITICAL",
+            "aqi_category": "Unhealthy",
+            "recommendation": "Test recommendation for Firebase saving",
+            "input_data": {
+                "methane": 48.7,
+                "co2": 435.2,
+                "ammonia": 15.3,
+                "humidity": 68.9,
+                "temperature": 26.4
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Send alert (this will save to Firebase)
+        send_alert_async(sensor_id, test_risk_data)
+        
+        return {
+            "success": True,
+            "sensor_id": sensor_id,
+            "risk_index": test_risk_data["predicted_risk_index"],
+            "message": "Test alert sent - check Firebase for saved record",
+            "firebase_path": f"/alerts/{sensor_id}/alert_*",
+            "expected_data": {
+                "sensor_id": sensor_id,
+                "risk_index": test_risk_data["predicted_risk_index"],
+                "risk_level": test_risk_data["risk_level"],
+                "email_sent": True,
+                "timestamp": "Should be current time"
+            }
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+        
 @app.get("/api/predict/{sensor_id}")
 def predict_risk_endpoint(
     sensor_id: str,
