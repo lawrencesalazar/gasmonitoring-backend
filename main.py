@@ -183,7 +183,18 @@ def initialize_firebase():
 
 # ---------------------------------------------------
 # Enhanced Email Config with Firebase Integration
-# ---------------------------------------------------
+# ---------------------------------------------------import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import logging
+from typing import List, Optional, Dict, Union
+import os
+from datetime import datetime
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
 class EmailConfig:
     """Email configuration for alerts with Firebase integration"""
     def __init__(self):
@@ -224,10 +235,12 @@ class EmailConfig:
     def _get_config_from_firebase(self):
         """Get configuration from Firebase"""
         try:
-            if not firebase_db:
+            # You'll need to import your firebase_db and db references
+            # from your main application
+            if not getattr(self, 'firebase_db', None):
                 return None
                 
-            ref = db.reference('/email_config/default')
+            ref = self.db.reference('/email_config/default')
             config = ref.get()
             
             if config and isinstance(config, dict):
@@ -241,7 +254,7 @@ class EmailConfig:
     def _save_config_to_firebase(self, config_data):
         """Save configuration to Firebase"""
         try:
-            if not firebase_db:
+            if not getattr(self, 'firebase_db', None):
                 logger.error("Firebase not initialized - cannot save email config")
                 return False
             
@@ -259,7 +272,7 @@ class EmailConfig:
             if 'config_source' in save_data:
                 del save_data['config_source']
             
-            ref = db.reference('/email_config/default')
+            ref = self.db.reference('/email_config/default')
             ref.set(save_data)
             
             # Update cache
@@ -298,10 +311,6 @@ class EmailConfig:
     def update_config(self, new_config, confirm=True):
         """
         Update email configuration with optional confirmation
-        
-        Args:
-            new_config: Dictionary with new configuration values
-            confirm: If True, will only update if configuration is valid and confirmed
         """
         try:
             # Validate required fields
@@ -450,7 +459,6 @@ class EmailConfig:
             "smtp_port": self.smtp_port,
             "sender_email": self.sender_email,
             "sender_password_set": bool(self.sender_password),
-            "sender_password_length": len(self.sender_password),
             "enable_ssl": self.enable_ssl,
             "fully_configured": self.is_configured(),
             "config_source": self.config_source
@@ -459,10 +467,6 @@ class EmailConfig:
     def get_recipients_for_sensor(self, sensor_id: str) -> List[str]:
         """
         Fetch recipient emails from Firebase for a specific sensor
-        Structure in Firebase:
-        /alert_recipients/{sensor_id}/emails: ["email1@com", "email2@com"]
-        OR
-        /alert_recipients/global/emails: ["email1@com", "email2@com"] (fallback)
         """
         try:
             # Check cache first (cache for 5 minutes)
@@ -472,14 +476,14 @@ class EmailConfig:
                 (current_time - self._recipient_cache_time[sensor_id]).total_seconds() < 300):
                 return self._recipient_cache[sensor_id]
             
-            if not firebase_db:
+            if not getattr(self, 'firebase_db', None):
                 logger.error("Firebase not initialized - cannot fetch recipients")
                 return []
             
             recipients = []
             
             # First try: Get sensor-specific recipients
-            sensor_ref = db.reference(f'/alert_recipients/{sensor_id}/emails')
+            sensor_ref = self.db.reference(f'/alert_recipients/{sensor_id}/emails')
             sensor_emails = sensor_ref.get()
             
             if sensor_emails:
@@ -487,7 +491,7 @@ class EmailConfig:
                 logger.info(f"Found {len(recipients)} sensor-specific recipients for {sensor_id}")
             else:
                 # Second try: Get global recipients
-                global_ref = db.reference('/alert_recipients/global/emails')
+                global_ref = self.db.reference('/alert_recipients/global/emails')
                 global_emails = global_ref.get()
                 
                 if global_emails:
@@ -495,7 +499,7 @@ class EmailConfig:
                     logger.info(f"Using {len(recipients)} global recipients for {sensor_id}")
                 else:
                     # Third try: Get from sensorLocations (backward compatibility)
-                    locations_ref = db.reference('/sensorLocations')
+                    locations_ref = self.db.reference('/sensorLocations')
                     locations_data = locations_ref.get()
                     
                     if locations_data:
@@ -538,6 +542,195 @@ class EmailConfig:
             self._recipient_cache_time.clear()
             self._config_cache = None
             self._cache_timestamp = None
+
+    def send_email(self, 
+                  subject: str, 
+                  body: str, 
+                  recipient_emails: Union[str, List[str]], 
+                  is_html: bool = False,
+                  attachments: List[Dict[str, str]] = None) -> Dict[str, any]:
+        """
+        Send email using the configured SMTP settings
+        
+        Args:
+            subject: Email subject
+            body: Email body content
+            recipient_emails: Single email or list of recipient emails
+            is_html: Whether the body contains HTML content
+            attachments: List of attachments with 'filename' and 'content' keys
+            
+        Returns:
+            Dictionary with success status and message
+        """
+        if not self.is_configured():
+            return {
+                "success": False,
+                "error": "Email not configured. Please set sender email and password.",
+                "config_status": self.get_config_status()
+            }
+        
+        try:
+            # Convert single email to list
+            if isinstance(recipient_emails, str):
+                recipient_emails = [recipient_emails]
+            
+            # Validate recipient emails
+            valid_recipients = []
+            for email in recipient_emails:
+                if email and '@' in email:
+                    valid_recipients.append(email)
+            
+            if not valid_recipients:
+                return {
+                    "success": False,
+                    "error": "No valid recipient emails provided"
+                }
+            
+            # Create message
+            if is_html:
+                msg = MIMEMultipart('alternative')
+                msg.attach(MIMEText(body, 'html'))
+            else:
+                msg = MIMEText(body)
+            
+            msg['Subject'] = subject
+            msg['From'] = self.sender_email
+            msg['To'] = ', '.join(valid_recipients)
+            
+            # Add attachments if provided
+            if attachments:
+                if not isinstance(msg, MIMEMultipart):
+                    # Convert to multipart if we have attachments
+                    new_msg = MIMEMultipart()
+                    new_msg['Subject'] = msg['Subject']
+                    new_msg['From'] = msg['From']
+                    new_msg['To'] = msg['To']
+                    new_msg.attach(msg)
+                    msg = new_msg
+                
+                for attachment in attachments:
+                    if 'filename' in attachment and 'content' in attachment:
+                        part = MIMEApplication(attachment['content'], Name=attachment['filename'])
+                        part['Content-Disposition'] = f'attachment; filename="{attachment["filename"]}"'
+                        msg.attach(part)
+            
+            # Send email
+            if self.enable_ssl:
+                # SSL connection
+                with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port) as server:
+                    server.login(self.sender_email, self.sender_password)
+                    server.send_message(msg)
+            else:
+                # TLS connection (more common)
+                with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                    server.starttls()
+                    server.login(self.sender_email, self.sender_password)
+                    server.send_message(msg)
+            
+            logger.info(f"Email sent successfully to {len(valid_recipients)} recipients")
+            return {
+                "success": True,
+                "message": f"Email sent successfully to {len(valid_recipients)} recipients",
+                "recipients": valid_recipients
+            }
+            
+        except smtplib.SMTPAuthenticationError as e:
+            error_msg = "SMTP authentication failed. Check email and password."
+            logger.error(f"{error_msg}: {e}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "smtp_error": str(e)
+            }
+        except smtplib.SMTPException as e:
+            error_msg = "SMTP error occurred while sending email"
+            logger.error(f"{error_msg}: {e}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "smtp_error": str(e)
+            }
+        except Exception as e:
+            error_msg = "Unexpected error occurred while sending email"
+            logger.error(f"{error_msg}: {e}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "exception": str(e)
+            }
+
+    def send_alert_email(self, 
+                        sensor_id: str, 
+                        subject: str, 
+                        body: str, 
+                        is_html: bool = False,
+                        additional_recipients: List[str] = None) -> Dict[str, any]:
+        """
+        Send alert email for a specific sensor to its configured recipients
+        
+        Args:
+            sensor_id: The sensor ID to look up recipients for
+            subject: Email subject
+            body: Email body content
+            is_html: Whether the body contains HTML content
+            additional_recipients: Additional email addresses to include
+            
+        Returns:
+            Dictionary with success status and message
+        """
+        # Get recipients from Firebase
+        recipients = self.get_recipients_for_sensor(sensor_id)
+        
+        # Add additional recipients if provided
+        if additional_recipients:
+            if isinstance(additional_recipients, str):
+                additional_recipients = [additional_recipients]
+            recipients.extend(additional_recipients)
+        
+        if not recipients:
+            return {
+                "success": False,
+                "error": f"No recipients configured for sensor {sensor_id}",
+                "sensor_id": sensor_id
+            }
+        
+        # Remove duplicates
+        recipients = list(set(recipients))
+        
+        # Send email
+        result = self.send_email(subject, body, recipients, is_html)
+        result['sensor_id'] = sensor_id
+        result['recipients_count'] = len(recipients)
+        
+        return result
+
+
+# Example usage:
+if __name__ == "__main__":
+    # Initialize the email config
+    email_config = EmailConfig()
+    
+    # Check if configured
+    if email_config.is_configured():
+        # Send a test email
+        result = email_config.send_email(
+            subject="Test Email from EmailConfig",
+            body="This is a test email sent using the EmailConfig class.",
+            recipient_emails="recipient@example.com"
+        )
+        print(result)
+        
+        # Send an alert email for a sensor
+        alert_result = email_config.send_alert_email(
+            sensor_id="sensor_001",
+            subject="Gas Alert - Sensor 001",
+            body="High gas levels detected in sensor 001. Please check immediately.",
+            is_html=False
+        )
+        print(alert_result)
+    else:
+        print("Email not configured. Please set up SMTP settings.")
+        print("Current config status:", email_config.get_config_status())
 
 # ---------------------------------------------------
 # Email Alert Functions
