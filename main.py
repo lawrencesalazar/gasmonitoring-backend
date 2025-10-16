@@ -41,6 +41,7 @@ import pickle
 import base64
 import joblib
 
+import resend
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -186,47 +187,50 @@ def initialize_firebase():
 # Enhanced Email Config with Firebase Integration
 # ---------------------------------------------------
 
-class EmailAlertSystem:
-    """Simplified email alert system with Firebase configuration"""
+import resend
+import os
+import logging
+from typing import List, Dict, Any
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class ResendEmailSystem:
+    """Complete email system using Resend.com (FREE)"""
     
     def __init__(self, db):
         self.db = db
         self._recipient_cache = {}
         self._cache_timeout = 300  # 5 minutes
         
+        # Initialize Resend
+        resend.api_key = os.environ.get("RESEND_API_KEY")
+        if not resend.api_key:
+            logger.warning("RESEND_API_KEY not set in environment variables")
+        
         # Load email configuration from Firebase
         self._load_email_config()
     
     def _load_email_config(self):
-        """Load email configuration from Firebase"""
+        """Load sender email from Firebase"""
         try:
             config_ref = self.db.reference('/email_config/default')
             config = config_ref.get()
             
-            if config:
-                self.smtp_server = config.get('smtp_server', 'smtp.gmail.com')
-                self.smtp_port = config.get('smtp_port', 587)
-                self.sender_email = config.get('sender_email', '')
-                self.sender_password = config.get('sender_password', '')
-                self.enable_ssl = config.get('enable_ssl', False)
-                logger.info("Email configuration loaded from Firebase")
+            if config and config.get('sender_email'):
+                self.sender_email = config['sender_email']
+                logger.info(f"Sender email loaded from Firebase: {self.sender_email}")
             else:
-                # Fallback to environment variables if no Firebase config
-                import os
-                self.smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
-                self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
-                self.sender_email = os.getenv('SENDER_EMAIL', '')
-                self.sender_password = os.getenv('SENDER_PASSWORD', '')
-                self.enable_ssl = os.getenv('SMTP_SSL', 'False').lower() == 'true'
-                logger.info("Email configuration loaded from environment")
+                self.sender_email = "gasvanguard@gmail.com"  # Default fallback
+                logger.warning("Using default sender email - configure in Firebase")
                 
         except Exception as e:
+            self.sender_email = "gasvanguard@gmail.com"
             logger.error(f"Error loading email config: {e}")
-            raise
     
     def is_configured(self):
-        """Check if email is properly configured"""
-        return bool(self.sender_email and self.sender_password)
+        """Check if email system is ready"""
+        return bool(resend.api_key and self.sender_email)
     
     def _get_recipients_for_sensor(self, sensor_id: str) -> List[str]:
         """Get email recipients for a specific sensor from Firebase"""
@@ -282,51 +286,73 @@ class EmailAlertSystem:
         return isinstance(email, str) and '@' in email and '.' in email
     
     def send_email(self, subject: str, body: str, recipient_emails: List[str], is_html: bool = False) -> Dict[str, Any]:
-        """Send email to recipients"""
+        """Send email using Resend API"""
         if not self.is_configured():
-            return {"success": False, "error": "Email not configured"}
+            return {
+                "success": False, 
+                "error": "Email not configured. Set RESEND_API_KEY and sender email."
+            }
         
         if not recipient_emails:
             return {"success": False, "error": "No recipients provided"}
         
         try:
-            # Create message
+            # Convert single email to list if needed
+            if isinstance(recipient_emails, str):
+                recipient_emails = [recipient_emails]
+            
+            # Validate emails
+            valid_recipients = [email for email in recipient_emails if self._is_valid_email(email)]
+            if not valid_recipients:
+                return {"success": False, "error": "No valid email addresses provided"}
+            
+            # Prepare email content
             if is_html:
-                msg = MIMEMultipart('alternative')
-                msg.attach(MIMEText(body, 'html'))
+                html_content = body
+                text_content = self._html_to_text(body)
             else:
-                msg = MIMEText(body)
+                html_content = f"<pre style='font-family: Arial, sans-serif;'>{body}</pre>"
+                text_content = body
             
-            msg['Subject'] = subject
-            msg['From'] = self.sender_email
-            msg['To'] = ', '.join(recipient_emails)
-            
-            # Send email
-            if self.enable_ssl:
-                with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port) as server:
-                    server.login(self.sender_email, self.sender_password)
-                    server.send_message(msg)
-            else:
-                with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                    server.starttls()
-                    server.login(self.sender_email, self.sender_password)
-                    server.send_message(msg)
-            
-            logger.info(f"Email sent to {len(recipient_emails)} recipients")
-            return {
-                "success": True,
-                "message": f"Email sent to {len(recipient_emails)} recipients",
-                "recipients": recipient_emails
+            # Send via Resend
+            params = {
+                "from": f"GasVanguard <{self.sender_email}>",
+                "to": valid_recipients,
+                "subject": subject,
+                "html": html_content,
+                "text": text_content
             }
             
-        except smtplib.SMTPAuthenticationError as e:
-            error_msg = "SMTP authentication failed"
-            logger.error(f"{error_msg}: {e}")
-            return {"success": False, "error": error_msg}
+            email = resend.Emails.send(params)
+            
+            logger.info(f"Email sent via Resend to {len(valid_recipients)} recipients")
+            
+            return {
+                "success": True,
+                "message": f"Email sent to {len(valid_recipients)} recipients",
+                "email_id": email['id'],
+                "recipients": valid_recipients,
+                "service": "Resend",
+                "cost": "FREE"
+            }
+            
         except Exception as e:
-            error_msg = "Failed to send email"
-            logger.error(f"{error_msg}: {e}")
-            return {"success": False, "error": error_msg}
+            error_msg = f"Failed to send email via Resend: {str(e)}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "service": "Resend"
+            }
+    
+    def _html_to_text(self, html: str) -> str:
+        """Simple HTML to text conversion for plain text fallback"""
+        import re
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', '', html)
+        # Replace multiple spaces with single space
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
     
     def send_alert_email(self, sensor_id: str, risk_data: Dict[str, Any]) -> Dict[str, Any]:
         """Send alert email for sensor with risk data"""
@@ -357,11 +383,11 @@ class EmailAlertSystem:
         risk_label = risk_data.get('risk_label', 'Unknown')
         
         if risk_level >= 4:
-            return f"🚨 CRITICAL ALERT - Sensor {sensor_id} - {risk_label}"
+            return f"🚨 CRITICAL GAS ALERT - Sensor {sensor_id} - {risk_label}"
         elif risk_level >= 3:
             return f"⚠️ HIGH RISK ALERT - Sensor {sensor_id} - {risk_label}"
         else:
-            return f"ℹ️ ALERT - Sensor {sensor_id} - {risk_label}"
+            return f"ℹ️ GAS ALERT - Sensor {sensor_id} - {risk_label}"
     
     def _create_alert_body(self, sensor_id: str, risk_data: Dict[str, Any]) -> str:
         """Create HTML alert email body"""
@@ -370,36 +396,59 @@ class EmailAlertSystem:
         # Style based on risk level
         if risk_level >= 4:
             alert_style = "background: #ffebee; color: #c62828; border: 2px solid #f44336;"
+            icon = "🚨"
+            title = "CRITICAL GAS ALERT"
         elif risk_level >= 3:
             alert_style = "background: #fff3e0; color: #ef6c00; border: 2px solid #ff9800;"
+            icon = "⚠️"
+            title = "HIGH RISK ALERT"
         else:
             alert_style = "background: #e8f5e8; color: #2e7d32; border: 2px solid #4caf50;"
+            icon = "ℹ️"
+            title = "GAS ALERT"
+        
+        # Sensor readings
+        readings_html = ""
+        input_data = risk_data.get('input_data', {})
+        if input_data:
+            readings_html = "<h3>📊 Sensor Readings</h3><div style='display: grid; grid-template-columns: 1fr 1fr; gap: 10px;'>"
+            for key, value in input_data.items():
+                readings_html += f"<div style='padding: 8px; background: white; border-radius: 5px;'><strong>{key.title()}:</strong> {value}</div>"
+            readings_html += "</div>"
         
         return f"""
         <html>
-        <head><style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            .alert-box {{ padding: 20px; border-radius: 10px; margin: 10px 0; {alert_style} }}
-            .sensor-info {{ background: #f5f5f5; padding: 15px; border-radius: 5px; }}
-            .values {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-        </style></head>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
+                .alert-box {{ padding: 20px; border-radius: 10px; margin: 10px 0; {alert_style} }}
+                .sensor-info {{ background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 15px 0; }}
+                .footer {{ margin-top: 20px; padding: 15px; background: #e3f2fd; border-radius: 5px; font-size: 12px; color: #666; }}
+            </style>
+        </head>
         <body>
             <div class="alert-box">
-                <h2>Gas Monitoring Alert</h2>
+                <h2>{icon} {title}</h2>
                 <p><strong>Sensor ID:</strong> {sensor_id}</p>
                 <p><strong>Risk Level:</strong> {risk_data.get('risk_label', 'Unknown')}</p>
                 <p><strong>Time:</strong> {risk_data.get('timestamp', 'Unknown')}</p>
+                <p><strong>Risk Index:</strong> {risk_data.get('predicted_risk_index', 0):.2f}</p>
+                <p><strong>AQI:</strong> {risk_data.get('aqi', 0):.1f} ({risk_data.get('aqi_category', 'Unknown')})</p>
             </div>
             
             <div class="sensor-info">
-                <h3>Sensor Readings</h3>
-                <div class="values">
-                    <div><strong>Risk Index:</strong> {risk_data.get('predicted_risk_index', 0):.2f}</div>
-                    <div><strong>AQI:</strong> {risk_data.get('aqi', 0):.1f}</div>
-                </div>
+                {readings_html}
             </div>
             
-            <p><em>This is an automated alert from the Gas Monitoring System.</em></p>
+            <div class="sensor-info">
+                <h3>💡 Recommended Actions</h3>
+                <p>{risk_data.get('recommendation', 'Please check the sensor immediately.')}</p>
+            </div>
+            
+            <div class="footer">
+                <p>This is an automated alert from the Gas Monitoring System.</p>
+                <p>Service: Resend.com | Cost: FREE | Delivery: Instant</p>
+            </div>
         </body>
         </html>
         """
@@ -411,28 +460,6 @@ class EmailAlertSystem:
         else:
             self._recipient_cache.clear()
 
-# Usage example:
-def setup_email_system(db):
-    """Initialize email system with Firebase database"""
-    return EmailAlertSystem(db)
-
-# Send alert example:
-def handle_sensor_alert(db, sensor_id: str, risk_data: Dict[str, Any]):
-    """Handle sensor alert and send email"""
-    email_system = EmailAlertSystem(db)
-    
-    if not email_system.is_configured():
-        logger.warning("Email system not configured - skipping alert")
-        return {"success": False, "error": "Email not configured"}
-    
-    result = email_system.send_alert_email(sensor_id, risk_data)
-    
-    if result['success']:
-        logger.info(f"Alert sent for sensor {sensor_id} to {result['recipients_count']} recipients")
-    else:
-        logger.error(f"Failed to send alert for sensor {sensor_id}: {result['error']}")
-    
-    return result
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
 # ---------------------------------------------------
@@ -1450,7 +1477,7 @@ def predict_risk_endpoint(
     humidity: float = Query(..., description="Humidity percentage"),
     temperature: float = Query(..., description="Temperature in Celsius")
 ):
-    """Predict risk index using pre-trained model"""
+    """Predict risk index using pre-trained model and send alerts if risk > 1"""
     try:
         sensor_data = {
             "methane": methane,
@@ -1476,15 +1503,47 @@ def predict_risk_endpoint(
             "aqi_category": aqi_category,
             "risk_level": risk_level,
             "risk_label": risk_label,
-            "recommendation": recommendation
+            "recommendation": recommendation,
+            "input_data": sensor_data,  # Include input data for email alerts
+            "timestamp": datetime.now().isoformat()
         }
+        
+        # Send email alert if risk index > 1
+        if risk_index > 1:
+            try:
+                email_system = ResendEmailSystem(db)
+                
+                if email_system.is_configured():
+                    alert_result = email_system.send_alert_email(sensor_id, enhanced_result)
+                    
+                    # Add alert status to response
+                    enhanced_result["alert_sent"] = alert_result["success"]
+                    enhanced_result["alert_message"] = alert_result.get("message", "Alert sent")
+                    enhanced_result["recipients_count"] = alert_result.get("recipients_count", 0)
+                    
+                    if alert_result["success"]:
+                        logger.info(f"Alert sent for sensor {sensor_id} - Risk: {risk_index}")
+                    else:
+                        logger.warning(f"Alert failed for sensor {sensor_id}: {alert_result.get('error')}")
+                else:
+                    enhanced_result["alert_sent"] = False
+                    enhanced_result["alert_message"] = "Email system not configured"
+                    logger.warning(f"Email system not configured - alert not sent for sensor {sensor_id}")
+                    
+            except Exception as email_error:
+                enhanced_result["alert_sent"] = False
+                enhanced_result["alert_message"] = f"Alert failed: {str(email_error)}"
+                logger.error(f"Error sending alert for sensor {sensor_id}: {email_error}")
+        else:
+            enhanced_result["alert_sent"] = False
+            enhanced_result["alert_message"] = "No alert needed (risk <= 1)"
         
         return enhanced_result
         
     except Exception as e:
         logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
-
+        
 @app.post("/api/predict/{sensor_id}")
 def predict_risk_bulk(
     sensor_id: str,
@@ -1492,9 +1551,7 @@ def predict_risk_bulk(
 ):
     """Bulk prediction for multiple sensor readings"""
     try:
-        results = []
-        alert_count = 0
-        email_config = EmailConfig()
+        results = [] 
         
         for reading in sensor_readings:
             result = predict_risk_index(sensor_id, reading)
@@ -1511,11 +1568,6 @@ def predict_risk_bulk(
                     "risk_label": risk_label,
                     "recommendation": recommendation
                 }
-                
-                # Check if alert was sent
-                if enhanced_result.get("alert_sent"):
-                    alert_count += 1
-                    
                 results.append(enhanced_result)
             else:
                 results.append({"error": result["error"], "input_data": reading})
@@ -1525,8 +1577,7 @@ def predict_risk_bulk(
             "predictions": results,
             "total_predictions": len(results),
             "successful_predictions": len([r for r in results if "error" not in r]),
-            "alerts_triggered": alert_count,
-            "email_alerts_enabled": email_config.is_configured()
+     
         }
         
     except Exception as e:
@@ -1643,269 +1694,7 @@ def get_latest_sensor_reading(
     except Exception as e:
         logger.error(f"Error fetching sensor readings for {sensor_id}: {str(e)}")
         return {"error": f"Failed to fetch sensor readings: {str(e)}", "sensor_id": sensor_id}
-
-# ---------------------------------------------------
-# Email Configuration Endpoints
-# ---------------------------------------------------
-@app.get("/api/email-config")
-def get_email_config():
-    """Get current email configuration from Firebase"""
-    try:
-        email_system = EmailAlertSystem(db)
-        config = {
-            "smtp_server": email_system.smtp_server,
-            "smtp_port": email_system.smtp_port,
-            "sender_email": email_system.sender_email,
-            "sender_password_set": bool(email_system.sender_password),
-            "enable_ssl": email_system.enable_ssl,
-            "fully_configured": email_system.is_configured()
-        }
-        return config
-    except Exception as e:
-        logger.error(f"Error getting email config: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get email config: {str(e)}")
-
-@app.post("/api/email-config/update")
-def update_email_config(config_update: Dict[str, Any]):
-    """Update email configuration directly in Firebase"""
-    try:
-        # Validate required fields
-        required_fields = ['smtp_server', 'smtp_port', 'sender_email', 'sender_password']
-        for field in required_fields:
-            if field not in config_update or not config_update[field]:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-        
-        # Validate port
-        try:
-            port = int(config_update['smtp_port'])
-            if not (1 <= port <= 65535):
-                raise HTTPException(status_code=400, detail="SMTP port must be between 1 and 65535")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="SMTP port must be a valid number")
-        
-        # Validate email format
-        if '@' not in config_update['sender_email']:
-            raise HTTPException(status_code=400, detail="Invalid sender email format")
-        
-        # Save to Firebase
-        ref = db.reference('/email_config/default')
-        ref.set(config_update)
-        
-        logger.info("Email configuration updated in Firebase")
-        
-        return {
-            "success": True,
-            "message": "Email configuration updated successfully",
-            "config": {
-                "smtp_server": config_update['smtp_server'],
-                "smtp_port": config_update['smtp_port'],
-                "sender_email": config_update['sender_email'],
-                "sender_password_set": True,
-                "enable_ssl": config_update.get('enable_ssl', False),
-                "fully_configured": True
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating email config: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to update email config: {str(e)}")
-
-@app.get("/api/email-config/test-connection")
-def test_email_connection():
-    """Test email configuration with a connection test"""
-    try:
-        email_system = EmailAlertSystem(db)
-        
-        if not email_system.is_configured():
-            return {
-                "success": False,
-                "error": "Email not configured - check Firebase configuration"
-            }
-        
-        # Test SMTP connection
-        if email_system.enable_ssl:
-            server = smtplib.SMTP_SSL(email_system.smtp_server, email_system.smtp_port)
-        else:
-            server = smtplib.SMTP(email_system.smtp_server, email_system.smtp_port)
-            server.starttls()
-        
-        server.login(email_system.sender_email, email_system.sender_password)
-        server.quit()
-        
-        return {
-            "success": True,
-            "message": "Email connection test successful",
-            "config": {
-                "smtp_server": email_system.smtp_server,
-                "sender_email": email_system.sender_email,
-                "configured": email_system.is_configured()
-            }
-        }
-        
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"Email authentication failed: {e}")
-        return {
-            "success": False,
-            "error": "SMTP authentication failed - check email and password"
-        }
-    except Exception as e:
-        logger.error(f"Email connection test failed: {e}")
-        return {
-            "success": False,
-            "error": f"Email connection test failed: {str(e)}"
-        }
-
-@app.post("/api/test-email-alert/{sensor_id}")
-def test_email_alert(sensor_id: str):
-    """Test email alert functionality for a specific sensor"""
-    try:
-        email_system = EmailAlertSystem(db)
-        
-        if not email_system.is_configured():
-            return {"success": False, "error": "Email not configured - check Firebase configuration"}
-        
-        # Create test risk data
-        test_risk_data = {
-            "risk_level": 4,
-            "risk_label": "CRITICAL",
-            "predicted_risk_index": 8.5,
-            "aqi": 280.5,
-            "aqi_category": "Unhealthy",
-            "recommendation": "Air quality is unhealthy. Limit outdoor exposure.",
-            "timestamp": datetime.now().isoformat(),
-            "input_data": {
-                "methane": 45.2,
-                "co2": 420.5,
-                "ammonia": 12.8,
-                "humidity": 65.2,
-                "temperature": 25.8
-            }
-        }
-        
-        result = email_system.send_alert_email(sensor_id, test_risk_data)
-        
-        return {
-            "success": result["success"],
-            "message": result.get("message", result.get("error", "Unknown result")),
-            "sensor_id": sensor_id,
-            "recipients_count": result.get("recipients_count", 0),
-            "recipients": result.get("recipients", [])
-        }
-        
-    except Exception as e:
-        logger.error(f"Email test failed for {sensor_id}: {e}")
-        return {
-            "success": False,
-            "error": f"Email test failed: {str(e)}",
-            "sensor_id": sensor_id
-        }
-
-@app.get("/api/alert-recipients/{sensor_id}")
-def get_alert_recipients(sensor_id: str):
-    """Get current alert recipients for a sensor"""
-    try:
-        email_system = EmailAlertSystem(db)
-        recipients = email_system._get_recipients_for_sensor(sensor_id)
-        
-        return {
-            "success": True,
-            "sensor_id": sensor_id,
-            "recipients": recipients,
-            "recipient_count": len(recipients)
-        }
-    except Exception as e:
-        logger.error(f"Error getting recipients for {sensor_id}: {e}")
-        return {
-            "success": False,
-            "error": f"Failed to get recipients: {str(e)}",
-            "sensor_id": sensor_id
-        }
-
-@app.post("/api/alert-recipients/{sensor_id}")
-def set_alert_recipients(
-    sensor_id: str,
-    recipients: List[str],
-    recipient_type: str = Query("sensor", description="sensor or global")
-):
-    """Set alert recipients for a sensor or globally"""
-    try:
-        # Validate emails
-        valid_recipients = []
-        for email in recipients:
-            if email and isinstance(email, str) and '@' in email and '.' in email:
-                valid_recipients.append(email.strip())
-        
-        if not valid_recipients:
-            return {
-                "success": False,
-                "error": "No valid email addresses provided"
-            }
-        
-        # Save to Firebase
-        if recipient_type == "global":
-            ref = db.reference('/alert_recipients/global/emails')
-        else:
-            ref = db.reference(f'/alert_recipients/{sensor_id}/emails')
-        
-        ref.set(valid_recipients)
-        
-        # Clear cache
-        email_system = EmailAlertSystem(db)
-        email_system.clear_cache(sensor_id if recipient_type == "sensor" else None)
-        
-        logger.info(f"Updated {recipient_type} recipients for {sensor_id}: {valid_recipients}")
-        
-        return {
-            "success": True,
-            "message": f"Recipients updated for {recipient_type}",
-            "sensor_id": sensor_id,
-            "recipients": valid_recipients,
-            "recipient_count": len(valid_recipients)
-        }
-        
-    except Exception as e:
-        logger.error(f"Error setting recipients for {sensor_id}: {e}")
-        return {
-            "success": False,
-            "error": f"Failed to set recipients: {str(e)}",
-            "sensor_id": sensor_id
-        }
-
-@app.delete("/api/alert-recipients/{sensor_id}")
-def clear_alert_recipients(
-    sensor_id: str,
-    recipient_type: str = Query("sensor", description="sensor or global")
-):
-    """Clear alert recipients for a sensor or globally"""
-    try:
-        if recipient_type == "global":
-            ref = db.reference('/alert_recipients/global')
-        else:
-            ref = db.reference(f'/alert_recipients/{sensor_id}')
-        
-        ref.delete()
-        
-        # Clear cache
-        email_system = EmailAlertSystem(db)
-        email_system.clear_cache(sensor_id if recipient_type == "sensor" else None)
-        
-        logger.info(f"Cleared {recipient_type} recipients for {sensor_id}")
-        
-        return {
-            "success": True,
-            "message": f"Recipients cleared for {recipient_type}",
-            "sensor_id": sensor_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Error clearing recipients for {sensor_id}: {e}")
-        return {
-            "success": False,
-            "error": f"Failed to clear recipients: {str(e)}",
-            "sensor_id": sensor_id
-        }
+ 
 # ---------------------------------------------------
 # Health and Debug Endpoints
 # ---------------------------------------------------
@@ -1994,37 +1783,105 @@ def home():
     </body>
     </html>
     """
-###
-# test  
-## 
-@app.get("/test_email_direct")
-def test_email_direct():
-    """Direct email test without Firebase config"""
+###  
+# Email Configuration Endpoints
+@app.get("/api/email-config")
+def get_email_config():
+    """Get current email configuration"""
     try:
-        # self.smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
-        # self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
-        # self.sender_email = os.getenv('SENDER_EMAIL', '')
-        # self.sender_password = os.getenv('SENDER_PASSWORD', '')
-        
-        sender_email = os.getenv('SENDER_EMAIL', '') # Your email
-        app_password =  os.getenv('SENDER_PASSWORD', '')   # Your app password
-        recipient_email = "lawrence.c.salazar@gmail.com"
-        
-        msg = MIMEText("This is a direct test email.")
-        msg['Subject'] = "Direct Test Email"
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
+        email_system = ResendEmailSystem(db)
+        return {
+            "success": True,
+            "service": "Resend",
+            "sender_email": email_system.sender_email,
+            "configured": email_system.is_configured(),
+            "cost": "FREE (250 emails/month)",
+            "api_key_set": bool(os.environ.get("RESEND_API_KEY"))
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(sender_email, app_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
+@app.post("/api/email-config/update")
+def update_email_config(config_update: Dict[str, Any]):
+    """Update email configuration in Firebase"""
+    try:
+        if 'sender_email' not in config_update:
+            return {"success": False, "error": "sender_email is required"}
         
-        return {"success": True, "message": "Direct email sent successfully!"}
+        ref = db.reference('/email_config/default')
+        ref.set({
+            "sender_email": config_update['sender_email'],
+            "service": "resend",
+            "updated_at": datetime.now().isoformat()
+        })
+        
+        return {
+            "success": True,
+            "message": "Email configuration updated",
+            "sender_email": config_update['sender_email'],
+            "service": "Resend"
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Test Endpoints
+@app.get("/test-email-resend")
+def test_email_resend():
+    """Test Resend email integration"""
+    try:
+        email_system = ResendEmailSystem(db)
+        
+        if not email_system.is_configured():
+            return {
+                "success": False,
+                "error": "Resend not configured. Set RESEND_API_KEY environment variable.",
+                "setup_required": True
+            }
+        
+        result = email_system.send_email(
+            subject="Resend Integration Test",
+            body="<h1>Resend Test Successful! 🎉</h1><p>Your email system is now working with Resend.com</p>",
+            recipient_emails=["lawrence.c.salazar@gmail.com"],
+            is_html=True
+        )
+        
+        return result
         
     except Exception as e:
-        return {"success": False, "error": f"Direct email failed: {str(e)}"}
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/test-email-alert/{sensor_id}")
+def test_email_alert(sensor_id: str):
+    """Test email alert functionality"""
+    try:
+        email_system = ResendEmailSystem(db)
         
+        if not email_system.is_configured():
+            return {"success": False, "error": "Email system not configured"}
+        
+        test_risk_data = {
+            "risk_level": 4,
+            "risk_label": "CRITICAL",
+            "predicted_risk_index": 8.5,
+            "aqi": 280.5,
+            "aqi_category": "Unhealthy",
+            "recommendation": "Air quality is unhealthy. Limit outdoor exposure. Use air purifiers if available.",
+            "timestamp": datetime.now().isoformat(),
+            "input_data": {
+                "methane": 45.2,
+                "co2": 420.5,
+                "ammonia": 12.8,
+                "humidity": 65.2,
+                "temperature": 25.8
+            }
+        }
+        
+        result = email_system.send_alert_email(sensor_id, test_risk_data)
+        return result
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+  
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
