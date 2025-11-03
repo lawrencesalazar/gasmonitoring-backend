@@ -702,13 +702,28 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
         # Get recent sensor data
         df = fetch_history(sensor_id, "1week")
         if df.empty:
-            return {"error": f"No recent data found for sensor {sensor_id}"}
+            # Return proper JSON response instead of raising exception
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": f"No recent data found for sensor {sensor_id}",
+                    "sensor_id": sensor_id
+                }
+            )
         
         # Get the latest reading
         latest_reading = df.iloc[-1] if not df.empty else None
         
         if latest_reading is None:
-            return {"error": "No valid sensor data found"}
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "No valid sensor data found",
+                    "sensor_id": sensor_id
+                }
+            )
         
         # Check each gas against thresholds
         compliance_check = {}
@@ -716,6 +731,10 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
             if gas in thresholds and gas in latest_reading:
                 concentration = latest_reading[gas]
                 limits = thresholds[gas]
+                
+                # Handle NaN or None values
+                if pd.isna(concentration):
+                    concentration = 0
                 
                 compliance_check[gas] = {
                     'current_value': float(concentration),
@@ -729,6 +748,19 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
                              'WARNING' if concentration <= limits['stel'] else
                              'DANGER' if concentration <= limits['idlh'] else 'CRITICAL'
                 }
+            else:
+                # Handle missing gas data
+                compliance_check[gas] = {
+                    'current_value': 0,
+                    'twa_limit': thresholds.get(gas, {}).get('twa', 0),
+                    'stel_limit': thresholds.get(gas, {}).get('stel', 0),
+                    'idlh_limit': thresholds.get(gas, {}).get('idlh', 0),
+                    'within_twa': True,
+                    'within_stel': True,
+                    'within_idlh': True,
+                    'status': 'SAFE',
+                    'note': 'No data available for this gas'
+                }
         
         return {
             "success": True,
@@ -740,7 +772,15 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
         
     except Exception as e:
         logger.error(f"Error verifying thresholds for {sensor_id}: {e}")
-        return {"success": False, "error": str(e)}
+        # Return proper JSON response with CORS-friendly format
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": f"Internal server error: {str(e)}",
+                "sensor_id": sensor_id
+            }
+        )
         
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
