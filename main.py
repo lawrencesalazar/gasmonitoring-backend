@@ -466,7 +466,7 @@ class EmailJSEmailSystem:
             ---
             Gas Monitoring System Alert
             From: {self.sender_email}
-            Sent via EmailJS API | Service: FREE | Works on Render: ✅
+          
             """
         
         return message
@@ -580,7 +580,168 @@ def test_email_alert(sensor_id: str):
         
     except Exception as e:
         return {"success": False, "error": str(e)} 
+        
+# ---------------------------------------------------
+# Threshold Management Functions
+# ---------------------------------------------------
 
+def fetch_exposure_thresholds():
+    """Fetch exposure thresholds from Firebase Realtime Database"""
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot fetch thresholds")
+            return get_default_thresholds()
+        
+        ref = db.reference('/threshold')
+        thresholds_data = ref.get()
+        
+        if not thresholds_data:
+            logger.warning("No threshold data found in Firebase, using defaults")
+            return get_default_thresholds()
+        
+        # Transform Firebase data to match expected format
+        exposure_limits = {}
+        
+        for gas_name, limits in thresholds_data.items():
+            if isinstance(limits, dict):
+                exposure_limits[gas_name.lower()] = {
+                    'stel': limits.get('stel', 0),
+                    'twa': limits.get('twa', 0),
+                    'idlh': limits.get('idlh', 0)
+                }
+        
+        logger.info(f"Loaded thresholds for gases: {list(exposure_limits.keys())}")
+        return exposure_limits
+        
+    except Exception as e:
+        logger.error(f"Error fetching exposure thresholds: {e}")
+        return get_default_thresholds()
+
+def get_default_thresholds():
+    """Return default thresholds as fallback"""
+    return {
+        'methane': {'stel': 1000, 'twa': 1000, 'idlh': 50000},
+        'co2': {'stel': 30000, 'twa': 5000, 'idlh': 40000},
+        'ammonia': {'stel': 35, 'twa': 25, 'idlh': 500}
+    }
+
+def update_thresholds_in_firebase(gas_name, new_limits):
+    """Update thresholds for a specific gas in Firebase"""
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot update thresholds")
+            return False
+        
+        ref = db.reference(f'/threshold/{gas_name}')
+        ref.set(new_limits)
+        
+        logger.info(f"Updated thresholds for {gas_name} in Firebase")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error updating thresholds for {gas_name}: {e}")
+        return False
+
+# ---------------------------------------------------
+# Threshold Management Endpoints
+# ---------------------------------------------------
+
+@app.get("/api/thresholds")
+def get_current_thresholds():
+    """Get current exposure thresholds from Firebase"""
+    try:
+        thresholds = fetch_exposure_thresholds()
+        return {
+            "success": True,
+            "thresholds": thresholds,
+            "source": "firebase",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error fetching thresholds: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/thresholds/{gas_name}")
+def update_gas_thresholds(
+    gas_name: str,
+    stel: float = Query(..., description="Short Term Exposure Limit"),
+    twa: float = Query(..., description="Time Weighted Average"),
+    idlh: float = Query(..., description="Immediately Dangerous to Life and Health")
+):
+    """Update thresholds for a specific gas"""
+    try:
+        new_limits = {
+            'stel': stel,
+            'twa': twa,
+            'idlh': idlh
+        }
+        
+        success = update_thresholds_in_firebase(gas_name, new_limits)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Thresholds updated for {gas_name}",
+                "new_limits": new_limits,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update thresholds in Firebase")
+            
+    except Exception as e:
+        logger.error(f"Error updating thresholds for {gas_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Threshold update failed: {str(e)}")
+
+@app.get("/api/thresholds/verify/{sensor_id}")
+def verify_thresholds_with_sensor_data(sensor_id: str):
+    """Verify current thresholds against recent sensor data"""
+    try:
+        # Get current thresholds
+        thresholds = fetch_exposure_thresholds()
+        
+        # Get recent sensor data
+        df = fetch_history(sensor_id, "1week")
+        if df.empty:
+            return {"error": f"No recent data found for sensor {sensor_id}"}
+        
+        # Get the latest reading
+        latest_reading = df.iloc[-1] if not df.empty else None
+        
+        if latest_reading is None:
+            return {"error": "No valid sensor data found"}
+        
+        # Check each gas against thresholds
+        compliance_check = {}
+        for gas in ['methane', 'co2', 'ammonia']:
+            if gas in thresholds and gas in latest_reading:
+                concentration = latest_reading[gas]
+                limits = thresholds[gas]
+                
+                compliance_check[gas] = {
+                    'current_value': float(concentration),
+                    'twa_limit': limits['twa'],
+                    'stel_limit': limits['stel'],
+                    'idlh_limit': limits['idlh'],
+                    'within_twa': concentration <= limits['twa'],
+                    'within_stel': concentration <= limits['stel'],
+                    'within_idlh': concentration <= limits['idlh'],
+                    'status': 'SAFE' if concentration <= limits['twa'] else 
+                             'WARNING' if concentration <= limits['stel'] else
+                             'DANGER' if concentration <= limits['idlh'] else 'CRITICAL'
+                }
+        
+        return {
+            "success": True,
+            "sensor_id": sensor_id,
+            "timestamp": datetime.now().isoformat(),
+            "compliance_check": compliance_check,
+            "thresholds_source": "firebase"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error verifying thresholds for {sensor_id}: {e}")
+        return {"success": False, "error": str(e)}
+        
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
 # ---------------------------------------------------
@@ -888,19 +1049,20 @@ def xgboost_model(
 
 def calculate_regulatory_risk(methane, co2, ammonia, humidity, temperature):
     """
-    Risk index based on regulatory exposure limits
+    Risk index based on regulatory exposure limits from Firebase
     """
-    # OSHA and NIOSH exposure limits (adjust based on your region)
-    exposure_limits = {
-        'methane': {'stel': 1000, 'twa': 1000, 'idlh': 50000},  # Short-term, Time-weighted, Immediately Dangerous
-        'co2': {'stel': 30000, 'twa': 5000, 'idlh': 40000},
-        'ammonia': {'stel': 35, 'twa': 25, 'idlh': 500}
-    }
+    # Fetch current thresholds from Firebase
+    exposure_limits = fetch_exposure_thresholds()
     
     risks = []
     
     # Calculate compliance risk for each gas
     for gas, concentration in [('methane', methane), ('co2', co2), ('ammonia', ammonia)]:
+        if gas not in exposure_limits:
+            logger.warning(f"No thresholds found for {gas}, using default risk calculation")
+            risks.append(5)  # Medium risk as fallback
+            continue
+            
         limits = exposure_limits[gas]
         
         if concentration <= limits['twa']:
@@ -910,7 +1072,7 @@ def calculate_regulatory_risk(methane, co2, ammonia, humidity, temperature):
         elif concentration <= limits['idlh']:
             risk = 6  # Exceeded STEL but below IDLH
         else:
-            risk = 9 # Immediately dangerous
+            risk = 9  # Immediately dangerous
             
         risks.append(risk)
     
