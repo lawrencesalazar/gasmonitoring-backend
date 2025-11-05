@@ -1242,7 +1242,7 @@ def generate_sample_data():
     
     # for aqi_min, aqi_max, risk_min, risk_max in aqi_thresholds:
         # if risk_min <= risk_index <= risk_max:
-            Linear interpolation within this category
+           # Linear interpolation within this category
             # aqi = aqi_min + (risk_index - risk_min) * (aqi_max - aqi_min) / (risk_max - risk_min)
             # return min(max(aqi, 0), 500)
     
