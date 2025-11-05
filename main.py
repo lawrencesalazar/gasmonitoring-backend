@@ -701,87 +701,164 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
         
         # Get recent sensor data
         df = fetch_history(sensor_id, "1week")
-        if df.empty:
-            # Return proper JSON response instead of raising exception
+        
+        # Enhanced empty DataFrame check
+        if df.empty or len(df) == 0:
+            logger.warning(f"No data found for sensor {sensor_id}")
             return JSONResponse(
                 status_code=404,
                 content={
                     "success": False,
                     "error": f"No recent data found for sensor {sensor_id}",
-                    "sensor_id": sensor_id
+                    "sensor_id": sensor_id,
+                    "timestamp": datetime.now().isoformat()
                 }
             )
         
-        # Get the latest reading
-        latest_reading = df.iloc[-1] if not df.empty else None
+        # Check if required columns exist
+        required_columns = ['methane', 'co2', 'ammonia']
+        missing_columns = [col for col in required_columns if col not in df.columns]
         
-        if latest_reading is None:
+        if missing_columns:
+            logger.warning(f"Missing columns in sensor data: {missing_columns}")
+        
+        # Get the latest reading with safety checks
+        try:
+            latest_reading = df.iloc[-1] if not df.empty else None
+            
+            # Check if latest_reading is valid
+            if latest_reading is None or pd.isna(latest_reading).all():
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "success": False,
+                        "error": "No valid sensor readings found",
+                        "sensor_id": sensor_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+                
+        except (IndexError, KeyError) as e:
+            logger.error(f"Error accessing latest reading: {e}")
             return JSONResponse(
                 status_code=404,
                 content={
                     "success": False,
-                    "error": "No valid sensor data found",
-                    "sensor_id": sensor_id
+                    "error": "Cannot access sensor readings",
+                    "sensor_id": sensor_id,
+                    "timestamp": datetime.now().isoformat()
                 }
             )
         
-        # Check each gas against thresholds
+        # Check each gas against thresholds with enhanced error handling
         compliance_check = {}
         for gas in ['methane', 'co2', 'ammonia']:
-            if gas in thresholds and gas in latest_reading:
-                concentration = latest_reading[gas]
-                limits = thresholds[gas]
-                
-                # Handle NaN or None values
-                if pd.isna(concentration):
+            try:
+                if gas in thresholds:
+                    limits = thresholds[gas]
+                    
+                    # Safely get concentration value
                     concentration = 0
-                
-                compliance_check[gas] = {
-                    'current_value': float(concentration),
-                    'twa_limit': limits['twa'],
-                    'stel_limit': limits['stel'],
-                    'idlh_limit': limits['idlh'],
-                    'within_twa': concentration <= limits['twa'],
-                    'within_stel': concentration <= limits['stel'],
-                    'within_idlh': concentration <= limits['idlh'],
-                    'status': 'SAFE' if concentration <= limits['twa'] else 
-                             'WARNING' if concentration <= limits['stel'] else
-                             'DANGER' if concentration <= limits['idlh'] else 'CRITICAL'
-                }
-            else:
-                # Handle missing gas data
+                    if gas in df.columns and gas in latest_reading:
+                        concentration_val = latest_reading[gas]
+                        if pd.isna(concentration_val) or concentration_val is None:
+                            concentration = 0
+                        else:
+                            concentration = float(concentration_val)
+                    
+                    # Calculate compliance status
+                    within_twa = concentration <= limits['twa']
+                    within_stel = concentration <= limits['stel']
+                    within_idlh = concentration <= limits['idlh']
+                    
+                    # Determine status
+                    if within_twa:
+                        status = 'SAFE'
+                    elif within_stel:
+                        status = 'WARNING'
+                    elif within_idlh:
+                        status = 'DANGER'
+                    else:
+                        status = 'CRITICAL'
+                    
+                    compliance_check[gas] = {
+                        'current_value': concentration,
+                        'twa_limit': limits['twa'],
+                        'stel_limit': limits['stel'],
+                        'idlh_limit': limits['idlh'],
+                        'within_twa': within_twa,
+                        'within_stel': within_stel,
+                        'within_idlh': within_idlh,
+                        'status': status,
+                        'data_available': gas in df.columns and not pd.isna(latest_reading.get(gas))
+                    }
+                else:
+                    # Handle missing threshold data
+                    compliance_check[gas] = {
+                        'current_value': 0,
+                        'twa_limit': 0,
+                        'stel_limit': 0,
+                        'idlh_limit': 0,
+                        'within_twa': True,
+                        'within_stel': True,
+                        'within_idlh': True,
+                        'status': 'UNKNOWN',
+                        'note': f'No threshold data available for {gas}'
+                    }
+                    
+            except Exception as gas_error:
+                logger.error(f"Error processing gas {gas}: {gas_error}")
                 compliance_check[gas] = {
                     'current_value': 0,
-                    'twa_limit': thresholds.get(gas, {}).get('twa', 0),
-                    'stel_limit': thresholds.get(gas, {}).get('stel', 0),
-                    'idlh_limit': thresholds.get(gas, {}).get('idlh', 0),
+                    'twa_limit': 0,
+                    'stel_limit': 0,
+                    'idlh_limit': 0,
                     'within_twa': True,
                     'within_stel': True,
                     'within_idlh': True,
-                    'status': 'SAFE',
-                    'note': 'No data available for this gas'
+                    'status': 'ERROR',
+                    'note': f'Error processing {gas} data: {str(gas_error)}'
                 }
+        
+        # Add data summary
+        data_summary = {
+            "total_readings": len(df),
+            "date_range": {
+                "start": df['timestamp'].min().isoformat() if 'timestamp' in df.columns and not df.empty else "Unknown",
+                "end": df['timestamp'].max().isoformat() if 'timestamp' in df.columns and not df.empty else "Unknown"
+            },
+            "data_quality": {
+                "has_methane": 'methane' in df.columns,
+                "has_co2": 'co2' in df.columns,
+                "has_ammonia": 'ammonia' in df.columns
+            }
+        }
         
         return {
             "success": True,
             "sensor_id": sensor_id,
             "timestamp": datetime.now().isoformat(),
             "compliance_check": compliance_check,
-            "thresholds_source": "firebase"
+            "thresholds_source": "firebase",
+            "data_summary": data_summary
         }
         
     except Exception as e:
         logger.error(f"Error verifying thresholds for {sensor_id}: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error details: {str(e)}")
+        
         # Return proper JSON response with CORS-friendly format
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
                 "error": f"Internal server error: {str(e)}",
-                "sensor_id": sensor_id
+                "sensor_id": sensor_id,
+                "timestamp": datetime.now().isoformat(),
+                "error_type": type(e).__name__
             }
-        )
-        
+        )      
 # ---------------------------------------------------
 # Data Fetching Function with Fallback
 # ---------------------------------------------------
