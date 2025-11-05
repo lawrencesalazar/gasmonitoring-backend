@@ -1226,19 +1226,120 @@ def generate_sample_data():
         logger.error(f"Error generating sample data: {e}")
         return pd.DataFrame()
         
-def convert_risk_to_aqi(risk_index):
-    """
-    Piecewise Linear Scaling
-    Convert risk index to AQI (0-500 scale) 
-    """
+# def convert_risk_to_aqi(risk_index):
+    # """
+    # Piecewise Linear Scaling
+    # Convert risk index to AQI (0-500 scale) 
+    # """
     
-    # AQI categories and their corresponding risk index ranges 
-    aqi_thresholds = [
+   ## AQI categories and their corresponding risk index ranges 
+    # aqi_thresholds = [
+        # (0, 50, 0, 3),      # Good: 0-50 AQI, 0-3 risk
+        # (51, 100, 3.1, 7),  # Moderate: 51-100 AQI, 3.1-7 risk  
+        # (101, 150, 7.1, 9), # Unhealthy for Sensitive: 101-150 AQI, 7.1-9 risk
+        # (151, 500, 9.1, 10) # Unhealthy/Very Unhealthy: 151-500 AQI, 9.1-10 risk
+    # ]
+    
+    # for aqi_min, aqi_max, risk_min, risk_max in aqi_thresholds:
+        # if risk_min <= risk_index <= risk_max:
+            Linear interpolation within this category
+            # aqi = aqi_min + (risk_index - risk_min) * (aqi_max - aqi_min) / (risk_max - risk_min)
+            # return min(max(aqi, 0), 500)
+    
+   ## Fallback: cap at extremes
+    # if risk_index < 1:
+        # return 10
+    # else:
+        # return 500 
+# ---------------------------------------------------
+# AQI Threshold Management Functions
+# ---------------------------------------------------
+
+def fetch_aqi_thresholds():
+    """Fetch AQI thresholds from Firebase Realtime Database"""
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot fetch AQI thresholds")
+            return get_default_aqi_thresholds()
+        
+        ref = db.reference('/aqi_threshold')
+        aqi_thresholds_data = ref.get()
+        
+        if not aqi_thresholds_data:
+            logger.warning("No AQI threshold data found in Firebase, using defaults")
+            return get_default_aqi_thresholds()
+        
+        # Validate and transform the data
+        validated_thresholds = []
+        for threshold in aqi_thresholds_data:
+            if all(key in threshold for key in ['aqi_min', 'aqi_max', 'risk_min', 'risk_max']):
+                validated_thresholds.append((
+                    float(threshold['aqi_min']),
+                    float(threshold['aqi_max']),
+                    float(threshold['risk_min']),
+                    float(threshold['risk_max'])
+                ))
+        
+        if not validated_thresholds:
+            logger.warning("Invalid AQI threshold structure in Firebase, using defaults")
+            return get_default_aqi_thresholds()
+        
+        logger.info(f"Loaded {len(validated_thresholds)} AQI thresholds from Firebase")
+        return validated_thresholds
+        
+    except Exception as e:
+        logger.error(f"Error fetching AQI thresholds: {e}")
+        return get_default_aqi_thresholds()
+
+def get_default_aqi_thresholds():
+    """Return default AQI thresholds as fallback"""
+    return [
         (0, 50, 0, 3),      # Good: 0-50 AQI, 0-3 risk
         (51, 100, 3.1, 7),  # Moderate: 51-100 AQI, 3.1-7 risk  
         (101, 150, 7.1, 9), # Unhealthy for Sensitive: 101-150 AQI, 7.1-9 risk
         (151, 500, 9.1, 10) # Unhealthy/Very Unhealthy: 151-500 AQI, 9.1-10 risk
     ]
+
+def update_aqi_thresholds_in_firebase(new_thresholds):
+    """Update AQI thresholds in Firebase"""
+    try:
+        if not firebase_db:
+            logger.error("Firebase not initialized - cannot update AQI thresholds")
+            return False
+        
+        # Validate the new thresholds structure
+        validated_thresholds = []
+        for threshold in new_thresholds:
+            if (isinstance(threshold, (list, tuple)) and len(threshold) == 4 and
+                all(isinstance(x, (int, float)) for x in threshold)):
+                validated_thresholds.append({
+                    'aqi_min': float(threshold[0]),
+                    'aqi_max': float(threshold[1]),
+                    'risk_min': float(threshold[2]),
+                    'risk_max': float(threshold[3])
+                })
+        
+        if not validated_thresholds:
+            logger.error("Invalid AQI thresholds format provided")
+            return False
+        
+        ref = db.reference('/aqi_threshold')
+        ref.set(validated_thresholds)
+        
+        logger.info(f"Updated AQI thresholds in Firebase with {len(validated_thresholds)} categories")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error updating AQI thresholds in Firebase: {e}")
+        return False
+
+def convert_risk_to_aqi(risk_index):
+    """
+    Piecewise Linear Scaling
+    Convert risk index to AQI (0-500 scale) using thresholds from Firebase
+    """
+    # Fetch thresholds from Firebase (with fallback to defaults)
+    aqi_thresholds = fetch_aqi_thresholds()
     
     for aqi_min, aqi_max, risk_min, risk_max in aqi_thresholds:
         if risk_min <= risk_index <= risk_max:
@@ -1247,10 +1348,117 @@ def convert_risk_to_aqi(risk_index):
             return min(max(aqi, 0), 500)
     
     # Fallback: cap at extremes
-    if risk_index < 1:
-        return 10
-    else:
-        return 500 
+    if risk_index < aqi_thresholds[0][2]:  # Below first risk_min
+        return max(aqi_thresholds[0][0], 0)
+    else:  # Above last risk_max
+        return min(aqi_thresholds[-1][1], 500)
+
+# ---------------------------------------------------
+# AQI Threshold Management Endpoints
+# ---------------------------------------------------
+
+@app.get("/api/aqi-thresholds")
+def get_current_aqi_thresholds():
+    """Get current AQI thresholds from Firebase"""
+    try:
+        thresholds = fetch_aqi_thresholds()
+        return {
+            "success": True,
+            "aqi_thresholds": [
+                {
+                    "aqi_min": t[0],
+                    "aqi_max": t[1], 
+                    "risk_min": t[2],
+                    "risk_max": t[3],
+                    "category": get_aqi_category_name(t[0], t[1])
+                }
+                for t in thresholds
+            ],
+            "source": "firebase",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error fetching AQI thresholds: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/aqi-thresholds")
+def update_aqi_thresholds(new_thresholds: List[Dict[str, float]]):
+    """Update AQI thresholds in Firebase"""
+    try:
+        # Convert the list of dicts to the expected format
+        thresholds_list = []
+        for threshold in new_thresholds:
+            if all(key in threshold for key in ['aqi_min', 'aqi_max', 'risk_min', 'risk_max']):
+                thresholds_list.append((
+                    threshold['aqi_min'],
+                    threshold['aqi_max'], 
+                    threshold['risk_min'],
+                    threshold['risk_max']
+                ))
+        
+        success = update_aqi_thresholds_in_firebase(thresholds_list)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"AQI thresholds updated successfully",
+                "new_thresholds": new_thresholds,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update AQI thresholds in Firebase")
+            
+    except Exception as e:
+        logger.error(f"Error updating AQI thresholds: {e}")
+        raise HTTPException(status_code=500, detail=f"AQI threshold update failed: {str(e)}")
+
+@app.post("/api/aqi-thresholds/reset")
+def reset_aqi_thresholds():
+    """Reset AQI thresholds to default values"""
+    try:
+        default_thresholds = get_default_aqi_thresholds()
+        success = update_aqi_thresholds_in_firebase(default_thresholds)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "AQI thresholds reset to default values",
+                "default_thresholds": [
+                    {
+                        "aqi_min": t[0],
+                        "aqi_max": t[1],
+                        "risk_min": t[2], 
+                        "risk_max": t[3],
+                        "category": get_aqi_category_name(t[0], t[1])
+                    }
+                    for t in default_thresholds
+                ],
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to reset AQI thresholds")
+            
+    except Exception as e:
+        logger.error(f"Error resetting AQI thresholds: {e}")
+        raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+def get_aqi_category_name(aqi_min, aqi_max):
+    """Get human-readable AQI category name"""
+    categories = {
+        (0, 50): "Good",
+        (51, 100): "Moderate", 
+        (101, 150): "Unhealthy for Sensitive Groups",
+        (151, 200): "Unhealthy",
+        (201, 300): "Very Unhealthy",
+        (301, 500): "Hazardous"
+    }
+    
+    for (min_val, max_val), name in categories.items():
+        if aqi_min == min_val and aqi_max == max_val:
+            return name
+    
+    return "Custom Range"
+
 
 def calculate_risk_category(risk_index):
     """
