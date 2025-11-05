@@ -1262,7 +1262,7 @@ def fetch_aqi_thresholds():
             logger.error("Firebase not initialized - cannot fetch AQI thresholds")
             return get_default_aqi_thresholds()
         
-        ref = db.reference('/aqi_threshold')
+        ref = db.reference('/aqi_thresholds')
         aqi_thresholds_data = ref.get()
         
         if not aqi_thresholds_data:
