@@ -2959,7 +2959,7 @@ def get_live_prediction_endpoint(sensor_id: str):
     # async def event_generator():
         # while True:
             # try:
-                Get latest forecast (with timeout)
+                ##Get latest forecast (with timeout)
                 # forecast_data = generate_forecast(sensor_id, 12)
                 # live_data = get_live_predictions(sensor_id)
                 
@@ -2975,7 +2975,7 @@ def get_live_prediction_endpoint(sensor_id: str):
                     # error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
                     # yield f"data: {json.dumps({'error': error_msg, 'timestamp': datetime.now().isoformat()})}\n\n"
                 
-                Wait before next update
+               ## Wait before next update
                 # await asyncio.sleep(30)  # Reduce to 30 seconds for better responsiveness
                 
             # except asyncio.CancelledError:
@@ -3000,7 +3000,7 @@ def get_live_prediction_endpoint(sensor_id: str):
         # }
     # )
 
-# Add OPTIONS endpoint for SSE CORS preflight
+# #Add OPTIONS endpoint for SSE CORS preflight
 # @app.options("/api/forecast/stream/{sensor_id}")
 # async def sse_preflight(sensor_id: str):
     # return JSONResponse(
