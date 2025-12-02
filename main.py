@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import io
 import base64
-import logging
+import logging 
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
 from xgboost import XGBRegressor
@@ -2670,6 +2670,229 @@ def home():
     """
 ###  
 # Email Configuration Endpoints
+ 
+ ### Forecast Live preview
+# Add these functions to your FastAPI backend
+
+def generate_forecast(sensor_id: str, steps: int = 24):
+    """Generate future forecast using trained XGBoost model"""
+    try:
+        # Load the trained model
+        model = load_model_from_firebase(sensor_id)
+        if not model:
+            return {"error": f"No trained model found for sensor {sensor_id}"}
+        
+        # Load model metadata
+        metadata = load_model_metadata(sensor_id)
+        if not metadata:
+            return {"error": "Model metadata not found"}
+        
+        feature_columns = metadata.get('feature_columns', [])
+        
+        # Get recent historical data for context
+        df = fetch_history(sensor_id, "1week")
+        if df.empty:
+            return {"error": "No historical data available for forecasting"}
+        
+        # Prepare the latest data point as starting point
+        latest_data = df.iloc[-1]
+        
+        # Create future timestamps
+        last_timestamp = latest_data['timestamp'] if 'timestamp' in df.columns else datetime.now()
+        future_timestamps = [last_timestamp + timedelta(hours=i) for i in range(1, steps + 1)]
+        
+        forecasts = []
+        current_features = {}
+        
+        # Initialize with latest values for each feature
+        for feature in feature_columns:
+            if feature in latest_data:
+                current_features[feature] = float(latest_data[feature])
+            else:
+                # Use average if feature not in latest data
+                current_features[feature] = float(df[feature].mean()) if feature in df.columns else 0
+        
+        # Generate forecasts
+        for i in range(steps):
+            # Create input DataFrame for prediction
+            input_data = pd.DataFrame([current_features])
+            
+            # Ensure all required features are present
+            for feature in feature_columns:
+                if feature not in input_data.columns:
+                    input_data[feature] = current_features.get(feature, 0)
+            
+            input_data = input_data[feature_columns]
+            
+            # Predict next risk index
+            try:
+                risk_index = model.predict(input_data)[0]
+            except:
+                # If prediction fails, use historical average
+                risk_index = df['riskIndex'].mean() if 'riskIndex' in df.columns else 5
+            
+            # Convert to AQI
+            aqi = convert_risk_to_aqi(risk_index)
+            risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
+            
+            # Add to forecasts
+            forecast_entry = {
+                "timestamp": future_timestamps[i].isoformat(),
+                "predicted_risk_index": float(risk_index),
+                "aqi": float(aqi),
+                "aqi_category": aqi_category,
+                "risk_level": risk_level,
+                "risk_label": risk_label,
+                "step": i + 1,
+                "hour_offset": i + 1
+            }
+            forecasts.append(forecast_entry)
+            
+            # Update features for next prediction (simple auto-regressive approach)
+            # In a real system, you'd want to update features based on patterns
+            for feature in ['methane', 'co2', 'ammonia']:
+                if feature in current_features:
+                    # Add small random variation for demonstration
+                    current_features[feature] *= (1 + np.random.uniform(-0.05, 0.05))
+        
+        # Get historical risk indices for comparison
+        historical_risks = []
+        if 'riskIndex' in df.columns and 'timestamp' in df.columns:
+            historical_data = df.tail(24)  # Last 24 hours
+            for idx, row in historical_data.iterrows():
+                historical_risks.append({
+                    "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                    "risk_index": float(row['riskIndex']),
+                    "aqi": float(convert_risk_to_aqi(row['riskIndex'])),
+                    "is_historical": True
+                })
+        
+        return {
+            "sensor_id": sensor_id,
+            "historical_data": historical_risks,
+            "forecast": forecasts,
+            "forecast_hours": steps,
+            "generated_at": datetime.now().isoformat(),
+            "model_info": {
+                "model_type": "XGBoost",
+                "features_used": feature_columns,
+                "last_trained": metadata.get('last_trained'),
+                "training_metrics": metadata.get('training_metrics', {})
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating forecast for {sensor_id}: {e}")
+        return {"error": f"Forecast generation failed: {str(e)}"}
+
+def get_live_predictions(sensor_id: str):
+    """Get live predictions for the current sensor readings"""
+    try:
+        # Get latest sensor reading
+        latest_reading_ref = db.reference(f'/sensorReadings')
+        readings_data = latest_reading_ref.order_by_child('sensorID').equal_to(sensor_id).limit_to_last(1).get()
+        
+        if not readings_data:
+            return {"error": f"No live readings found for sensor {sensor_id}"}
+        
+        # Get the latest reading
+        latest_key = list(readings_data.keys())[0]
+        latest_reading = readings_data[latest_key]
+        
+        # Prepare sensor data for prediction
+        sensor_data = {
+            "methane": latest_reading.get('methane', 0),
+            "co2": latest_reading.get('co2', 0),
+            "ammonia": latest_reading.get('ammonia', 0),
+            "humidity": latest_reading.get('humidity', 0),
+            "temperature": latest_reading.get('temperature', 0)
+        }
+        
+        # Predict risk index
+        prediction_result = predict_risk_index(sensor_id, sensor_data, use_regulatory_calculation=False)
+        
+        if "error" in prediction_result:
+            # Fallback to regulatory calculation
+            prediction_result = predict_risk_index(sensor_id, sensor_data, use_regulatory_calculation=True)
+        
+        # Add live data info
+        prediction_result["is_live"] = True
+        prediction_result["reading_timestamp"] = latest_reading.get('timestamp')
+        prediction_result["sensor_reading_id"] = latest_key
+        
+        return prediction_result
+        
+    except Exception as e:
+        logger.error(f"Error getting live predictions for {sensor_id}: {e}")
+        return {"error": f"Live prediction failed: {str(e)}"}
+
+# Add these endpoints to your FastAPI app
+
+@app.get("/api/forecast/{sensor_id}")
+def get_forecast(
+    sensor_id: str,
+    steps: int = Query(24, description="Number of forecast steps (hours)", ge=1, le=168)
+):
+    """Get predictive forecast for sensor"""
+    try:
+        result = generate_forecast(sensor_id, steps)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    except Exception as e:
+        logger.error(f"Error in forecast endpoint for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Forecast generation failed: {str(e)}")
+
+@app.get("/api/live-predict/{sensor_id}")
+def get_live_prediction_endpoint(sensor_id: str):
+    """Get live prediction for current sensor readings"""
+    try:
+        result = get_live_predictions(sensor_id)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    except Exception as e:
+        logger.error(f"Error in live prediction for {sensor_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Live prediction failed: {str(e)}")
+
+@app.get("/api/forecast/stream/{sensor_id}")
+def stream_forecast_updates(sensor_id: str):
+    """Server-Sent Events stream for live forecast updates"""
+    async def event_generator():
+        while True:
+            try:
+                # Get latest forecast
+                forecast_data = generate_forecast(sensor_id, 12)
+                live_data = get_live_predictions(sensor_id)
+                
+                if "error" not in forecast_data and "error" not in live_data:
+                    data = {
+                        "forecast": forecast_data,
+                        "live_prediction": live_data,
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "update"
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'error': 'Data unavailable', 'timestamp': datetime.now().isoformat()})}\n\n"
+                
+                # Wait before next update
+                await asyncio.sleep(60)  # Update every 60 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in forecast stream: {e}")
+                yield f"data: {json.dumps({'error': str(e), 'timestamp': datetime.now().isoformat()})}\n\n"
+                await asyncio.sleep(10)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
  
   
 @app.on_event("startup")
