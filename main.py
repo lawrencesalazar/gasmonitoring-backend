@@ -72,12 +72,28 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=3600,
 )
 
+# Add specific CORS headers for SSE
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Add CORS headers for SSE
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Cache-Control"
+    
+    # Important for SSE
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
+    
+    return response
+    
 # Enhanced OPTIONS handler
 @app.options("/{path:path}")
 async def preflight_handler(request: Request, path: str):
@@ -2937,14 +2953,13 @@ def get_live_prediction_endpoint(sensor_id: str):
         logger.error(f"Error in live prediction for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Live prediction failed: {str(e)}")
 
-# Update the SSE endpoint to fix the asyncio error
 @app.get("/api/forecast/stream/{sensor_id}")
 async def stream_forecast_updates(sensor_id: str):
-    """Server-Sent Events stream for live forecast updates - FIXED"""
+    """Server-Sent Events stream for live forecast updates - FIXED CORS"""
     async def event_generator():
         while True:
             try:
-                # Get latest forecast
+                # Get latest forecast (with timeout)
                 forecast_data = generate_forecast(sensor_id, 12)
                 live_data = get_live_predictions(sensor_id)
                 
@@ -2957,17 +2972,19 @@ async def stream_forecast_updates(sensor_id: str):
                     }
                     yield f"data: {json.dumps(data)}\n\n"
                 else:
-                    # Return error data but keep connection open
                     error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
                     yield f"data: {json.dumps({'error': error_msg, 'timestamp': datetime.now().isoformat()})}\n\n"
                 
                 # Wait before next update
-                await asyncio.sleep(60)  # Update every 60 seconds
+                await asyncio.sleep(30)  # Reduce to 30 seconds for better responsiveness
                 
+            except asyncio.CancelledError:
+                logger.info(f"SSE connection cancelled for {sensor_id}")
+                break
             except Exception as e:
                 logger.error(f"Error in forecast stream: {e}")
                 yield f"data: {json.dumps({'error': str(e), 'timestamp': datetime.now().isoformat()})}\n\n"
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
     
     return StreamingResponse(
         event_generator(),
@@ -2975,11 +2992,28 @@ async def stream_forecast_updates(sensor_id: str):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*"
+            "X-Accel-Buffering": "no",  # Disable buffering for nginx
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Expose-Headers": "*",
+            "Content-Type": "text/event-stream; charset=utf-8"
         }
     )
-  
+
+# Add OPTIONS endpoint for SSE CORS preflight
+@app.options("/api/forecast/stream/{sensor_id}")
+async def sse_preflight(sensor_id: str):
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Credentials": "true"
+        }
+    )
+    
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
