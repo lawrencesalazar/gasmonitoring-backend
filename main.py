@@ -2953,66 +2953,145 @@ def get_live_prediction_endpoint(sensor_id: str):
         logger.error(f"Error in live prediction for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Live prediction failed: {str(e)}")
 
-@app.get("/api/forecast/stream/{sensor_id}")
-async def stream_forecast_updates(sensor_id: str):
-    """Server-Sent Events stream for live forecast updates - FIXED CORS"""
-    async def event_generator():
-        while True:
-            try:
-                # Get latest forecast (with timeout)
-                forecast_data = generate_forecast(sensor_id, 12)
-                live_data = get_live_predictions(sensor_id)
+# @app.get("/api/forecast/stream/{sensor_id}")
+# async def stream_forecast_updates(sensor_id: str):
+    # """Server-Sent Events stream for live forecast updates - FIXED CORS"""
+    # async def event_generator():
+        # while True:
+            # try:
+                Get latest forecast (with timeout)
+                # forecast_data = generate_forecast(sensor_id, 12)
+                # live_data = get_live_predictions(sensor_id)
                 
-                if "error" not in forecast_data and "error" not in live_data:
-                    data = {
-                        "forecast": forecast_data,
-                        "live_prediction": live_data,
-                        "timestamp": datetime.now().isoformat(),
-                        "type": "update"
-                    }
-                    yield f"data: {json.dumps(data)}\n\n"
-                else:
-                    error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
-                    yield f"data: {json.dumps({'error': error_msg, 'timestamp': datetime.now().isoformat()})}\n\n"
+                # if "error" not in forecast_data and "error" not in live_data:
+                    # data = {
+                        # "forecast": forecast_data,
+                        # "live_prediction": live_data,
+                        # "timestamp": datetime.now().isoformat(),
+                        # "type": "update"
+                    # }
+                    # yield f"data: {json.dumps(data)}\n\n"
+                # else:
+                    # error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
+                    # yield f"data: {json.dumps({'error': error_msg, 'timestamp': datetime.now().isoformat()})}\n\n"
                 
-                # Wait before next update
-                await asyncio.sleep(30)  # Reduce to 30 seconds for better responsiveness
+                Wait before next update
+                # await asyncio.sleep(30)  # Reduce to 30 seconds for better responsiveness
                 
-            except asyncio.CancelledError:
-                logger.info(f"SSE connection cancelled for {sensor_id}")
-                break
-            except Exception as e:
-                logger.error(f"Error in forecast stream: {e}")
-                yield f"data: {json.dumps({'error': str(e), 'timestamp': datetime.now().isoformat()})}\n\n"
-                await asyncio.sleep(5)
+            # except asyncio.CancelledError:
+                # logger.info(f"SSE connection cancelled for {sensor_id}")
+                # break
+            # except Exception as e:
+                # logger.error(f"Error in forecast stream: {e}")
+                # yield f"data: {json.dumps({'error': str(e), 'timestamp': datetime.now().isoformat()})}\n\n"
+                # await asyncio.sleep(5)
     
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Disable buffering for nginx
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Expose-Headers": "*",
-            "Content-Type": "text/event-stream; charset=utf-8"
-        }
-    )
+    # return StreamingResponse(
+        # event_generator(),
+        # media_type="text/event-stream",
+        # headers={
+            # "Cache-Control": "no-cache",
+            # "Connection": "keep-alive",
+            # "X-Accel-Buffering": "no",  # Disable buffering for nginx
+            # "Access-Control-Allow-Origin": "*",
+            # "Access-Control-Allow-Credentials": "true",
+            # "Access-Control-Expose-Headers": "*",
+            # "Content-Type": "text/event-stream; charset=utf-8"
+        # }
+    # )
 
 # Add OPTIONS endpoint for SSE CORS preflight
-@app.options("/api/forecast/stream/{sensor_id}")
-async def sse_preflight(sensor_id: str):
-    return JSONResponse(
-        content={"status": "ok"},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age": "86400",
-            "Access-Control-Allow-Credentials": "true"
+# @app.options("/api/forecast/stream/{sensor_id}")
+# async def sse_preflight(sensor_id: str):
+    # return JSONResponse(
+        # content={"status": "ok"},
+        # headers={
+            # "Access-Control-Allow-Origin": "*",
+            # "Access-Control-Allow-Methods": "GET, OPTIONS",
+            # "Access-Control-Allow-Headers": "*",
+            # "Access-Control-Max-Age": "86400",
+            # "Access-Control-Allow-Credentials": "true"
+        # }
+    # )
+ 
+# Remove or comment out the SSE endpoints and add these polling endpoints
+
+@app.get("/api/forecast/poll/{sensor_id}")
+async def poll_forecast_updates(sensor_id: str):
+    """Polling endpoint for forecast updates - more reliable than SSE"""
+    try:
+        # Get latest forecast
+        forecast_data = generate_forecast(sensor_id, 12)
+        live_data = get_live_predictions(sensor_id)
+        
+        if "error" in forecast_data or "error" in live_data:
+            error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
+            return {
+                "success": False,
+                "error": error_msg,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        return {
+            "success": True,
+            "forecast": forecast_data,
+            "live_prediction": live_data,
+            "timestamp": datetime.now().isoformat(),
+            "type": "update",
+            "next_poll_in": 30  # seconds until next recommended poll
         }
-    )
+        
+    except Exception as e:
+        logger.error(f"Error in forecast poll for {sensor_id}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/api/forecast/batch/{sensor_id}")
+async def get_batch_forecast_data(sensor_id: str):
+    """Get all forecast data in one request - optimized for polling"""
+    try:
+        # Get forecast for 24 hours
+        forecast_data = generate_forecast(sensor_id, 24)
+        live_data = get_live_predictions(sensor_id)
+        
+        # Get historical data separately
+        df = fetch_history(sensor_id, "1day")
+        historical_stats = {}
+        if not df.empty:
+            for column in ['riskIndex', 'methane', 'co2', 'ammonia', 'humidity', 'temperature']:
+                if column in df.columns:
+                    historical_stats[column] = {
+                        "min": float(df[column].min()),
+                        "max": float(df[column].max()),
+                        "mean": float(df[column].mean()),
+                        "latest": float(df[column].iloc[-1]) if len(df) > 0 else 0
+                    }
+        
+        # Check if model exists
+        model_exists = model_exists_in_firebase(sensor_id)
+        
+        return {
+            "success": True,
+            "sensor_id": sensor_id,
+            "forecast": forecast_data,
+            "live_prediction": live_data,
+            "historical_stats": historical_stats,
+            "model_exists": model_exists,
+            "timestamp": datetime.now().isoformat(),
+            "cache_control": "max-age=30"  # Cache for 30 seconds
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in batch forecast for {sensor_id}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        } 
+    
     
 @app.on_event("startup")
 async def startup_event():
