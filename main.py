@@ -3571,43 +3571,7 @@ def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: f
     except Exception as e:
         logger.warning(f"Error calculating longest exceedance period for {gas}: {e}", exc_info=True)
         return {"duration_hours": 0, "start": None, "end": None}
-        
-# In the generate_report function, after fetching data:
-
-df = fetch_history(sensor_id, "all")
-
-if df.empty:
-    return {
-        "success": False, 
-        "error": f"No data available for sensor {sensor_id}",
-        "sensor_id": sensor_id
-    }
-
-# DEBUG: Log columns to see what we're getting
-logger.info(f"DataFrame columns from fetch_history: {df.columns.tolist()}")
-
-# Check for timestamp column with different names
-timestamp_column = None
-possible_timestamp_names = ['timestamp', 'Timestamp', 'time', 'Time', 'datetime', 'DateTime', 'date', 'Date']
-
-for col in possible_timestamp_names:
-    if col in df.columns:
-        timestamp_column = col
-        break
-
-if not timestamp_column:
-    logger.error(f"No timestamp column found. Available columns: {df.columns.tolist()}")
-    return {"success": False, "error": "Data format error: no timestamp column found"}
-
-# Rename to standard 'timestamp' column
-df = df.rename(columns={timestamp_column: 'timestamp'})
-logger.info(f"Using column '{timestamp_column}' as timestamp")
-
-# Ensure timestamp column exists
-if 'timestamp' not in df.columns:
-    logger.error(f"DataFrame missing 'timestamp' column after rename. Columns: {df.columns.tolist()}")
-    return {"success": False, "error": "Data format error: missing timestamp"}
-    
+         
 def create_executive_summary(statistics: dict, gas_analysis: dict) -> dict:
     """Create executive summary text with specific event mentions"""
     avg_aqi = statistics.get('avg_aqi', 0)
@@ -3793,6 +3757,7 @@ def format_timestamp(timestamp_str: str) -> str:
         return dt.strftime("%Y-%m-%d %H:%M")
     except:
         return timestamp_str
+
 def get_suggested_tier(selected_days: int) -> dict:
     """Suggest appropriate report tier based on selected days"""
     for tier_name, tier_info in REPORT_TIERS.items():
