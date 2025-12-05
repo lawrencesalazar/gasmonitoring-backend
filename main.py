@@ -3333,31 +3333,81 @@ def analyze_gas_concentrations_with_timestamps(df: pd.DataFrame) -> dict:
                 exceedance_records = []
                 safe_records = []
                 
+                # CRITICAL FIX: Check if 'timestamp' column exists in df
+                if 'timestamp' not in df.columns:
+                    logger.error(f"DataFrame missing 'timestamp' column. Available columns: {df.columns.tolist()}")
+                    # Create a fallback using index or current time
+                    timestamps = pd.Series([datetime.now()] * len(df), index=df.index)
+                else:
+                    timestamps = df['timestamp']
+                
                 if exceedances_mask.any():
-                    exceedance_data = df[exceedances_mask][['timestamp', gas]].copy()
-                    for idx, row in exceedance_data.iterrows():
-                        exceedance_records.append({
-                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
-                            "value": float(row[gas]),
-                            "exceedance_percent": float(((row[gas] - threshold) / threshold) * 100) if threshold > 0 else 0
-                        })
+                    # Use .loc to avoid chained indexing
+                    exceedance_indices = df.index[exceedances_mask]
+                    for idx in exceedance_indices:
+                        try:
+                            timestamp_val = timestamps.loc[idx]
+                            gas_value = values.loc[idx]
+                            
+                            # Format timestamp
+                            if hasattr(timestamp_val, 'isoformat'):
+                                timestamp_str = timestamp_val.isoformat()
+                            elif isinstance(timestamp_val, (datetime, pd.Timestamp)):
+                                timestamp_str = timestamp_val.isoformat()
+                            else:
+                                timestamp_str = str(timestamp_val)
+                            
+                            exceedance_records.append({
+                                "timestamp": timestamp_str,
+                                "value": float(gas_value),
+                                "exceedance_percent": float(((gas_value - threshold) / threshold) * 100) if threshold > 0 else 0
+                            })
+                        except Exception as e:
+                            logger.warning(f"Error processing exceedance record for {gas} at index {idx}: {e}")
+                            continue
                 
                 if safe_mask.any():
-                    safe_data = df[safe_mask][['timestamp', gas]].copy()
-                    for idx, row in safe_data.iterrows():
-                        safe_records.append({
-                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
-                            "value": float(row[gas]),
-                            "safety_margin_percent": float(((safe_threshold - row[gas]) / safe_threshold) * 100) if safe_threshold > 0 else 0
-                        })
+                    # Use .loc to avoid chained indexing
+                    safe_indices = df.index[safe_mask]
+                    for idx in safe_indices:
+                        try:
+                            timestamp_val = timestamps.loc[idx]
+                            gas_value = values.loc[idx]
+                            
+                            # Format timestamp
+                            if hasattr(timestamp_val, 'isoformat'):
+                                timestamp_str = timestamp_val.isoformat()
+                            elif isinstance(timestamp_val, (datetime, pd.Timestamp)):
+                                timestamp_str = timestamp_val.isoformat()
+                            else:
+                                timestamp_str = str(timestamp_val)
+                            
+                            safe_records.append({
+                                "timestamp": timestamp_str,
+                                "value": float(gas_value),
+                                "safety_margin_percent": float(((safe_threshold - gas_value) / safe_threshold) * 100) if safe_threshold > 0 else 0
+                            })
+                        except Exception as e:
+                            logger.warning(f"Error processing safe record for {gas} at index {idx}: {e}")
+                            continue
                 
                 # Get top 5 highest and lowest readings with timestamps
-                top_exceedances = exceedance_records[:5] if exceedance_records else []
-                top_safe = safe_records[:5] if safe_records else []
+                top_exceedances = sorted(exceedance_records, key=lambda x: x["value"], reverse=True)[:5]
+                top_safe = sorted(safe_records, key=lambda x: x["safety_margin_percent"] if "safety_margin_percent" in x else x["value"], reverse=True)[:5]
                 
-                # Find first and last exceedance
-                first_exceedance = exceedance_records[0] if exceedance_records else None
-                last_exceedance = exceedance_records[-1] if exceedance_records else None
+                # Find first and last exceedance (by timestamp)
+                if exceedance_records:
+                    # Sort by timestamp if possible
+                    try:
+                        exceedance_records_sorted = sorted(exceedance_records, key=lambda x: x["timestamp"])
+                        first_exceedance = exceedance_records_sorted[0]
+                        last_exceedance = exceedance_records_sorted[-1]
+                    except:
+                        first_exceedance = exceedance_records[0] if exceedance_records else None
+                        last_exceedance = exceedance_records[-1] if exceedance_records else None
+                else:
+                    first_exceedance = None
+                    last_exceedance = None
                 
                 # Calculate longest continuous exceedance period
                 longest_exceedance_period = calculate_longest_exceedance_period(df, gas, threshold)
@@ -3386,32 +3436,57 @@ def analyze_gas_concentrations_with_timestamps(df: pd.DataFrame) -> dict:
                     }
                 }
             except Exception as e:
-                logger.warning(f"Error analyzing {gas} with timestamps: {e}")
+                logger.warning(f"Error analyzing {gas} with timestamps: {e}", exc_info=True)
                 analysis[gas] = {
-                    "error": f"Failed to analyze {gas}: {str(e)}"
+                    "error": f"Failed to analyze {gas}: {str(e)}",
+                    "average": 0,
+                    "max": 0,
+                    "min": 0,
+                    "exceedances": 0,
+                    "safe_readings": 0
                 }
     
     return analysis
 
-
 def analyze_gas_concentrations(df):
-    """Analyze gas concentration data"""
+    """Analyze gas concentration data (simpler version without timestamps)"""
     gases = ['methane', 'co2', 'ammonia']
     analysis = {}
     
     for gas in gases:
         if gas in df.columns:
-            values = df[gas]
-            analysis[gas] = {
-                "average": float(values.mean()),
-                "max": float(values.max()),
-                "min": float(values.min()),
-                "std": float(values.std()),
-                "exceedances": int((values > get_gas_threshold(gas)).sum())
-            }
+            try:
+                values = df[gas].astype(float)
+                threshold = get_gas_threshold(gas)
+                safe_threshold = get_safe_threshold(gas)
+                
+                exceedances_mask = values > threshold
+                safe_mask = values < safe_threshold
+                
+                analysis[gas] = {
+                    "average": float(values.mean()),
+                    "max": float(values.max()),
+                    "min": float(values.min()),
+                    "std": float(values.std()),
+                    "exceedances": int(exceedances_mask.sum()),
+                    "safe_readings": int(safe_mask.sum()),
+                    "threshold": threshold,
+                    "safe_threshold": safe_threshold,
+                    "unit": "ppm"
+                }
+            except Exception as e:
+                logger.warning(f"Error analyzing {gas}: {e}")
+                analysis[gas] = {
+                    "average": 0,
+                    "max": 0,
+                    "min": 0,
+                    "exceedances": 0,
+                    "safe_readings": 0,
+                    "error": str(e)
+                }
     
     return analysis
-
+    
 def get_safe_threshold(gas: str) -> float:
     """Get safe threshold values for each gas (lower than warning threshold)"""
     safe_thresholds = {
@@ -3424,11 +3499,23 @@ def get_safe_threshold(gas: str) -> float:
 def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: float) -> dict:
     """Calculate the longest continuous period when gas exceeded threshold"""
     try:
+        # FIX: Check if 'timestamp' column exists
         if gas not in df.columns or 'timestamp' not in df.columns:
+            logger.warning(f"Missing columns: gas={gas in df.columns}, timestamp={'timestamp' in df.columns}")
+            return {"duration_hours": 0, "start": None, "end": None}
+        
+        # Make a copy to avoid modifying the original
+        df_sorted = df[['timestamp', gas]].copy()
+        
+        # Ensure timestamp is datetime
+        df_sorted['timestamp'] = pd.to_datetime(df_sorted['timestamp'], errors='coerce')
+        df_sorted = df_sorted.dropna(subset=['timestamp', gas])
+        
+        if df_sorted.empty:
             return {"duration_hours": 0, "start": None, "end": None}
         
         # Sort by timestamp
-        df_sorted = df.sort_values('timestamp').copy()
+        df_sorted = df_sorted.sort_values('timestamp')
         
         # Create exceedance mask
         exceedance_mask = df_sorted[gas] > threshold
@@ -3438,7 +3525,7 @@ def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: f
         current_period = None
         
         for idx, row in df_sorted.iterrows():
-            is_exceeding = exceedance_mask.loc[idx]
+            is_exceeding = exceedance_mask.loc[idx] if idx in exceedance_mask else False
             
             if is_exceeding and current_period is None:
                 # Start new period
@@ -3482,80 +3569,45 @@ def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: f
         return {"duration_hours": 0, "start": None, "end": None}
         
     except Exception as e:
-        logger.warning(f"Error calculating longest exceedance period for {gas}: {e}")
+        logger.warning(f"Error calculating longest exceedance period for {gas}: {e}", exc_info=True)
         return {"duration_hours": 0, "start": None, "end": None}
+        
+# In the generate_report function, after fetching data:
 
-def generate_critical_events_timeline(df: pd.DataFrame) -> dict:
-    """Generate timeline of critical events (high risk, exceedances)"""
-    timeline = {
-        "high_risk_events": [],
-        "gas_exceedance_events": [],
-        "summary": {}
+df = fetch_history(sensor_id, "all")
+
+if df.empty:
+    return {
+        "success": False, 
+        "error": f"No data available for sensor {sensor_id}",
+        "sensor_id": sensor_id
     }
-    
-    try:
-        # Check for high risk events (riskIndex > 7)
-        if 'riskIndex' in df.columns and 'timestamp' in df.columns:
-            high_risk_mask = df['riskIndex'] > 7
-            if high_risk_mask.any():
-                high_risk_data = df[high_risk_mask][['timestamp', 'riskIndex']].copy()
-                high_risk_data = high_risk_data.sort_values('timestamp')
-                
-                # Get top 10 highest risk events
-                top_high_risk = high_risk_data.nlargest(10, 'riskIndex')
-                
-                for idx, row in top_high_risk.iterrows():
-                    timeline["high_risk_events"].append({
-                        "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
-                        "risk_index": float(row['riskIndex']),
-                        "aqi": float(row['riskIndex'] * 50) if 'aqi' not in df.columns else float(df.loc[idx, 'aqi']),
-                        "risk_level": "Critical" if row['riskIndex'] > 8 else "High"
-                    })
-        
-        # Check for gas exceedance events
-        gases = ['methane', 'co2', 'ammonia']
-        gas_events = []
-        
-        for gas in gases:
-            if gas in df.columns:
-                threshold = get_gas_threshold(gas)
-                exceedance_mask = df[gas] > threshold
-                
-                if exceedance_mask.any():
-                    exceedance_data = df[exceedance_mask][['timestamp', gas]].copy()
-                    exceedance_data = exceedance_data.sort_values('timestamp')
-                    
-                    # Get top 5 highest exceedances for each gas
-                    top_exceedances = exceedance_data.nlargest(5, gas)
-                    
-                    for idx, row in top_exceedances.iterrows():
-                        gas_events.append({
-                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
-                            "gas": gas,
-                            "value": float(row[gas]),
-                            "threshold": threshold,
-                            "exceedance_percent": float(((row[gas] - threshold) / threshold) * 100) if threshold > 0 else 0
-                        })
-        
-        # Sort gas events by timestamp
-        gas_events.sort(key=lambda x: x["timestamp"])
-        timeline["gas_exceedance_events"] = gas_events[:20]  # Limit to 20 events
-        
-        # Generate summary
-        timeline["summary"] = {
-            "total_high_risk_events": len(timeline["high_risk_events"]),
-            "total_gas_exceedance_events": len(timeline["gas_exceedance_events"]),
-            "most_common_gas": max(gases, key=lambda g: len([e for e in timeline["gas_exceedance_events"] if e["gas"] == g])) if timeline["gas_exceedance_events"] else "None",
-            "highest_risk_event": max(timeline["high_risk_events"], key=lambda x: x["risk_index"]) if timeline["high_risk_events"] else None,
-            "highest_gas_exceedance": max(timeline["gas_exceedance_events"], key=lambda x: x["exceedance_percent"]) if timeline["gas_exceedance_events"] else None
-        }
-        
-        return timeline
-        
-    except Exception as e:
-        logger.warning(f"Error generating critical events timeline: {e}")
-        return timeline
 
+# DEBUG: Log columns to see what we're getting
+logger.info(f"DataFrame columns from fetch_history: {df.columns.tolist()}")
+
+# Check for timestamp column with different names
+timestamp_column = None
+possible_timestamp_names = ['timestamp', 'Timestamp', 'time', 'Time', 'datetime', 'DateTime', 'date', 'Date']
+
+for col in possible_timestamp_names:
+    if col in df.columns:
+        timestamp_column = col
+        break
+
+if not timestamp_column:
+    logger.error(f"No timestamp column found. Available columns: {df.columns.tolist()}")
+    return {"success": False, "error": "Data format error: no timestamp column found"}
+
+# Rename to standard 'timestamp' column
+df = df.rename(columns={timestamp_column: 'timestamp'})
+logger.info(f"Using column '{timestamp_column}' as timestamp")
+
+# Ensure timestamp column exists
+if 'timestamp' not in df.columns:
+    logger.error(f"DataFrame missing 'timestamp' column after rename. Columns: {df.columns.tolist()}")
+    return {"success": False, "error": "Data format error: missing timestamp"}
+    
 def create_executive_summary(statistics: dict, gas_analysis: dict) -> dict:
     """Create executive summary text with specific event mentions"""
     avg_aqi = statistics.get('avg_aqi', 0)
