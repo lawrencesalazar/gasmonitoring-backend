@@ -3299,6 +3299,20 @@ async def generate_report(
             "error": f"Internal server error: {str(e)}",
             "sensor_id": sensor_id
         }
+# Helper functions
+def calculate_statistics(df):
+    """Calculate statistical metrics"""
+    if df.empty:
+        return {}
+    
+    return {
+        "total_readings": len(df),
+        "avg_risk": float(df['riskIndex'].mean()) if 'riskIndex' in df.columns else 0,
+        "avg_aqi": float(df.get('aqi', df['riskIndex'] * 50).mean()) if 'riskIndex' in df.columns else 0,
+        "max_aqi": float(df.get('aqi', df['riskIndex'] * 50).max()) if 'riskIndex' in df.columns else 0,
+        "min_aqi": float(df.get('aqi', df['riskIndex'] * 50).min()) if 'riskIndex' in df.columns else 0,
+        "alerts_count": int((df['riskIndex'] > 6).sum()) if 'riskIndex' in df.columns else 0
+    }
 
 def analyze_gas_concentrations_with_timestamps(df: pd.DataFrame) -> dict:
     """Analyze gas concentration data with specific timestamp information"""
@@ -3376,6 +3390,25 @@ def analyze_gas_concentrations_with_timestamps(df: pd.DataFrame) -> dict:
                 analysis[gas] = {
                     "error": f"Failed to analyze {gas}: {str(e)}"
                 }
+    
+    return analysis
+
+
+def analyze_gas_concentrations(df):
+    """Analyze gas concentration data"""
+    gases = ['methane', 'co2', 'ammonia']
+    analysis = {}
+    
+    for gas in gases:
+        if gas in df.columns:
+            values = df[gas]
+            analysis[gas] = {
+                "average": float(values.mean()),
+                "max": float(values.max()),
+                "min": float(values.min()),
+                "std": float(values.std()),
+                "exceedances": int((values > get_gas_threshold(gas)).sum())
+            }
     
     return analysis
 
