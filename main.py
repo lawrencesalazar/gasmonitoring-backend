@@ -3092,7 +3092,188 @@ async def get_batch_forecast_data(sensor_id: str):
             "timestamp": datetime.now().isoformat()
         } 
     
+ #### Reports Generations #####
+ # Add to your FastAPI app
+
+@app.get("/api/report/{sensor_id}")
+def generate_report(
+    sensor_id: str,
+    from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    to_date: str = Query(..., description="End date (YYYY-MM-DD)")
+):
+    """Generate comprehensive report data"""
+    try:
+        # Fetch historical data for the date range
+        df = fetch_history(sensor_id, "all")
+        
+        if df.empty:
+            return {"success": False, "error": "No data available for the selected range"}
+        
+        # Filter by date range
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        mask = (df['timestamp'] >= from_date) & (df['timestamp'] <= to_date)
+        filtered_df = df.loc[mask]
+        
+        if filtered_df.empty:
+            return {"success": False, "error": "No data in selected date range"}
+        
+        # Calculate statistics
+        statistics = calculate_statistics(filtered_df)
+        
+        # Generate gas analysis
+        gas_analysis = analyze_gas_concentrations(filtered_df)
+        
+        # Get forecast data
+        forecast_data = generate_forecast(sensor_id, steps=24)
+        
+        # Generate recommendations
+        recommendations = generate_recommendations(filtered_df, gas_analysis)
+        
+        # Create executive summary
+        summary = create_executive_summary(statistics, gas_analysis)
+        
+        return {
+            "success": True,
+            "sensor_id": sensor_id,
+            "date_range": {"from": from_date, "to": to_date},
+            "statistics": statistics,
+            "gas_analysis": gas_analysis,
+            "forecast": forecast_data.get('forecast', []) if forecast_data else [],
+            "recommendations": recommendations,
+            "summary": summary,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating report for {sensor_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+# Helper functions
+def calculate_statistics(df):
+    """Calculate statistical metrics"""
+    if df.empty:
+        return {}
     
+    return {
+        "total_readings": len(df),
+        "avg_risk": float(df['riskIndex'].mean()) if 'riskIndex' in df.columns else 0,
+        "avg_aqi": float(df.get('aqi', df['riskIndex'] * 50).mean()) if 'riskIndex' in df.columns else 0,
+        "max_aqi": float(df.get('aqi', df['riskIndex'] * 50).max()) if 'riskIndex' in df.columns else 0,
+        "min_aqi": float(df.get('aqi', df['riskIndex'] * 50).min()) if 'riskIndex' in df.columns else 0,
+        "alerts_count": int((df['riskIndex'] > 6).sum()) if 'riskIndex' in df.columns else 0
+    }
+
+def analyze_gas_concentrations(df):
+    """Analyze gas concentration data"""
+    gases = ['methane', 'co2', 'ammonia']
+    analysis = {}
+    
+    for gas in gases:
+        if gas in df.columns:
+            values = df[gas]
+            analysis[gas] = {
+                "average": float(values.mean()),
+                "max": float(values.max()),
+                "min": float(values.min()),
+                "std": float(values.std()),
+                "exceedances": int((values > get_gas_threshold(gas)).sum())
+            }
+    
+    return analysis
+
+def get_gas_threshold(gas):
+    """Get threshold values for each gas"""
+    thresholds = {
+        'methane': 1000,  # ppm
+        'co2': 5000,      # ppm
+        'ammonia': 25     # ppm
+    }
+    return thresholds.get(gas, 0)
+
+def generate_recommendations(df, gas_analysis):
+    """Generate recommendations based on data analysis"""
+    recommendations = []
+    
+    # Check for high methane levels
+    if 'methane' in gas_analysis and gas_analysis['methane']['max'] > 500:
+        recommendations.append({
+            "title": "Methane Monitoring",
+            "description": "High methane levels detected. Consider increasing ventilation and conducting leak detection.",
+            "priority": "high"
+        })
+    
+    # Check for CO2 buildup
+    if 'co2' in gas_analysis and gas_analysis['co2']['max'] > 1000:
+        recommendations.append({
+            "title": "CO2 Ventilation",
+            "description": "Elevated CO2 levels indicate poor ventilation. Improve air circulation in the monitored area.",
+            "priority": "medium"
+        })
+    
+    # Check for ammonia presence
+    if 'ammonia' in gas_analysis and gas_analysis['ammonia']['max'] > 10:
+        recommendations.append({
+            "title": "Ammonia Safety",
+            "description": "Ammonia detected above safe levels. Ensure proper containment and ventilation systems.",
+            "priority": "high"
+        })
+    
+    # General recommendations
+    avg_risk = df['riskIndex'].mean() if 'riskIndex' in df.columns else 0
+    if avg_risk > 5:
+        recommendations.append({
+            "title": "Continuous Monitoring",
+            "description": "Persistent high risk levels detected. Implement continuous monitoring and alert system.",
+            "priority": "medium"
+        })
+    
+    # Add standard recommendations
+    recommendations.extend([
+        {
+            "title": "Regular Maintenance",
+            "description": "Schedule regular sensor calibration and maintenance every 3 months.",
+            "priority": "low"
+        },
+        {
+            "title": "Emergency Protocols",
+            "description": "Review and update emergency response protocols for gas leaks.",
+            "priority": "medium"
+        }
+    ])
+    
+    return recommendations[:5]  # Return top 5 recommendations
+
+def create_executive_summary(statistics, gas_analysis):
+    """Create executive summary text"""
+    avg_aqi = statistics.get('avg_aqi', 0)
+    
+    if avg_aqi <= 50:
+        air_quality = "Good"
+        impact = "minimal health impact"
+    elif avg_aqi <= 100:
+        air_quality = "Moderate"
+        impact = "acceptable air quality"
+    elif avg_aqi <= 150:
+        air_quality = "Unhealthy for Sensitive Groups"
+        impact = "caution advised for sensitive individuals"
+    else:
+        air_quality = "Unhealthy"
+        impact = "significant health concerns"
+    
+    exceedances = sum(gas['exceedances'] for gas in gas_analysis.values())
+    
+    summary = f"""
+    During the reporting period, the average Air Quality Index (AQI) was {avg_aqi:.1f}, 
+    categorizing air quality as '{air_quality}'. This indicates {impact}. 
+    A total of {statistics.get('total_readings', 0)} readings were analyzed, 
+    with {statistics.get('alerts_count', 0)} high-risk alerts triggered. 
+    Gas concentration thresholds were exceeded {exceedances} times across all monitored gases.
+    """
+    
+    return {"executive_summary": summary.strip()}
+ 
+ #### End Reports Generations #####
+ 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
