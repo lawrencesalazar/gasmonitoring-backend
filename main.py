@@ -3112,10 +3112,6 @@ async def generate_report(
         if from_dt > to_dt:
             return {"success": False, "error": "from_date must be before to_date"}
         
-        # Validate date range (limit to 30 days)
-        if (to_dt - from_dt).days > 30:
-            return {"success": False, "error": "Date range cannot exceed 30 days"}
-        
         # Fetch historical data
         logger.info(f"Fetching data for sensor {sensor_id} from {from_date} to {to_date}")
         df = fetch_history(sensor_id, "all")
@@ -3159,6 +3155,12 @@ async def generate_report(
         # Generate gas analysis
         gas_analysis = analyze_gas_concentrations(filtered_df)
         
+        # Generate forecast data
+        forecast_result = generate_forecast(sensor_id, steps=24)
+        
+        # Get live predictions
+        live_predictions = get_live_predictions(sensor_id)
+        
         # Generate recommendations
         recommendations = generate_recommendations(filtered_df, gas_analysis)
         
@@ -3166,7 +3168,7 @@ async def generate_report(
         summary = create_executive_summary(statistics, gas_analysis)
         
         # Prepare response
-        return {
+        response_data = {
             "success": True,
             "sensor_id": sensor_id,
             "date_range": {
@@ -3186,6 +3188,29 @@ async def generate_report(
             "generated_at": datetime.now().isoformat()
         }
         
+        # Add forecast data if available
+        if forecast_result and not isinstance(forecast_result, dict) or 'error' not in forecast_result:
+            response_data["forecast"] = forecast_result
+        else:
+            response_data["forecast"] = {
+                "sensor_id": sensor_id,
+                "forecast": [],
+                "historical_data": [],
+                "forecast_hours": 24,
+                "model_info": {
+                    "model_type": "Not Available",
+                    "features_used": [],
+                    "note": "Forecast data not available for this sensor"
+                },
+                "generated_at": datetime.now().isoformat()
+            }
+        
+        # Add live predictions if available
+        if live_predictions and 'error' not in live_predictions:
+            response_data["live_predictions"] = live_predictions
+        
+        return response_data
+        
     except HTTPException:
         raise
     except Exception as e:
@@ -3195,7 +3220,7 @@ async def generate_report(
             "error": f"Internal server error: {str(e)}",
             "sensor_id": sensor_id
         }
-
+        
 def calculate_statistics(df):
     """Calculate statistical metrics with safe access"""
     stats = {
