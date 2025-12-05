@@ -3099,7 +3099,6 @@ async def generate_report(
     sensor_id: str,
     from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
-    authorization: Optional[str] = Header(None)
 ):
     """Generate comprehensive report data"""
     try:
