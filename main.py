@@ -3094,13 +3094,32 @@ async def get_batch_forecast_data(sensor_id: str):
     
  #### Reports Generations ##### 
 
+# Define report tier limits
+REPORT_TIERS = {
+    "standard": {
+        "max_days": 90,
+        "name": "Standard Report (90 days)",
+        "features": ["statistics", "gas_analysis", "recommendations", "executive_summary"]
+    },
+    "extended": {
+        "max_days": 180,
+        "name": "Extended Report (180 days)",
+        "features": ["statistics", "gas_analysis", "recommendations", "executive_summary", "trend_analysis"]
+    },
+    "annual": {
+        "max_days": 365,
+        "name": "Annual Report (1 year)",
+        "features": ["statistics", "gas_analysis", "recommendations", "executive_summary", "trend_analysis", "yearly_summary"]
+    }
+}
 @app.get("/api/report/{sensor_id}")
 async def generate_report(
     sensor_id: str,
     from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
+    report_type: str = Query("standard", description="Report type: standard (90 days), extended (180 days), annual (365 days)")
 ):
-    """Generate comprehensive report data"""
+    """Generate comprehensive report data with tiered limits"""
     try:
         # Validate date format
         try:
@@ -3112,8 +3131,34 @@ async def generate_report(
         if from_dt > to_dt:
             return {"success": False, "error": "from_date must be before to_date"}
         
-        # Fetch historical data
-        logger.info(f"Fetching data for sensor {sensor_id} from {from_date} to {to_date}")
+        # Calculate total days
+        total_days = (to_dt - from_dt).days + 1
+        
+        # Validate report type and check limits
+        report_tier = REPORT_TIERS.get(report_type.lower(), REPORT_TIERS["standard"])
+        max_allowed_days = report_tier["max_days"]
+        
+        if total_days > max_allowed_days:
+            return {
+                "success": False, 
+                "error": f"Date range exceeds {max_allowed_days} days limit for {report_tier['name']}. Selected: {total_days} days.",
+                "max_allowed_days": max_allowed_days,
+                "selected_days": total_days,
+                "suggested_tier": get_suggested_tier(total_days)
+            }
+        
+        # Check minimum date range (at least 1 day)
+        if total_days < 1:
+            return {"success": False, "error": "Date range must be at least 1 day"}
+        
+        # Warn for very large date ranges
+        if total_days > 30:
+            logger.info(f"Generating large report for {sensor_id}: {total_days} days ({from_date} to {to_date})")
+        
+        # Fetch historical data with optimization for large date ranges
+        logger.info(f"Fetching data for sensor {sensor_id} from {from_date} to {to_date} ({total_days} days)")
+        
+        # For large date ranges, fetch all data and then filter
         df = fetch_history(sensor_id, "all")
         
         if df.empty:
@@ -3136,7 +3181,15 @@ async def generate_report(
             
             # Filter by date range
             mask = (df['timestamp'] >= from_dt) & (df['timestamp'] <= (to_dt + timedelta(days=1)))
-            filtered_df = df.loc[mask]
+            filtered_df = df.loc[mask].copy()  # Use copy to avoid SettingWithCopyWarning
+            
+            # Downsample for very large datasets to improve performance
+            if len(filtered_df) > 10000:
+                logger.info(f"Large dataset detected ({len(filtered_df)} records). Downsampling...")
+                # Keep hourly samples for better performance
+                filtered_df = downsample_data(filtered_df)
+                logger.info(f"Downsampled to {len(filtered_df)} records")
+                
         except Exception as e:
             logger.error(f"Error processing timestamps: {e}")
             return {"success": False, "error": f"Error processing data: {str(e)}"}
@@ -3152,14 +3205,8 @@ async def generate_report(
         # Calculate statistics with safe access
         statistics = calculate_statistics(filtered_df)
         
-        # Generate gas analysis
-        gas_analysis = analyze_gas_concentrations(filtered_df)
-        
-        # Generate forecast data
-        forecast_result = generate_forecast(sensor_id, steps=24)
-        
-        # Get live predictions
-        live_predictions = get_live_predictions(sensor_id)
+        # Generate gas analysis with specific timestamp data
+        gas_analysis = analyze_gas_concentrations_with_timestamps(filtered_df)
         
         # Generate recommendations
         recommendations = generate_recommendations(filtered_df, gas_analysis)
@@ -3167,47 +3214,79 @@ async def generate_report(
         # Create executive summary
         summary = create_executive_summary(statistics, gas_analysis)
         
-        # Prepare response
+        # Prepare base response data
         response_data = {
             "success": True,
             "sensor_id": sensor_id,
+            "report_type": report_tier["name"],
             "date_range": {
                 "from": from_date, 
                 "to": to_date,
-                "days": (to_dt - from_dt).days + 1
+                "days": total_days
             },
             "data_summary": {
                 "total_records": len(filtered_df),
                 "date_range_records": len(filtered_df),
-                "date_range_coverage": f"{filtered_df['timestamp'].min().date()} to {filtered_df['timestamp'].max().date()}"
+                "date_range_coverage": f"{filtered_df['timestamp'].min().date()} to {filtered_df['timestamp'].max().date()}",
+                "date_range_density": f"{len(filtered_df) / total_days:.1f} records per day"
             },
             "statistics": statistics,
             "gas_analysis": gas_analysis,
             "recommendations": recommendations,
             "summary": summary,
-            "generated_at": datetime.now().isoformat()
+            "generated_at": datetime.now().isoformat(),
+            "features_included": report_tier["features"]
         }
         
-        # Add forecast data if available
-        if forecast_result and not isinstance(forecast_result, dict) or 'error' not in forecast_result:
-            response_data["forecast"] = forecast_result
-        else:
-            response_data["forecast"] = {
-                "sensor_id": sensor_id,
-                "forecast": [],
-                "historical_data": [],
-                "forecast_hours": 24,
-                "model_info": {
-                    "model_type": "Not Available",
-                    "features_used": [],
-                    "note": "Forecast data not available for this sensor"
-                },
-                "generated_at": datetime.now().isoformat()
-            }
+        # Add critical events timeline
+        if len(filtered_df) > 0:
+            critical_events = generate_critical_events_timeline(filtered_df)
+            response_data["critical_events"] = critical_events
         
-        # Add live predictions if available
-        if live_predictions and 'error' not in live_predictions:
-            response_data["live_predictions"] = live_predictions
+        # Add trend analysis for extended and annual reports
+        if report_type in ["extended", "annual"] and total_days > 30:
+            trend_analysis = analyze_trends(filtered_df)
+            response_data["trend_analysis"] = trend_analysis
+        
+        # Add yearly summary for annual reports
+        if report_type == "annual" and total_days >= 180:
+            yearly_summary = generate_yearly_summary(filtered_df, from_dt, to_dt)
+            response_data["yearly_summary"] = yearly_summary
+        
+        # Add forecast data (only for recent data, up to 30 days)
+        if total_days <= 30:
+            try:
+                forecast_result = generate_forecast(sensor_id, steps=24)
+                if forecast_result and 'error' not in forecast_result:
+                    response_data["forecast"] = forecast_result
+                else:
+                    response_data["forecast"] = {
+                        "sensor_id": sensor_id,
+                        "forecast": [],
+                        "historical_data": [],
+                        "forecast_hours": 24,
+                        "model_info": {
+                            "model_type": "Not Available",
+                            "note": "Forecast only available for recent data (≤ 30 days)"
+                        },
+                        "generated_at": datetime.now().isoformat()
+                    }
+            except Exception as forecast_error:
+                logger.warning(f"Forecast generation failed: {forecast_error}")
+                response_data["forecast"] = {
+                    "sensor_id": sensor_id,
+                    "forecast": [],
+                    "note": "Forecast unavailable for this date range"
+                }
+        
+        # Add live predictions for recent reports (last 7 days)
+        if total_days <= 7:
+            try:
+                live_predictions = get_live_predictions(sensor_id)
+                if live_predictions and 'error' not in live_predictions:
+                    response_data["live_predictions"] = live_predictions
+            except Exception as live_error:
+                logger.warning(f"Live predictions failed: {live_error}")
         
         return response_data
         
@@ -3220,39 +3299,9 @@ async def generate_report(
             "error": f"Internal server error: {str(e)}",
             "sensor_id": sensor_id
         }
-        
-def calculate_statistics(df):
-    """Calculate statistical metrics with safe access"""
-    stats = {
-        "total_readings": len(df),
-        "avg_risk": 0,
-        "avg_aqi": 0,
-        "max_aqi": 0,
-        "min_aqi": 0,
-        "alerts_count": 0
-    }
-    
-    try:
-        if 'riskIndex' in df.columns:
-            stats["avg_risk"] = float(df['riskIndex'].mean())
-            
-            # Calculate AQI based on risk index
-            if 'aqi' in df.columns:
-                aqi_values = df['aqi']
-            else:
-                aqi_values = df['riskIndex'] * 50
-            
-            stats["avg_aqi"] = float(aqi_values.mean())
-            stats["max_aqi"] = float(aqi_values.max())
-            stats["min_aqi"] = float(aqi_values.min())
-            stats["alerts_count"] = int((df['riskIndex'] > 6).sum() if 'riskIndex' in df.columns else 0)
-    except Exception as e:
-        logger.warning(f"Error calculating statistics: {e}")
-    
-    return stats
 
-def analyze_gas_concentrations(df):
-    """Analyze gas concentration data"""
+def analyze_gas_concentrations_with_timestamps(df: pd.DataFrame) -> dict:
+    """Analyze gas concentration data with specific timestamp information"""
     gases = ['methane', 'co2', 'ammonia']
     analysis = {}
     
@@ -3261,85 +3310,372 @@ def analyze_gas_concentrations(df):
             try:
                 values = df[gas].astype(float)
                 threshold = get_gas_threshold(gas)
-                exceedances = (values > threshold).sum() if threshold else 0
+                safe_threshold = get_safe_threshold(gas)  # Lower threshold for "good" levels
+                
+                # Find exceedances with timestamps
+                exceedances_mask = values > threshold
+                safe_mask = values < safe_threshold
+                
+                exceedance_records = []
+                safe_records = []
+                
+                if exceedances_mask.any():
+                    exceedance_data = df[exceedances_mask][['timestamp', gas]].copy()
+                    for idx, row in exceedance_data.iterrows():
+                        exceedance_records.append({
+                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                            "value": float(row[gas]),
+                            "exceedance_percent": float(((row[gas] - threshold) / threshold) * 100) if threshold > 0 else 0
+                        })
+                
+                if safe_mask.any():
+                    safe_data = df[safe_mask][['timestamp', gas]].copy()
+                    for idx, row in safe_data.iterrows():
+                        safe_records.append({
+                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                            "value": float(row[gas]),
+                            "safety_margin_percent": float(((safe_threshold - row[gas]) / safe_threshold) * 100) if safe_threshold > 0 else 0
+                        })
+                
+                # Get top 5 highest and lowest readings with timestamps
+                top_exceedances = exceedance_records[:5] if exceedance_records else []
+                top_safe = safe_records[:5] if safe_records else []
+                
+                # Find first and last exceedance
+                first_exceedance = exceedance_records[0] if exceedance_records else None
+                last_exceedance = exceedance_records[-1] if exceedance_records else None
+                
+                # Calculate longest continuous exceedance period
+                longest_exceedance_period = calculate_longest_exceedance_period(df, gas, threshold)
                 
                 analysis[gas] = {
                     "average": float(values.mean()),
                     "max": float(values.max()),
                     "min": float(values.min()),
                     "std": float(values.std()),
-                    "exceedances": int(exceedances),
+                    "exceedances": int(exceedances_mask.sum()),
+                    "safe_readings": int(safe_mask.sum()),
                     "threshold": threshold,
-                    "unit": "ppm"
+                    "safe_threshold": safe_threshold,
+                    "unit": "ppm",
+                    "exceedance_details": {
+                        "total_exceedances": len(exceedance_records),
+                        "top_exceedances": top_exceedances,
+                        "first_exceedance": first_exceedance,
+                        "last_exceedance": last_exceedance,
+                        "longest_exceedance_period": longest_exceedance_period
+                    },
+                    "safe_period_details": {
+                        "total_safe_readings": len(safe_records),
+                        "top_safe_readings": top_safe,
+                        "safe_percentage": float((safe_mask.sum() / len(values)) * 100) if len(values) > 0 else 0
+                    }
                 }
             except Exception as e:
-                logger.warning(f"Error analyzing {gas}: {e}")
+                logger.warning(f"Error analyzing {gas} with timestamps: {e}")
                 analysis[gas] = {
                     "error": f"Failed to analyze {gas}: {str(e)}"
                 }
     
     return analysis
 
-def get_gas_threshold(gas):
-    """Get threshold values for each gas"""
-    thresholds = {
-        'methane': 1000,  # ppm
-        'co2': 5000,      # ppm
-        'ammonia': 25     # ppm
+def get_safe_threshold(gas: str) -> float:
+    """Get safe threshold values for each gas (lower than warning threshold)"""
+    safe_thresholds = {
+        'methane': 500,   # 50% of warning threshold
+        'co2': 1000,      # 20% of warning threshold
+        'ammonia': 10     # 40% of warning threshold
     }
-    return thresholds.get(gas, 0)
+    return safe_thresholds.get(gas, 0)
 
-def generate_recommendations(df, gas_analysis):
-    """Generate recommendations based on data analysis"""
+def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: float) -> dict:
+    """Calculate the longest continuous period when gas exceeded threshold"""
+    try:
+        if gas not in df.columns or 'timestamp' not in df.columns:
+            return {"duration_hours": 0, "start": None, "end": None}
+        
+        # Sort by timestamp
+        df_sorted = df.sort_values('timestamp').copy()
+        
+        # Create exceedance mask
+        exceedance_mask = df_sorted[gas] > threshold
+        
+        # Find continuous exceedance periods
+        exceedance_periods = []
+        current_period = None
+        
+        for idx, row in df_sorted.iterrows():
+            is_exceeding = exceedance_mask.loc[idx]
+            
+            if is_exceeding and current_period is None:
+                # Start new period
+                current_period = {
+                    "start": row['timestamp'],
+                    "start_value": float(row[gas]),
+                    "end": row['timestamp'],
+                    "end_value": float(row[gas]),
+                    "max_value": float(row[gas])
+                }
+            elif is_exceeding and current_period is not None:
+                # Continue current period
+                current_period["end"] = row['timestamp']
+                current_period["end_value"] = float(row[gas])
+                current_period["max_value"] = max(current_period["max_value"], float(row[gas]))
+            elif not is_exceeding and current_period is not None:
+                # End current period
+                exceedance_periods.append(current_period)
+                current_period = None
+        
+        # Add last period if it exists
+        if current_period is not None:
+            exceedance_periods.append(current_period)
+        
+        # Find longest period
+        if exceedance_periods:
+            longest_period = max(exceedance_periods, 
+                                key=lambda p: (p["end"] - p["start"]).total_seconds())
+            
+            duration_hours = (longest_period["end"] - longest_period["start"]).total_seconds() / 3600
+            
+            return {
+                "duration_hours": float(duration_hours),
+                "start": longest_period["start"].isoformat() if hasattr(longest_period["start"], 'isoformat') else str(longest_period["start"]),
+                "end": longest_period["end"].isoformat() if hasattr(longest_period["end"], 'isoformat') else str(longest_period["end"]),
+                "max_value": longest_period["max_value"],
+                "start_value": longest_period["start_value"],
+                "end_value": longest_period["end_value"]
+            }
+        
+        return {"duration_hours": 0, "start": None, "end": None}
+        
+    except Exception as e:
+        logger.warning(f"Error calculating longest exceedance period for {gas}: {e}")
+        return {"duration_hours": 0, "start": None, "end": None}
+
+def generate_critical_events_timeline(df: pd.DataFrame) -> dict:
+    """Generate timeline of critical events (high risk, exceedances)"""
+    timeline = {
+        "high_risk_events": [],
+        "gas_exceedance_events": [],
+        "summary": {}
+    }
+    
+    try:
+        # Check for high risk events (riskIndex > 7)
+        if 'riskIndex' in df.columns and 'timestamp' in df.columns:
+            high_risk_mask = df['riskIndex'] > 7
+            if high_risk_mask.any():
+                high_risk_data = df[high_risk_mask][['timestamp', 'riskIndex']].copy()
+                high_risk_data = high_risk_data.sort_values('timestamp')
+                
+                # Get top 10 highest risk events
+                top_high_risk = high_risk_data.nlargest(10, 'riskIndex')
+                
+                for idx, row in top_high_risk.iterrows():
+                    timeline["high_risk_events"].append({
+                        "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                        "risk_index": float(row['riskIndex']),
+                        "aqi": float(row['riskIndex'] * 50) if 'aqi' not in df.columns else float(df.loc[idx, 'aqi']),
+                        "risk_level": "Critical" if row['riskIndex'] > 8 else "High"
+                    })
+        
+        # Check for gas exceedance events
+        gases = ['methane', 'co2', 'ammonia']
+        gas_events = []
+        
+        for gas in gases:
+            if gas in df.columns:
+                threshold = get_gas_threshold(gas)
+                exceedance_mask = df[gas] > threshold
+                
+                if exceedance_mask.any():
+                    exceedance_data = df[exceedance_mask][['timestamp', gas]].copy()
+                    exceedance_data = exceedance_data.sort_values('timestamp')
+                    
+                    # Get top 5 highest exceedances for each gas
+                    top_exceedances = exceedance_data.nlargest(5, gas)
+                    
+                    for idx, row in top_exceedances.iterrows():
+                        gas_events.append({
+                            "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                            "gas": gas,
+                            "value": float(row[gas]),
+                            "threshold": threshold,
+                            "exceedance_percent": float(((row[gas] - threshold) / threshold) * 100) if threshold > 0 else 0
+                        })
+        
+        # Sort gas events by timestamp
+        gas_events.sort(key=lambda x: x["timestamp"])
+        timeline["gas_exceedance_events"] = gas_events[:20]  # Limit to 20 events
+        
+        # Generate summary
+        timeline["summary"] = {
+            "total_high_risk_events": len(timeline["high_risk_events"]),
+            "total_gas_exceedance_events": len(timeline["gas_exceedance_events"]),
+            "most_common_gas": max(gases, key=lambda g: len([e for e in timeline["gas_exceedance_events"] if e["gas"] == g])) if timeline["gas_exceedance_events"] else "None",
+            "highest_risk_event": max(timeline["high_risk_events"], key=lambda x: x["risk_index"]) if timeline["high_risk_events"] else None,
+            "highest_gas_exceedance": max(timeline["gas_exceedance_events"], key=lambda x: x["exceedance_percent"]) if timeline["gas_exceedance_events"] else None
+        }
+        
+        return timeline
+        
+    except Exception as e:
+        logger.warning(f"Error generating critical events timeline: {e}")
+        return timeline
+
+def create_executive_summary(statistics: dict, gas_analysis: dict) -> dict:
+    """Create executive summary text with specific event mentions"""
+    avg_aqi = statistics.get('avg_aqi', 0)
+    
+    if avg_aqi <= 50:
+        air_quality = "Good"
+        impact = "minimal health impact"
+        color = "green"
+    elif avg_aqi <= 100:
+        air_quality = "Moderate"
+        impact = "acceptable air quality"
+        color = "yellow"
+    elif avg_aqi <= 150:
+        air_quality = "Unhealthy for Sensitive Groups"
+        impact = "caution advised for sensitive individuals"
+        color = "orange"
+    else:
+        air_quality = "Unhealthy"
+        impact = "significant health concerns"
+        color = "red"
+    
+    exceedances = sum(gas.get('exceedances', 0) for gas in gas_analysis.values() if isinstance(gas, dict))
+    safe_readings = sum(gas.get('safe_readings', 0) for gas in gas_analysis.values() if isinstance(gas, dict))
+    
+    # Add specific gas exceedance details to summary
+    gas_details = []
+    for gas_name, gas_data in gas_analysis.items():
+        if isinstance(gas_data, dict) and gas_data.get('exceedances', 0) > 0:
+            gas_details.append(f"{gas_name}: {gas_data['exceedances']} exceedances")
+    
+    gas_detail_text = f" Gas exceedances: {', '.join(gas_details)}." if gas_details else ""
+    
+    summary = f"""
+    During the reporting period, the average Air Quality Index (AQI) was {avg_aqi:.1f}, 
+    categorizing air quality as '{air_quality}'. This indicates {impact}. 
+    A total of {statistics.get('total_readings', 0)} readings were analyzed, 
+    with {statistics.get('alerts_count', 0)} high-risk alerts triggered.{gas_detail_text}
+    Gas concentration thresholds were exceeded {exceedances} times across all monitored gases,
+    while {safe_readings} readings were within safe limits.
+    """
+    
+    # Add critical event highlights if available
+    critical_events_note = ""
+    if any(gas_data.get('exceedance_details', {}).get('longest_exceedance_period', {}).get('duration_hours', 0) > 24 
+           for gas_data in gas_analysis.values() if isinstance(gas_data, dict)):
+        critical_events_note = " Extended exceedance periods (>24 hours) were detected for some gases."
+    
+    summary = summary.strip() + critical_events_note
+    
+    return {
+        "executive_summary": summary,
+        "air_quality_category": air_quality,
+        "air_quality_color": color,
+        "overall_assessment": "Safe" if avg_aqi <= 100 else "Requires Attention",
+        "exceedance_summary": {
+            "total_exceedances": exceedances,
+            "gas_details": gas_details,
+            "safe_readings": safe_readings
+        }
+    }
+
+# Update the generate_recommendations function to use timestamp data
+def generate_recommendations(df: pd.DataFrame, gas_analysis: dict) -> list:
+    """Generate recommendations based on data analysis with specific event references"""
     recommendations = []
     
-    # Check for high methane levels
-    if 'methane' in gas_analysis and 'max' in gas_analysis['methane']:
-        methane_max = gas_analysis['methane']['max']
-        if methane_max > 500:
+    # Check for high methane levels with specific events
+    if 'methane' in gas_analysis and 'exceedance_details' in gas_analysis['methane']:
+        methane_data = gas_analysis['methane']
+        if methane_data.get('exceedances', 0) > 0:
+            first_exceedance = methane_data['exceedance_details'].get('first_exceedance')
+            last_exceedance = methane_data['exceedance_details'].get('last_exceedance')
+            longest_period = methane_data['exceedance_details'].get('longest_exceedance_period', {})
+            
+            event_details = []
+            if first_exceedance:
+                event_details.append(f"First detected at {format_timestamp(first_exceedance['timestamp'])}")
+            if last_exceedance:
+                event_details.append(f"Last detected at {format_timestamp(last_exceedance['timestamp'])}")
+            if longest_period.get('duration_hours', 0) > 0:
+                event_details.append(f"Longest continuous exceedance: {longest_period['duration_hours']:.1f} hours")
+            
             recommendations.append({
                 "title": "Methane Monitoring",
-                "description": f"High methane levels detected (max: {methane_max:.1f} ppm). Consider increasing ventilation and conducting leak detection.",
+                "description": f"High methane levels detected ({methane_data['exceedances']} exceedances). {' '.join(event_details)}",
                 "priority": "high",
                 "action": "Conduct immediate leak detection and increase ventilation",
-                "category": "safety"
+                "category": "safety",
+                "gas": "methane",
+                "events_count": methane_data['exceedances'],
+                "timeline_data": methane_data['exceedance_details'].get('top_exceedances', [])[:3]
             })
     
-    # Check for CO2 buildup
-    if 'co2' in gas_analysis and 'max' in gas_analysis['co2']:
-        co2_max = gas_analysis['co2']['max']
-        if co2_max > 1000:
+    # Check for CO2 buildup with specific events
+    if 'co2' in gas_analysis and 'exceedance_details' in gas_analysis['co2']:
+        co2_data = gas_analysis['co2']
+        if co2_data.get('exceedances', 0) > 0:
+            top_exceedances = co2_data['exceedance_details'].get('top_exceedances', [])
+            
+            recommendation_text = f"Elevated CO2 levels detected ({co2_data['exceedances']} exceedances). "
+            if top_exceedances:
+                peak_time = format_timestamp(top_exceedances[0]['timestamp'])
+                recommendation_text += f"Peak concentration of {top_exceedances[0]['value']:.0f} ppm at {peak_time}. "
+            
             recommendations.append({
                 "title": "CO2 Ventilation",
-                "description": f"Elevated CO2 levels detected (max: {co2_max:.1f} ppm). Poor ventilation may be affecting air quality.",
+                "description": recommendation_text + "Poor ventilation may be affecting air quality.",
                 "priority": "medium",
                 "action": "Improve air circulation in monitored areas",
-                "category": "ventilation"
+                "category": "ventilation",
+                "gas": "co2",
+                "events_count": co2_data['exceedances']
             })
     
-    # Check for ammonia presence
-    if 'ammonia' in gas_analysis and 'max' in gas_analysis['ammonia']:
-        ammonia_max = gas_analysis['ammonia']['max']
-        if ammonia_max > 10:
+    # Check for ammonia presence with specific events
+    if 'ammonia' in gas_analysis and 'exceedance_details' in gas_analysis['ammonia']:
+        ammonia_data = gas_analysis['ammonia']
+        if ammonia_data.get('exceedances', 0) > 0:
+            top_exceedances = ammonia_data['exceedance_details'].get('top_exceedances', [])
+            
+            recommendation_text = f"Ammonia detected above safe levels ({ammonia_data['exceedances']} exceedances). "
+            if top_exceedances:
+                peak_value = top_exceedances[0]['value']
+                threshold = ammonia_data.get('threshold', 25)
+                recommendation_text += f"Peak concentration {peak_value:.1f} ppm ({((peak_value - threshold) / threshold * 100):.0f}% above threshold). "
+            
             recommendations.append({
                 "title": "Ammonia Safety",
-                "description": f"Ammonia detected above safe levels (max: {ammonia_max:.1f} ppm). Ensure proper containment and ventilation.",
+                "description": recommendation_text + "Ensure proper containment and ventilation.",
                 "priority": "high",
                 "action": "Check containment systems and increase ventilation",
-                "category": "safety"
+                "category": "safety",
+                "gas": "ammonia",
+                "events_count": ammonia_data['exceedances']
             })
     
     # Check risk index if available
     if 'riskIndex' in df.columns:
         avg_risk = df['riskIndex'].mean()
         if avg_risk > 5:
-            recommendations.append({
-                "title": "Continuous Monitoring",
-                "description": f"Persistent high risk levels detected (average: {avg_risk:.1f}).",
-                "priority": "medium",
-                "action": "Implement enhanced monitoring and alert protocols",
-                "category": "monitoring"
-            })
+            # Find high risk periods
+            high_risk_periods = df[df['riskIndex'] > 6][['timestamp', 'riskIndex']]
+            if not high_risk_periods.empty:
+                worst_period = high_risk_periods.nlargest(1, 'riskIndex').iloc[0]
+                worst_time = format_timestamp(worst_period['timestamp'])
+                
+                recommendations.append({
+                    "title": "Continuous Monitoring",
+                    "description": f"Persistent high risk levels detected (average: {avg_risk:.1f}). Highest risk of {worst_period['riskIndex']:.1f} at {worst_time}.",
+                    "priority": "medium",
+                    "action": "Implement enhanced monitoring and alert protocols",
+                    "category": "monitoring"
+                })
     
     # Add standard recommendations
     recommendations.extend([
@@ -3365,42 +3701,167 @@ def generate_recommendations(df, gas_analysis):
     
     return recommendations[:5]  # Return top 5 recommendations
 
-def create_executive_summary(statistics, gas_analysis):
-    """Create executive summary text"""
-    avg_aqi = statistics.get('avg_aqi', 0)
+def format_timestamp(timestamp_str: str) -> str:
+    """Format timestamp string to readable format"""
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except:
+        return timestamp_str
+def get_suggested_tier(selected_days: int) -> dict:
+    """Suggest appropriate report tier based on selected days"""
+    for tier_name, tier_info in REPORT_TIERS.items():
+        if selected_days <= tier_info["max_days"]:
+            return {
+                "tier": tier_name,
+                "name": tier_info["name"],
+                "max_days": tier_info["max_days"]
+            }
     
-    if avg_aqi <= 50:
-        air_quality = "Good"
-        impact = "minimal health impact"
-        color = "green"
-    elif avg_aqi <= 100:
-        air_quality = "Moderate"
-        impact = "acceptable air quality"
-        color = "yellow"
-    elif avg_aqi <= 150:
-        air_quality = "Unhealthy for Sensitive Groups"
-        impact = "caution advised for sensitive individuals"
-        color = "orange"
-    else:
-        air_quality = "Unhealthy"
-        impact = "significant health concerns"
-        color = "red"
-    
-    exceedances = sum(gas.get('exceedances', 0) for gas in gas_analysis.values() if isinstance(gas, dict))
-    
-    summary = f"""
-    During the reporting period, the average Air Quality Index (AQI) was {avg_aqi:.1f}, 
-    categorizing air quality as '{air_quality}'. This indicates {impact}. 
-    A total of {statistics.get('total_readings', 0)} readings were analyzed, 
-    with {statistics.get('alerts_count', 0)} high-risk alerts triggered. 
-    Gas concentration thresholds were exceeded {exceedances} times across all monitored gases.
-    """
-    
+    # If exceeds all tiers, suggest annual
     return {
-        "executive_summary": summary.strip(),
-        "air_quality_category": air_quality,
-        "air_quality_color": color,
-        "overall_assessment": "Safe" if avg_aqi <= 100 else "Requires Attention"
+        "tier": "annual",
+        "name": REPORT_TIERS["annual"]["name"],
+        "max_days": REPORT_TIERS["annual"]["max_days"],
+        "note": "Date range exceeds maximum allowed. Consider generating multiple reports."
+    }
+
+def downsample_data(df: pd.DataFrame, frequency: str = '1H') -> pd.DataFrame:
+    """Downsample data to improve performance for large datasets"""
+    try:
+        # Ensure timestamp is datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Set timestamp as index
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to hourly data (take mean)
+        resampled = df.resample(frequency).mean()
+        
+        # Reset index
+        resampled.reset_index(inplace=True)
+        
+        return resampled
+    except Exception as e:
+        logger.error(f"Error downsampling data: {e}")
+        return df
+
+def analyze_trends(df: pd.DataFrame) -> dict:
+    """Analyze trends in the data for extended reports"""
+    trends = {
+        "daily_patterns": {},
+        "weekly_patterns": {},
+        "overall_trend": "stable"
+    }
+    
+    try:
+        if 'timestamp' not in df.columns or 'riskIndex' not in df.columns:
+            return trends
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['date'] = df['timestamp'].dt.date
+        df['hour'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        
+        # Analyze daily patterns
+        if len(df) > 24:  # Need at least 24 hours of data
+            hourly_avg = df.groupby('hour')['riskIndex'].mean()
+            trends["daily_patterns"] = {
+                "highest_risk_hour": int(hourly_avg.idxmax()),
+                "lowest_risk_hour": int(hourly_avg.idxmin()),
+                "peak_hours": hourly_avg.nlargest(3).index.tolist()
+            }
+        
+        # Analyze weekly patterns
+        if len(df) > 7 * 24:  # Need at least 1 week of hourly data
+            weekly_avg = df.groupby('day_of_week')['riskIndex'].mean()
+            day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            trends["weekly_patterns"] = {
+                "highest_risk_day": day_names[int(weekly_avg.idxmax())],
+                "lowest_risk_day": day_names[int(weekly_avg.idxmin())]
+            }
+        
+        # Analyze overall trend
+        if len(df) > 30:  # Need at least 30 data points
+            # Simple linear regression for trend
+            df['time_index'] = range(len(df))
+            slope = np.polyfit(df['time_index'], df['riskIndex'], 1)[0]
+            
+            if slope > 0.01:
+                trends["overall_trend"] = "increasing"
+            elif slope < -0.01:
+                trends["overall_trend"] = "decreasing"
+            else:
+                trends["overall_trend"] = "stable"
+            
+            trends["trend_slope"] = float(slope)
+        
+        return trends
+        
+    except Exception as e:
+        logger.warning(f"Error analyzing trends: {e}")
+        return trends
+
+def generate_yearly_summary(df: pd.DataFrame, from_date: datetime, to_date: datetime) -> dict:
+    """Generate yearly summary for annual reports"""
+    summary = {
+        "monthly_analysis": {},
+        "seasonal_patterns": {},
+        "key_metrics_by_month": {}
+    }
+    
+    try:
+        if 'timestamp' not in df.columns:
+            return summary
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['month'] = df['timestamp'].dt.month
+        df['year'] = df['timestamp'].dt.year
+        
+        # Monthly analysis
+        monthly_stats = df.groupby('month').agg({
+            'riskIndex': ['mean', 'max', 'min', 'count'],
+            'aqi': ['mean', 'max', 'min'] if 'aqi' in df.columns else pd.NamedAgg(column='riskIndex', aggfunc='mean')
+        }).round(2)
+        
+        summary["monthly_analysis"] = monthly_stats.to_dict()
+        
+        # Seasonal patterns
+        seasons = {
+            1: "Winter", 2: "Winter", 3: "Spring", 4: "Spring", 5: "Spring",
+            6: "Summer", 7: "Summer", 8: "Summer", 9: "Fall", 10: "Fall",
+            11: "Fall", 12: "Winter"
+        }
+        
+        df['season'] = df['month'].map(seasons)
+        seasonal_stats = df.groupby('season')['riskIndex'].mean().round(2).to_dict()
+        summary["seasonal_patterns"] = seasonal_stats
+        
+        # Key metrics by month
+        for month in range(1, 13):
+            month_data = df[df['month'] == month]
+            if not month_data.empty:
+                summary["key_metrics_by_month"][month] = {
+                    "avg_risk": float(month_data['riskIndex'].mean()),
+                    "max_risk": float(month_data['riskIndex'].max()),
+                    "alerts": int((month_data['riskIndex'] > 6).sum()),
+                    "records": len(month_data)
+                }
+        
+        return summary
+        
+    except Exception as e:
+        logger.warning(f"Error generating yearly summary: {e}")
+        return summary
+
+# Helper function to get report tiers info (for frontend)
+@app.get("/api/report-tiers")
+async def get_report_tiers():
+    """Get information about available report tiers"""
+    return {
+        "success": True,
+        "tiers": REPORT_TIERS,
+        "default_tier": "standard"
     }
  #### End Reports Generations #####
  
