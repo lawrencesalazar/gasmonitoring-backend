@@ -5,7 +5,7 @@ import psutil
 import os
 import math
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import firebase_admin
@@ -14,13 +14,13 @@ import pandas as pd
 import numpy as np
 import shap
 import xgboost as xgb  
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.svm import SVR, SVC
-from sklearn.neighbors import KNeighborsClassifier
+# from sklearn.linear_model import LinearRegression, LogisticRegression
+# from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+# from sklearn.tree import DecisionTreeRegressor
+# from sklearn.svm import SVR, SVC
+# from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import  GridSearchCV, train_test_split, StratifiedKFold, RandomizedSearchCV
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+# from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
 import matplotlib
@@ -32,7 +32,7 @@ import base64
 import logging 
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
-from xgboost import XGBRegressor
+
 from io import BytesIO
 import shap
 from scipy import stats
@@ -1237,6 +1237,7 @@ def xgboost_model(
     save_model: bool = True,
     retrain: bool = False
 ):
+    from xgboost import XGBRegressor 
     """Train XGBoost model and save to Firebase"""
     try:
         # Check if model already exists and we don't want to retrain
@@ -2057,6 +2058,13 @@ def get_xgboost_model(
     save_model: bool = Query(True, description="Save trained model to Firebase"),
     retrain: bool = Query(False, description="Force retrain even if model exists")
 ):
+    try:
+        result = xgboost_model(...)
+        cleanup_memory()  # Clean up after heavy operation
+        return result
+    except Exception as e:
+        cleanup_memory()
+        raise
     """Train XGBoost model for specific sensor and optionally save to Firebase"""
     # Check rate limit
     client_ip = request.client.host if request.client else "unknown"
@@ -4093,31 +4101,51 @@ def get_firebase_stats_endpoint():
 # ---------------------------------------------------
 # Health and Debug Endpoints
 # ---------------------------------------------------
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    firebase_status = "initialized" if firebase_db else "not_initialized"
+# @app.get("/health")
+# def health_check():
+    # """Health check endpoint"""
+    # firebase_status = "initialized" if firebase_db else "not_initialized"
     
-    status = {
-        "status": "healthy", 
-        "message": "Dynamic XGBoost API is running",
-        "timestamp": datetime.now().isoformat(),
-        "firebase": firebase_status,
-        "fallback_data_available": True,
-        "trained_models": len(models),
-        "cached_datasets": len(data_cache),
-        "cache_stats": {
-            "model_cache": len(model_cache),
-            "metadata_cache": len(metadata_cache),
-            "history_cache": len(history_cache)
-        },
-        "system": {
-            "python_version": os.sys.version,
-            "platform": os.sys.platform
+    # status = {
+        # "status": "healthy", 
+        # "message": "Dynamic XGBoost API is running",
+        # "timestamp": datetime.now().isoformat(),
+        # "firebase": firebase_status,
+        # "fallback_data_available": True,
+        # "trained_models": len(models),
+        # "cached_datasets": len(data_cache),
+        # "cache_stats": {
+            # "model_cache": len(model_cache),
+            # "metadata_cache": len(metadata_cache),
+            # "history_cache": len(history_cache)
+        # },
+        # "system": {
+            # "python_version": os.sys.version,
+            # "platform": os.sys.platform
+        # }
+    # }
+    # return status
+@app.get("/health")
+async def health_check():
+    """Health check with timeout"""
+    try:
+        # Simple check that doesn't timeout
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "workers": len(training_tasks) if 'training_tasks' in globals() else 0,
+            "cache_stats": {
+                "model_cache": len(model_cache),
+                "metadata_cache": len(metadata_cache)
+            }
         }
-    }
-    return status
-
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+        
 # ---------------------------------------------------
 # Home Page
 # ---------------------------------------------------
@@ -4215,7 +4243,15 @@ def home():
     """
 ###  
 # Email Configuration Endpoints
- 
+
+def cleanup_memory():
+    """Force garbage collection"""
+    gc.collect()
+    
+    # Clear matplotlib figures
+    import matplotlib.pyplot as plt
+    plt.close('all')
+    
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
