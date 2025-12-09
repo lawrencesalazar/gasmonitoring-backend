@@ -1,33 +1,39 @@
-# Start from Debian
+# Dockerfile
 FROM python:3.11-slim
 
-
-# Set working directory
 WORKDIR /app
 
-# Install Python 3.11 + pip + build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3.11-dev python3-pip build-essential \
+# Install only essential system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.11 the default "python"
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-
-# Verify version
-RUN python --version && pip --version
-
-# Copy requirements first for caching
+# Copy requirements
 COPY requirements.txt .
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python packages
+RUN pip install --upgrade pip
 
-# Copy the rest of the app
+# Install critical packages first in correct order
+RUN pip install numpy==1.24.3
+RUN pip install scipy==1.11.4
+RUN pip install scikit-learn==1.3.2
+RUN pip install pandas==2.1.3
+RUN pip install xgboost==2.0.0
+
+# Install the rest from requirements
+RUN pip install -r requirements.txt
+
+# Copy application
 COPY . .
 
-# Expose Render port
-EXPOSE 8080
+# Expose port
+EXPOSE 10000
 
-# Run with Gunicorn + Uvicorn worker
-CMD exec gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import requests; requests.get('http://localhost:10000/health', timeout=2)"
+
+# Run the application
+CMD ["gunicorn", "main:app", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:10000", "--timeout", "120", "--keep-alive", "5"]
