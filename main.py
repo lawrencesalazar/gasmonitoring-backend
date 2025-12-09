@@ -43,6 +43,7 @@ import base64
 import joblib
 
 import requests   
+from collections import defaultdict
   
  
 # Configure logging FIRST
@@ -84,6 +85,64 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=3600,
 )
+
+# Simple Rate Limiter
+class SimpleRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.limits = {
+            "/api/forecast/{sensor_id}": {"limit": 10, "window": 60},
+            "/api/live-predict/{sensor_id}": {"limit": 30, "window": 60},
+            "/api/xgboost/{sensor_id}": {"limit": 5, "window": 300},
+            "/api/report/{sensor_id}": {"limit": 3, "window": 300},
+            "/api/predict/{sensor_id}": {"limit": 20, "window": 60},
+            "/api/alerts/{sensor_id}": {"limit": 20, "window": 60},
+            "/api/alerts": {"limit": 20, "window": 60},
+            "/api/correlation_summary/{sensor_id}": {"limit": 15, "window": 60},
+            "/api/forecast/poll/{sensor_id}": {"limit": 60, "window": 60},
+        }
+    
+    def is_rate_limited(self, path: str, client_ip: str) -> bool:
+        """Check if client is rate limited for a specific path"""
+        if path not in self.limits:
+            return False
+        
+        limit_info = self.limits[path]
+        current_time = datetime.now()
+        
+        # Clean old requests
+        self.requests[client_ip] = [
+            req_time for req_time in self.requests[client_ip]
+            if (current_time - req_time).total_seconds() < limit_info["window"]
+        ]
+        
+        # Check if limit exceeded
+        if len(self.requests[client_ip]) >= limit_info["limit"]:
+            return True
+        
+        # Add current request
+        self.requests[client_ip].append(current_time)
+        return False
+    
+    def get_remaining(self, path: str, client_ip: str) -> int:
+        """Get remaining requests for a client"""
+        if path not in self.limits:
+            return 999
+        
+        limit_info = self.limits[path]
+        current_time = datetime.now()
+        
+        # Clean old requests
+        self.requests[client_ip] = [
+            req_time for req_time in self.requests[client_ip]
+            if (current_time - req_time).total_seconds() < limit_info["window"]
+        ]
+        
+        remaining = limit_info["limit"] - len(self.requests[client_ip])
+        return max(0, remaining)
+
+# Initialize rate limiter
+rate_limiter = SimpleRateLimiter()
 
 # Add specific CORS headers for SSE
 @app.middleware("http")
@@ -1988,16 +2047,26 @@ def enhanced_correlation_summary(df, target_col='riskIndex'):
         return {"error": f"Failed to create correlation summary: {str(e)}"}
 
 # ---------------------------------------------------
-# API Endpoints with Error Handling
+# API Endpoints with Error Handling and Rate Limiting
 # ---------------------------------------------------
 @app.get("/api/xgboost/{sensor_id}")
 def get_xgboost_model(
+    request: Request,
     sensor_id: str,
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
     save_model: bool = Query(True, description="Save trained model to Firebase"),
     retrain: bool = Query(False, description="Force retrain even if model exists")
 ):
     """Train XGBoost model for specific sensor and optionally save to Firebase"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/xgboost/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/xgboost/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 5 minutes. Requests remaining: {remaining}"
+        )
+    
     try:
         result = xgboost_model(sensor_id, range, save_model, retrain)
         return result
@@ -2254,11 +2323,21 @@ def should_send_alert(sensor_id: str, risk_index: float) -> bool:
 
 @app.get("/api/alerts/{sensor_id}")
 def get_sensor_alerts(
+    request: Request,
     sensor_id: str,
     limit: int = Query(50, description="Number of alerts to return"),
     days: int = Query(7, description="Number of past days to include")
 ):
     """Get alert history for a specific sensor"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/alerts/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/alerts/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         alerts_ref = db.reference(f'/alerts/{sensor_id}')
         alerts_data = alerts_ref.order_by_child('timestamp').limit_to_last(limit).get()
@@ -2303,10 +2382,20 @@ def get_sensor_alerts(
 
 @app.get("/api/alerts")
 def get_all_alerts(
+    request: Request,
     limit: int = Query(100, description="Number of alerts to return"),
     risk_level: int = Query(None, description="Filter by risk level")
 ):
     """Get all alerts across all sensors"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/alerts", client_ip):
+        remaining = rate_limiter.get_remaining("/api/alerts", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         alerts_ref = db.reference('/alerts')
         all_alerts_data = alerts_ref.get()
@@ -2414,6 +2503,7 @@ def test_alert_saving(sensor_id: str):
         
 @app.get("/api/predict/{sensor_id}")
 def predict_risk_endpoint(
+    request: Request,
     sensor_id: str,
     methane: float = Query(..., description="Methane level"),
     co2: float = Query(..., description="CO2 level"),
@@ -2422,6 +2512,15 @@ def predict_risk_endpoint(
     temperature: float = Query(..., description="Temperature in Celsius")
 ):
     """Predict risk index using pre-trained model and send alerts if risk > 1"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/predict/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/predict/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         sensor_data = {
             "methane": methane,
@@ -2910,10 +3009,20 @@ def get_live_predictions(sensor_id: str):
 
 @app.get("/api/forecast/{sensor_id}")
 def get_forecast(
+    request: Request,
     sensor_id: str,
     steps: int = Query(24, description="Number of forecast steps (hours)", ge=1, le=168)
 ):
     """Get predictive forecast for sensor"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/forecast/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/forecast/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         result = generate_forecast(sensor_id, steps)
         if "error" in result:
@@ -2924,8 +3033,20 @@ def get_forecast(
         raise HTTPException(status_code=500, detail=f"Forecast generation failed: {str(e)}")
 
 @app.get("/api/live-predict/{sensor_id}")
-def get_live_prediction_endpoint(sensor_id: str):
+def get_live_prediction_endpoint(
+    request: Request,
+    sensor_id: str
+):
     """Get live prediction for current sensor readings"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/live-predict/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/live-predict/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         result = get_live_predictions(sensor_id)
         if "error" in result:
@@ -2936,8 +3057,20 @@ def get_live_prediction_endpoint(sensor_id: str):
         raise HTTPException(status_code=500, detail=f"Live prediction failed: {str(e)}")
 
 @app.get("/api/forecast/poll/{sensor_id}")
-async def poll_forecast_updates(sensor_id: str):
+async def poll_forecast_updates(
+    request: Request,
+    sensor_id: str
+):
     """Polling endpoint for forecast updates - more reliable than SSE"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/forecast/poll/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/forecast/poll/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
+        )
+    
     try:
         # Get latest forecast
         forecast_data = generate_forecast(sensor_id, 12)
@@ -2969,7 +3102,10 @@ async def poll_forecast_updates(sensor_id: str):
         }
 
 @app.get("/api/forecast/batch/{sensor_id}")
-async def get_batch_forecast_data(sensor_id: str):
+async def get_batch_forecast_data(
+    request: Request,
+    sensor_id: str
+):
     """Get all forecast data in one request - optimized for polling"""
     try:
         # Get forecast for 24 hours
@@ -3034,12 +3170,22 @@ REPORT_TIERS = {
 
 @app.get("/api/report/{sensor_id}")
 async def generate_report(
+    request: Request,
     sensor_id: str,
     from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
     report_type: str = Query("standard", description="Report type: standard (90 days), extended (180 days), annual (365 days)")
 ):
     """Generate comprehensive report data with tiered limits"""
+    # Check rate limit
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_rate_limited("/api/report/{sensor_id}", client_ip):
+        remaining = rate_limiter.get_remaining("/api/report/{sensor_id}", client_ip)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Try again in 5 minutes. Requests remaining: {remaining}"
+        )
+    
     try:
         # Validate date format
         try:

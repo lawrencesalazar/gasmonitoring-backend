@@ -13,4 +13,4 @@ psutil
 scipy
 resend
 slowapi==0.1.5
-limits==1.9.5
+limits==1.6
